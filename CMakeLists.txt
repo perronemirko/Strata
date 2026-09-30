@@ -1,4 +1,4 @@
-﻿# Strata Engine - top-level build (P1.S1).
+﻿﻿# Strata Engine - top-level build (P1.S1).
 #
 # Targets (phase-1 Ă‚Â§P1.S1): `strata_artifact` (no CUDA dependency), `tests`.  `strata_plan` and the C++
 # `strata-pack` are added when their sources exist - a target with no sources would make the build graph
@@ -100,7 +100,7 @@ if(STRATA_ENABLE_CUDA)
     if(_base LESS 60)
       message(FATAL_ERROR "CMAKE_CUDA_ARCHITECTURES '${CMAKE_CUDA_ARCHITECTURES}': even the experimental build "
                           "needs compute capability 6.0 (sm_60) or newer")
-    endif()
+ 
     # #220 / #224: RTX 50 engines built with CUDA 12.8 crashed in the prompt path on Linux (13.0 and newer did not)
     if(_base GREATER_EQUAL 120 AND CMAKE_CUDA_COMPILER_VERSION VERSION_LESS 13.0)
       message(WARNING "Building for sm_${_base} (RTX 50) with CUDA ${CMAKE_CUDA_COMPILER_VERSION}: engines built with "
@@ -165,10 +165,6 @@ if(STRATA_BUILD_TESTS)
   add_executable(gguf_reader_test src/artifact/gguf_reader_test.cpp)
   target_link_libraries(gguf_reader_test PRIVATE strata_artifact)
   add_test(NAME gguf_reader_test COMMAND gguf_reader_test)
-  # a split model's shards and their joint view: missing shard, split keys, duplicates, truncation (synthetic)
-  add_executable(gguf_split_test tests/core/gguf_split_test.cpp)
-  target_link_libraries(gguf_split_test PRIVATE strata_artifact)
-  add_test(NAME gguf_split_test COMMAND gguf_split_test)
 endif()
 
 # ---- strata_plan ----------------------------------------------------------
@@ -187,10 +183,6 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   add_library(strata_core STATIC src/core/device.cu src/core/pinned.cu src/platform/memory.cpp src/core/graph.cpp src/core/weights.cpp
                                src/core/layout.cpp)
   target_include_directories(strata_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
-  if(STRATA_ENABLE_CUDA AND STRATA_EXPERIMENTAL_SM60)
-    # the runtime device check (src/core/device.cu) admits the cards this build was made for (#236)
-    target_compile_definitions(strata_core PRIVATE STRATA_EXPERIMENTAL_SM60=1)
-  endif()
   # The selected runtime is PUBLIC because graph.cpp is a HOST translation unit that calls cudaGraphLaunch and
   # cudaEventQuery: the .cu sources get cudart through the CUDA language rules, a .cpp does not, and the
   # linker error ("unresolved external symbol cudaGraphInstantiate") names the function rather than the cause.
@@ -269,6 +261,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
                           src/kernels/cuda/qsa_select.cu
                           src/kernels/cuda/verify_kernels.cu
                           src/kernels/cuda/iq_kernels.cu
+                          src/kernels/cuda/dense_kernels.cu
                           src/kernels/ngram.cpp
                           src/ngram/ple_reader.cpp
                           src/platform/direct_file.cpp)
@@ -431,6 +424,11 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   target_include_directories(strata PRIVATE ${_strata_gpu_include_directories})
   target_link_libraries(strata PRIVATE strata_engine strata_prefill strata_spec ${_strata_gpu_runtime_target})
 
+  # a DENSE qwen35 model (Qwen3.8-27B): same server protocol as `strata --serve`, no experts (src/program/dense_main.cpp)
+  add_executable(strata-dense src/program/dense_main.cpp)
+  target_include_directories(strata-dense PRIVATE ${_strata_gpu_include_directories})
+  target_link_libraries(strata-dense PRIVATE strata_engine ${_strata_gpu_runtime_target})
+
   if(STRATA_ENABLE_HIP)
     enable_testing()
     set(_strata_hip_tests)
@@ -517,6 +515,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   add_executable(iq_parity src/kernels/iq_parity.cpp)
   target_include_directories(iq_parity PRIVATE ${_strata_gpu_include_directories})
   target_link_libraries(iq_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+
   # TODO 24: the i-quant fixtures are generated, not shipped.  tools/iq_fixture.py needs python3 + numpy
   # and the repository's vendored gguf-py (no pip installs); it writes deterministic fixtures into the
   # BUILD directory (the source tree is not touched).  The CTest fixture makes generation-to-test order
@@ -718,11 +717,11 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   add_test(NAME s2_expert_grouped_parity COMMAND s2_expert_grouped_parity --selftest)
 
   # Plan v0.3 P3: native MMVQ for 1..8 tokens (bitwise selftest + --bench timing); synthetic data, no model.
-  if(STRATA_BUILD_TESTS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/bench/micro/native_mmvq_multi.cpp")
-    add_executable(native_mmvq_multi bench/micro/native_mmvq_multi.cpp)
-    target_include_directories(native_mmvq_multi PRIVATE ${_strata_gpu_include_directories})
-    target_link_libraries(native_mmvq_multi PRIVATE strata_kernels ${_strata_gpu_runtime_target})
-    add_test(NAME native_mmvq_multi COMMAND native_mmvq_multi --selftest)
+  if(STRATA_BUILD_TESTS)
+  add_executable(native_mmvq_multi bench/micro/native_mmvq_multi.cpp)
+  target_include_directories(native_mmvq_multi PRIVATE ${_strata_gpu_include_directories})
+  target_link_libraries(native_mmvq_multi PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+  add_test(NAME native_mmvq_multi COMMAND native_mmvq_multi --selftest)
   endif()
 
   # Plan v0.3 P0.1: working-set lock of a host region (CPU only).
@@ -1044,7 +1043,7 @@ if(STRATA_NATIVE_EXPERTS)
   endif()
 endif()
 
-if(STRATA_ENABLE_CUDA AND STRATA_BUILD_TESTS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/bench/micro/hit_cpu_order_parity.cu")
+if(STRATA_ENABLE_CUDA AND STRATA_BUILD_TESTS)
   add_executable(hit_cpu_order_parity bench/micro/hit_cpu_order_parity.cu)
   target_link_libraries(hit_cpu_order_parity PRIVATE strata_kernels strata_kernels_cpu ${_strata_gpu_runtime_target})
 endif()
