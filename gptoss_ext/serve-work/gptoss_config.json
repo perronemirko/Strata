@@ -1,0 +1,31 @@
+{
+  "exe": "/home/albus/workspaces/RiStarta/Strata/gptoss_ext/build-out/gptoss_run_cuda",
+  "args": [
+    "--model",
+    "/media/albus/windows/Users/mio/models/llm_models/models/lmstudio-community/gpt-oss-120b",
+    "--ctx",
+    "8192",
+    "--kv-unified",
+    "--prefill-chunk",
+    "4096",
+    "--vram-pct",
+    "90.0",
+    "--pin-pct",
+    "80.0",
+    "--eos-ids",
+    "200002,200012",
+    "--expert-promote",
+    "20",
+    "--profile-decay",
+    "200000",
+    "--expert-profile",
+    "/var/tmp/gptoss.prof",
+    "--cuda",
+    "--decode-upload",
+    "--expert-lru-layered"
+  ],
+  "cwd": "/home/albus/workspaces/RiStarta/Strata/gptoss_ext",
+  "log": "/home/albus/workspaces/RiStarta/Strata/gptoss_ext/serve-work/gptoss_engine.log",
+  "tokenizer": "/home/albus/workspaces/RiStarta/Strata/gptoss_ext/serve-work/tokenizer",
+  "model_name": "gpt-oss-120b"
+}
