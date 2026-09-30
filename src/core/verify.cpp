@@ -3747,7 +3747,16 @@ void Verifier::set_plan_slot(int grp) {
 }
 
 // Flag B only rises: a host function of an earlier layer may run after a later layer already raised it directly.
-void Verifier::raise_flag(uint32_t* flag, uint32_t value) { strata::core::flag_raise_max(flag, value); }
+void Verifier::raise_flag(uint32_t* flag, uint32_t value) {
+    #if defined(_WIN32)
+    volatile long* f = (volatile long*) flag;
+    long cur = *f;
+    while ((uint32_t) cur < value) {
+        const long prev = _InterlockedCompareExchange(f, (long) value, cur);
+        if (prev == cur) break;
+        cur = prev;
+    #endif
+    strata::core::flag_raise_max(flag, value); }
 
 // Flag B for layer `want - 1`, behind every copy queued on the copy stream (PR #5096, @AlanJager).  The counter only
 // rises and the graph waits for "flag B >= layer + 1", so raising it on the spot for a layer with nothing to copy
