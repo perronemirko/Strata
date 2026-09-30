@@ -2106,6 +2106,16 @@ const MmqPlan& mmq_plan() {
             strata::core::manifest::instance().path("prefill", "mmq-group-sort", ns > 0, ns > 0 ? "STRATA_MMQ_GROUP_SORT=1" : "STRATA_MMQ_GROUP_SORT=1, but whole tiles are not guaranteed on every GPU",
                                                     std::to_string(ns) + " of " + std::to_string(layers) + " layers");
         }
+        // A type this build has no MMQ instance for drops the experts of every layer back on the FP16 path, which
+        // costs ~100x on the prompt (docs/UNSLOTH_Q4.md).  STRATA_MMQ_KQUANTS/STRATA_DENSE_PREFILL decide which types
+        // are compiled, so say out loud when one of them is what turned the path off - otherwise the only symptom is a
+        // prefill that is mysteriously slow.
+        if (blocked)
+            std::fprintf(stderr,
+                         "strata prefill: MMQ off for %lld of %lld expert layers - this build has no MMQ instance for "
+                         "GGML type %d/%d (gate/up, down); rebuild with STRATA_MMQ_KQUANTS=ON or STRATA_DENSE_PREFILL=ON "
+                         "for these weights\n",
+                         (long long) blocked, (long long) layers, blocked_gt, blocked_dt);
         return p;
     }();
     return plan;
