@@ -82,6 +82,9 @@ if(STRATA_Q6K_EXPERTS)
   add_compile_definitions(STRATA_Q6K_EXPERTS=1)
 endif()
 option(STRATA_ORCA_Q4KS_MMQ "Build the GGML Q5_0 MMQ instance for OrcaRouter Q4_K_S" OFF)
+# The dense runner (`strata-dense`) feeds a prompt through MMQ instead of 8-token run() groups; it needs the same
+# GGML MMQ instances strata_mmq compiles, so it is switched off with them.
+option(STRATA_DENSE_PREFILL "Batched MMQ prompt prefill for strata-dense (needs the strata_mmq MMQ kernels)" ON)
 if(STRATA_PREFILL_MMQ AND NOT STRATA_ENABLE_HIP)
   message(FATAL_ERROR "STRATA_PREFILL_MMQ requires STRATA_ENABLE_HIP=ON")
 endif()
@@ -181,11 +184,6 @@ elseif(STRATA_ENABLE_CUDA)
       message(WARNING "Building for sm_${_base} (RTX 50) with CUDA ${CMAKE_CUDA_COMPILER_VERSION}: engines built with "
                       "CUDA 12.8 crashed on long prompts on these cards (issues #220, #224). Use CUDA 13.0 or newer.")
     endif()
-    # #220 / #224: RTX 50 engines built with CUDA 12.8 crashed in the prompt path on Linux (13.0 and newer did not)
-    if(_base GREATER_EQUAL 120 AND CMAKE_CUDA_COMPILER_VERSION VERSION_LESS 13.0)
-      message(WARNING "Building for sm_${_base} (RTX 50) with CUDA ${CMAKE_CUDA_COMPILER_VERSION}: engines built with "
-                      "CUDA 12.8 crashed on long prompts on these cards (issues #220, #224). Use CUDA 13.0 or newer.")
-    endif()
   endforeach()
   if(STRATA_EXPERIMENTAL_SM60)
     # every target sees it: the Pascal / Volta code paths (the Volta prompt attention, PR #600) are compiled into this
@@ -273,10 +271,6 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   add_library(strata_core STATIC src/core/device.cu src/core/pinned.cu src/platform/memory.cpp src/core/graph.cpp src/core/weights.cpp
                                src/core/layout.cpp)
   target_include_directories(strata_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
-  if(STRATA_ENABLE_CUDA AND STRATA_EXPERIMENTAL_SM60)
-    # the runtime device check (src/core/device.cu) admits the cards this build was made for (#236)
-    target_compile_definitions(strata_core PRIVATE STRATA_EXPERIMENTAL_SM60=1)
-  endif()
   # The selected runtime is PUBLIC because graph.cpp is a HOST translation unit that calls cudaGraphLaunch and
   # cudaEventQuery: the .cu sources get cudart through the CUDA language rules, a .cpp does not, and the
   # linker error ("unresolved external symbol cudaGraphInstantiate") names the function rather than the cause.
@@ -355,6 +349,8 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
                           src/kernels/cuda/qsa_select.cu
                           src/kernels/cuda/verify_kernels.cu
                           src/kernels/cuda/iq_kernels.cu
+                          src/kernels/cuda/dense_kernels.cu
+                          src/kernels/cuda/qwen35_attention.cu
                           src/kernels/ngram.cpp
                           src/ngram/ple_reader.cpp
                           src/platform/direct_file.cpp)
@@ -442,7 +438,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   add_library(strata_engine STATIC src/core/layer.cpp src/core/session.cpp src/core/qwen35.cpp src/core/expert_source.cpp src/core/remote_experts.cpp src/core/remote_expert_opt.cu
     src/core/expert_cache.cpp src/core/native_head.cpp src/core/native_dense.cpp src/core/verify.cpp src/core/mtp.cpp
     src/core/conversation_snapshot.cpp src/core/conversation_state.cpp src/core/conversation_memory.cpp src/core/peer_experts.cpp
-    src/core/arch_defaults.cpp src/core/vmm.cpp src/core/conversation_file.cpp)
+    src/core/arch_defaults.cpp src/core/vmm.cpp src/core/conversation_file.cpp src/core/dense_model.cpp)
   target_include_directories(strata_engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
   target_link_libraries(strata_engine PUBLIC strata_core strata_kernels strata_kernels_cpu ${_strata_gpu_runtime_target})
   if(STRATA_BUILD_TESTS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/core/exchange_storage_test.cpp")
@@ -536,6 +532,11 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   add_executable(strata src/program/generate.cpp)
   target_include_directories(strata PRIVATE ${_strata_gpu_include_directories})
   target_link_libraries(strata PRIVATE strata_engine strata_prefill strata_spec ${_strata_gpu_runtime_target})
+
+  # a DENSE qwen35 model (Qwen3.8-27B): same server protocol as `strata --serve`, no experts (src/program/dense_main.cpp)
+  add_executable(strata-dense src/program/dense_main.cpp)
+  target_include_directories(strata-dense PRIVATE ${_strata_gpu_include_directories})
+  target_link_libraries(strata-dense PRIVATE strata_engine ${_strata_gpu_runtime_target})
 
   if(STRATA_ENABLE_HIP)
     enable_testing()
@@ -652,6 +653,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   add_executable(iq_parity src/kernels/iq_parity.cpp)
   target_include_directories(iq_parity PRIVATE ${_strata_gpu_include_directories})
   target_link_libraries(iq_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+
   # TODO 24: the i-quant fixtures are generated, not shipped.  tools/iq_fixture.py needs python3 + numpy
   # and the repository's vendored gguf-py (no pip installs); it writes deterministic fixtures into the
   # BUILD directory (the source tree is not touched).  The CTest fixture makes generation-to-test order
@@ -921,11 +923,11 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   add_test(NAME s2_expert_grouped_parity COMMAND s2_expert_grouped_parity --selftest)
 
   # Plan v0.3 P3: native MMVQ for 1..8 tokens (bitwise selftest + --bench timing); synthetic data, no model.
-  if(STRATA_BUILD_TESTS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/bench/micro/native_mmvq_multi.cpp")
-    add_executable(native_mmvq_multi bench/micro/native_mmvq_multi.cpp)
-    target_include_directories(native_mmvq_multi PRIVATE ${_strata_gpu_include_directories})
-    target_link_libraries(native_mmvq_multi PRIVATE strata_kernels ${_strata_gpu_runtime_target})
-    add_test(NAME native_mmvq_multi COMMAND native_mmvq_multi --selftest)
+  if(STRATA_BUILD_TESTS)
+  add_executable(native_mmvq_multi bench/micro/native_mmvq_multi.cpp)
+  target_include_directories(native_mmvq_multi PRIVATE ${_strata_gpu_include_directories})
+  target_link_libraries(native_mmvq_multi PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+  add_test(NAME native_mmvq_multi COMMAND native_mmvq_multi --selftest)
   endif()
 
   # Plan v0.3 P0.1: working-set lock of a host region (CPU only).
@@ -1183,11 +1185,34 @@ if(STRATA_NATIVE_EXPERTS)
     add_test(NAME iq_avx2_parity COMMAND iq_avx2_parity)
     add_test(NAME iq_avx2_parity_iq3s_mt1 COMMAND ${CMAKE_COMMAND} -E env STRATA_IQ3S_MT1=1 $<TARGET_FILE:iq_avx2_parity>)
   endif()
-  set(_strata_mmq_types q2_0 iq2_xxs iq2_xs iq2_s iq3_xxs iq3_s iq4_nl iq4_xs q8_0)
+  # cmake/mmq_types.cmake: ONE list decides both the mmq-instance-<type>.cu files that get compiled and the
+  # supported()/dispatch table of src/prefill/moe_mmq.cu, so the two can never disagree.
+  include(cmake/mmq_types.cmake)
+  # q8_0: the drafter's matrices (E-9); q2_k q3_k q4_0 q4_1 q5_0 q5_1 iq1_s: the quants a UD pack mixes in layer by
+  # layer (an UD-Q4_K_M Qwen3.8 file stores seven ffn matrices as Q3_K), always built because one uncovered type
+  # switches the whole prompt path off, which costs 100x on prefill.
+  set(_strata_mmq_types q2_0 iq2_xxs iq2_xs iq2_s iq3_xxs iq3_s iq4_nl iq4_xs q8_0
+                       q2_k q3_k q4_0 q4_1 q5_0 q5_1 iq1_s)
   # #296: OrcaRouter Q4_K_S's Q5_0 experts (Q4_K and Q5_1 come with STRATA_MMQ_KQUANTS on CUDA, S5's branch)
   if(STRATA_ORCA_Q4KS_MMQ)
     list(APPEND _strata_mmq_types q5_0)
   endif()
+  # q4_k q5_k q6_k: Unsloth's UD-Q4_K_XL experts (docs/UNSLOTH_Q4.md) and the weight types of the dense model itself.
+  # Each MMQ instance costs ~2.7 MB of device code that CUDA_MODULE_LOADING=EAGER pins in VRAM at startup, so on CUDA
+  # they are only built when something needs them; a build that leaves them out reports it and stays on run().
+  if(STRATA_ENABLE_CUDA)
+    if(STRATA_MMQ_KQUANTS)
+      list(APPEND _strata_mmq_types q4_k q5_k q5_1)
+    endif()
+    if(STRATA_DENSE_PREFILL)
+      list(APPEND _strata_mmq_types q4_k q5_k q6_k)
+    endif()
+  else()
+    # HIP has no KQUANTS switch and its own tuning story (docs/AMD_HIP.md): keep the K-quants always available.
+    list(APPEND _strata_mmq_types q4_k q5_k q6_k)
+  endif()
+  list(REMOVE_DUPLICATES _strata_mmq_types)
+  strata_gen_mmq_types(${CMAKE_CURRENT_BINARY_DIR}/gen/strata/prefill/mmq_types.inc "${_strata_mmq_types}")
   if(STRATA_ENABLE_CUDA)
     # prompt-speed plan step 2b: llama.cpp's MMQ kernels (ggml-cuda, MIT) for the prompt path's experts, compiled
     # from the same checkout as ggml above - only mmq.cuh's instances for the packs' types and the quantizer, with
@@ -1212,11 +1237,16 @@ if(STRATA_NATIVE_EXPERTS)
         list(APPEND _strata_mmq_cuda_types q6_k)
       endif()
     endif()
-    foreach(_t IN LISTS _strata_mmq_cuda_types)
+    if(STRATA_DENSE_PREFILL)
+      list(APPEND _strata_mmq_cuda_types q4_k q5_k q6_k)
+    endif()
+    list(REMOVE_DUPLICATES _strata_mmq_cuda_types)
+    foreach(_t IN LISTS _strata_mmq_cuda_types)    
       target_sources(strata_mmq PRIVATE ${_strata_mmq}/template-instances/mmq-instance-${_t}.cu)
     endforeach()
+    # the generated mmq_types.inc lands in the build tree at generate time, before anything compiles
     target_include_directories(strata_mmq PRIVATE ${_strata_gg}/include ${_strata_gg}/src ${_strata_mmq}
-                               PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+                               PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_BINARY_DIR}/gen)
     target_compile_options(strata_mmq PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--extended-lambda -use_fast_math>)
     if(MSVC)
       target_compile_options(strata_mmq PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/bigobj>)
@@ -1249,6 +1279,24 @@ if(STRATA_NATIVE_EXPERTS)
       add_test(NAME prefill_mmq_kquant_test COMMAND prefill_mmq_kquant_test)
       set_tests_properties(prefill_mmq_kquant_test PROPERTIES TIMEOUT 120)
     endif()
+    # strata_engine holds src/core/dense_model.cpp, whose prompt path multiplies the model's OWN weights through
+    # these same MMQ kernels (prefill_setup()/prefill()).  strata_mmq does not depend on strata_engine, so this edge
+    # is safe - the reverse one (strata_engine -> strata_prefill) would be a cycle, since strata_prefill already
+    # links strata_engine.
+    if(STRATA_DENSE_PREFILL AND TARGET strata_mmq)
+      target_link_libraries(strata_engine PUBLIC strata_mmq)
+      target_compile_definitions(strata_engine PUBLIC STRATA_DENSE_MMQ=1)
+    elseif(STRATA_DENSE_PREFILL)
+      message(STATUS "strata-dense: no strata_mmq target - the dense prompt path stays on run()")
+    endif()
+    # A UD pack mixes quantizations layer by layer (a UD-Q4_K_M Qwen3.8 file stores seven ffn matrices as Q3_K), and
+    # one type MMQ does not cover switches the whole dense prompt path off.  This checks the MMQ wrapper against
+    # ggml's own quantizer and dequantizer on a synthetic matrix: no model, no tokenizer, a few MiB.
+    add_executable(q3k_mmq_check tests/q3k_mmq_check.cpp)
+    target_include_directories(q3k_mmq_check PRIVATE ${_strata_gg}/include)
+    target_link_libraries(q3k_mmq_check PRIVATE strata_mmq)
+    add_test(NAME q3k_mmq_check COMMAND q3k_mmq_check)
+    set_tests_properties(q3k_mmq_check PROPERTIES TIMEOUT 120)
   elseif(STRATA_PREFILL_MMQ)
     # Compile only the pinned GGML MMQ and activation-quantizer sources used by prefill. This uses
     # common.cuh's native HIP path without enabling a second GGML HIP backend.
@@ -1274,6 +1322,14 @@ if(STRATA_NATIVE_EXPERTS)
       list(APPEND _strata_mmq_types q4_k q5_k q5_1 q6_k)
     endif()
     foreach(_t IN LISTS _strata_mmq_types)
+    # the HIP side mirrors the CUDA one: the pack types, the UD packs' mixed quants, plus q4_k q5_k q6_k
+    # for the dense runner
+    set(_strata_mmq_hip_types ${_strata_mmq_types} q2_k q3_k q4_0 q4_1 q5_0 q5_1 iq1_s)
+    if(STRATA_DENSE_PREFILL)
+      list(APPEND _strata_mmq_hip_types q4_k q5_k q6_k)
+    endif()
+    list(REMOVE_DUPLICATES _strata_mmq_hip_types)
+    foreach(_t IN LISTS _strata_mmq_hip_types)
       list(APPEND _strata_mmq_sources "${_strata_mmq}/template-instances/mmq-instance-${_t}.cu")
     endforeach()
     set_source_files_properties(${_strata_mmq_sources} PROPERTIES LANGUAGE HIP)
@@ -1283,7 +1339,7 @@ if(STRATA_NATIVE_EXPERTS)
     add_library(strata_mmq STATIC ${_strata_mmq_sources})
     target_include_directories(strata_mmq
       PRIVATE "${_strata_gg}/include" "${_strata_gg}/src" "${_strata_mmq}"
-      PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+      PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_BINARY_DIR}/gen)
     target_compile_definitions(strata_mmq PRIVATE GGML_USE_HIP=1)
     if(STRATA_MMQ_KQUANTS)
       target_compile_definitions(strata_mmq PRIVATE STRATA_MMQ_KQUANTS=1)
@@ -1307,6 +1363,11 @@ if(STRATA_NATIVE_EXPERTS)
     add_test(NAME hip_prefill_fused_iq COMMAND hip_prefill_fused_iq)
     set_tests_properties(hip_prefill_fused_iq PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
     list(APPEND _strata_hip_tests hip_prefill_fused_iq)
+    target_compile_definitions(strata_prefill PUBLIC STRATA_PREFILL_MMQ=1)
+    if(STRATA_DENSE_PREFILL AND TARGET strata_mmq)
+      target_link_libraries(strata_engine PUBLIC strata_mmq)
+      target_compile_definitions(strata_engine PUBLIC STRATA_DENSE_MMQ=1)
+    endif()
 
     # Numerical diagnostic: synthetic layouts by default, optional first-expert IQ3_XXS/IQ4_NL check with a pack.
     add_executable(hip_prefill_mmq_parity tests/hip/prefill_mmq_parity.cpp)
@@ -1369,7 +1430,7 @@ if(STRATA_NATIVE_EXPERTS)
   endif()
 endif()
 
-if(STRATA_ENABLE_CUDA AND STRATA_BUILD_TESTS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/bench/micro/hit_cpu_order_parity.cu")
+if(STRATA_ENABLE_CUDA AND STRATA_BUILD_TESTS)
   add_executable(hit_cpu_order_parity bench/micro/hit_cpu_order_parity.cu)
   target_link_libraries(hit_cpu_order_parity PRIVATE strata_kernels strata_kernels_cpu ${_strata_gpu_runtime_target})
 endif()

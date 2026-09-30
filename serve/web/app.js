@@ -734,21 +734,29 @@ function apiMessages() {
 }
 // An answer that used MCP tools goes back as the model wrote it: per round the text before the calls, the calls and
 // their results (as the model read them), then the rest - so the next question can build on what the tools found.
+//
+// `reasoning_content` is not decoration. The chat template writes a thinking block for every past assistant turn, and
+// with no reasoning to put in it the block comes out empty - while the tokens the engine already consumed contain the
+// thinking the model actually produced. The re-rendered prompt then stops matching the consumed tokens a few hundred
+// tokens in, the engine can no longer treat them as a prefix, and it re-reads the WHOLE conversation: on a 36k prompt
+// that is 90 seconds per turn instead of 3. Echoing the thinking back is what keeps the prefix intact.
 function assistantMessages(m) {
+  const think = (m.reasoning || "").trim();
+  const think_of = () => (think ? {reasoning_content: think} : {});
   const ran = (m.tools || []).filter((t) => t.round != null && t.result != null && t.state !== "skipped");
-  if (!ran.length) return m.text ? [{role: "assistant", content: m.text}] : [];
+  if (!ran.length) return m.text ? [{role: "assistant", content: m.text, ...think_of()}] : [];
   const out = [];
   let pos = 0;
   for (const r of [...new Set(ran.map((t) => t.round))]) {
     const calls = ran.filter((t) => t.round === r);
     const at = Math.min(Math.max(pos, calls[0].at || 0), m.text.length);
-    out.push({role: "assistant", content: m.text.slice(pos, at).trim(),
+    out.push({role: "assistant", content: m.text.slice(pos, at).trim(), ...think_of(),
               tool_calls: calls.map((t) => ({id: t.id, type: "function", function: {name: t.name, arguments: JSON.stringify(t.arguments || {})}}))});
     for (const t of calls) out.push({role: "tool", tool_call_id: t.id, content: t.result});
     pos = at;
   }
   const rest = m.text.slice(pos).trim();
-  if (rest) out.push({role: "assistant", content: rest});
+  if (rest) out.push({role: "assistant", content: rest, ...think_of()});
   return out;
 }
 
