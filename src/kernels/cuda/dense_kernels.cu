@@ -489,7 +489,115 @@ __global__ void attn_chunk_kernel(const float* __restrict__ q, const uint8_t* __
         out[((size_t) t * n_head + h) * head_dim + threadIdx.x] = val;
     }
 }
+// Same arithmetic as attn_chunk_kernel, but one block per (KV head, token) serving the G query heads that share that
+// KV head: every K/V cell is loaded and decompressed once instead of G times.  Per head the operations and their
+// order are the ones of attn_chunk_kernel, so the result is bit-identical.
+template <int KF, int VF, int G>
+__global__ void attn_chunk_g_kernel(const float* __restrict__ q, const uint8_t* __restrict__ K,
+                                    const uint8_t* __restrict__ V, float* __restrict__ out, int n_head, int n_kv,
+                                    int head_dim, int pos0, int max_ctx, float scale) {
+    const int kvh = blockIdx.x, t = blockIdx.y;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int per = head_dim >> 5;
 
+    __shared__ float sq[kMaxHeadDim];
+    float qv[G][8];
+#pragma unroll
+    for (int g = 0; g < G; ++g) {
+        const float* qp = q + ((size_t) t * n_head + kvh * G + g) * head_dim;
+        if (KF == kQ4) {                                  // head_dim == 256: one thread per dim
+            sq[threadIdx.x] = qp[threadIdx.x];
+            __syncthreads();
+            fwht256_shared(sq);
+#pragma unroll
+            for (int i = 0; i < 8; ++i) qv[g][i] = i < per ? sq[lane + 32 * i] * scale : 0.0f;
+            __syncthreads();                              // sq is rewritten by the next head
+        } else {
+#pragma unroll
+            for (int i = 0; i < 8; ++i) qv[g][i] = i < per ? qp[lane + 32 * i] * scale : 0.0f;
+        }
+    }
+
+    const size_t kcell = (size_t) cell_bytes(KF, head_dim), vcell = (size_t) cell_bytes(VF, head_dim);
+    const uint8_t* Kb = K + (size_t) kvh * max_ctx * kcell;
+    const uint8_t* Vb = V + (size_t) kvh * max_ctx * vcell;
+    const int end = pos0 + t + 1;
+
+    float m[G], l[G], acc[G][8];
+#pragma unroll
+    for (int g = 0; g < G; ++g) {
+        m[g] = -FLT_MAX;
+        l[g] = 0.0f;
+#pragma unroll
+        for (int i = 0; i < 8; ++i) acc[g][i] = 0.0f;
+    }
+
+    for (int c = warp; c < end; c += kWarps) {
+        const uint8_t* kcl = Kb + (size_t) c * kcell;
+        float kk[8];
+#pragma unroll
+        for (int i = 0; i < 8; ++i) kk[i] = i < per ? kv_val<KF>(kcl, i, lane) : 0.0f;
+        float pg[G], cg[G];
+#pragma unroll
+        for (int g = 0; g < G; ++g) {
+            float d = 0.0f;
+#pragma unroll
+            for (int i = 0; i < 8; ++i)
+                if (i < per) d += qv[g][i] * kk[i];
+            d = warp_sum(d);
+            const float mn = fmaxf(m[g], d);
+            cg[g] = __expf(m[g] - mn);
+            pg[g] = __expf(d - mn);
+            l[g] = l[g] * cg[g] + pg[g];
+            m[g] = mn;
+        }
+        const uint8_t* vcl = Vb + (size_t) c * vcell;
+        float vv[8];
+#pragma unroll
+        for (int i = 0; i < 8; ++i) vv[i] = i < per ? kv_val<VF>(vcl, i, lane) : 0.0f;
+#pragma unroll
+        for (int g = 0; g < G; ++g)
+#pragma unroll
+            for (int i = 0; i < 8; ++i)
+                if (i < per) acc[g][i] = acc[g][i] * cg[g] + pg[g] * vv[i];
+    }
+
+    // The cross-warp merge, one head at a time so the 8 x 256 float buffer is reused (G of them would not fit in 48 KiB).
+    __shared__ float sm[G][kWarps], sl[G][kWarps];
+    __shared__ float sacc[kWarps][kMaxHeadDim];
+    __shared__ float so[kMaxHeadDim];
+    if (lane == 0) {
+#pragma unroll
+        for (int g = 0; g < G; ++g) { sm[g][warp] = m[g]; sl[g][warp] = l[g]; }
+    }
+#pragma unroll
+    for (int g = 0; g < G; ++g) {
+#pragma unroll
+        for (int i = 0; i < 8; ++i)
+            if (i < per) sacc[warp][lane + 32 * i] = acc[g][i];
+        __syncthreads();
+        if (threadIdx.x < head_dim) {
+            float gm = -FLT_MAX;
+            for (int w = 0; w < kWarps; ++w) gm = fmaxf(gm, sm[g][w]);
+            float a = 0.0f, L = 0.0f;
+            for (int w = 0; w < kWarps; ++w) {
+                if (sl[g][w] == 0.0f) continue;
+                const float f = __expf(sm[g][w] - gm);
+                a += sacc[w][threadIdx.x] * f;
+                L += sl[g][w] * f;
+            }
+            float val = L > 0.0f ? a / L : 0.0f;
+            if (VF == kQ4) {                              // back from the rotated space
+                so[threadIdx.x] = val;
+                __syncthreads();
+                fwht256_shared(so);
+                val = so[threadIdx.x];
+            }
+            out[((size_t) t * n_head + kvh * G + g) * head_dim + threadIdx.x] = val;
+        }
+        __syncthreads();                                  // sacc is rewritten by the next head
+    }
+}
 // grid (ceil(n_out / 4), rows): one warp per output row of W for one input row.
 __global__ void gemv_f32_rows_kernel(const float* __restrict__ W, const float* __restrict__ X, float* __restrict__ y,
                                      int n_in, int n_out) {
@@ -830,6 +938,26 @@ void dense_attn_chunk_fmt(const float* q, const void* k_cache, const void* v_cac
     const uint8_t* K = (const uint8_t*) k_cache;
     const uint8_t* V = (const uint8_t*) v_cache;
     const dim3 grid(n_head, T);
+    if (n_head / n_kv == 6) {                  // Qwen3.8-27B: 24 query heads over 4 KV heads
+        const dim3 g6(n_kv, T);
+#define STRATA_ATTG(KF, VF)                                                                 \
+        attn_chunk_g_kernel<KF, VF, 6><<<g6, kWarps * 32, 0, st>>>(q, K, V, out, n_head, n_kv, \
+                                                                   head_dim, pos0, max_ctx, scale)
+        switch (k_fmt * 3 + v_fmt) {
+            case 0: STRATA_ATTG(kF16, kF16); break;
+            case 1: STRATA_ATTG(kF16, kQ8); break;
+            case 2: STRATA_ATTG(kF16, kQ4); break;
+            case 3: STRATA_ATTG(kQ8, kF16); break;
+            case 4: STRATA_ATTG(kQ8, kQ8); break;
+            case 5: STRATA_ATTG(kQ8, kQ4); break;
+            case 6: STRATA_ATTG(kQ4, kF16); break;
+            case 7: STRATA_ATTG(kQ4, kQ8); break;
+            default: STRATA_ATTG(kQ4, kQ4); break;
+        }
+#undef STRATA_ATTG
+        check("dense_attn_chunk");
+        return;
+    }
 #define STRATA_ATTCH(KF, VF)                                                            \
     attn_chunk_kernel<KF, VF><<<grid, kWarps * 32, 0, st>>>(q, K, V, out, n_head, n_kv,  \
                                                             head_dim, pos0, max_ctx, scale)
