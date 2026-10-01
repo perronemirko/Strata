@@ -878,7 +878,24 @@ int main(int argc, char** argv) {
         // ---- what of the state can be kept
         size_t resume = 0;
         if (!fed.empty() && fed.size() < ids.size() && std::equal(fed.begin(), fed.end(), ids.begin())) resume = fed.size();
-        if (resume == 0) { model.reset(); fed.clear(); }
+        if (resume == 0) {
+            // The whole conversation is re-read from token 0.  That is the single most expensive thing this engine
+            // can do (a 36k prompt is 90 s), and it happens whenever the client rewrites anything earlier in the
+            // prompt - an agent that regenerates its system prompt, or a chat template that stamps a clock, breaks
+            // the prefix at token ~100 and loses 35k tokens of work.  Say where the two prompts part, because the
+            // fix is different for each case: a divergence at the head is the client's prompt, one at the tail is
+            // this engine's own bookkeeping.
+            if (!fed.empty()) {
+                size_t common = 0;
+                const size_t lim = std::min(fed.size(), ids.size());
+                while (common < lim && fed[common] == ids[common]) ++common;
+                std::fprintf(stderr, "strata-dense: re-reading from token 0: the previous %zu tokens are not a prefix of "
+                             "the new %zu - they first differ at token %zu (%.1f%% of the prompt lost)\n",
+                             fed.size(), ids.size(), common, 100.0 * (double) (fed.size() - common) / (double) fed.size());
+            }
+            model.reset();
+            fed.clear();
+        }
         const int64_t n = (int64_t) ids.size();
         const long long budget = std::min<long long>(max_new, model.max_context() - n);
         auto fail = [&](const std::string& why) {

@@ -1,7 +1,8 @@
 // src/core/dense_model.cpp - see include/strata/core/dense_model.hpp.
 #include "strata/core/dense_model.hpp"
 
-#include "strata/artifact/dequant.hpp"
+#include "strata/arti
+act/dequant.hpp"
 #include "strata/artifact/gguf_reader.hpp"
 #include "strata/kernels/dense_kernels.hpp"
 #include "strata/kernels/elementwise.hpp"
