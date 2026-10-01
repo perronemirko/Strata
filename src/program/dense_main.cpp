@@ -408,6 +408,49 @@ int selftest() {
                 cudaFree(dq); cudaFree(dkf); cudaFree(dvf); cudaFree(dk); cudaFree(dv); cudaFree(dout);
             }
         }
+        {   // chunk path vs decode path over the SAME quantized cache, query by query.  This is the parity the
+            // model check measures (prefill vs one token at a time), without the weights in the way: n_ctx <= 256
+            // keeps the decode path on a single split, so the two kernels have to agree to within fp32 noise.
+            const int H = 24, HK = 4, D = 256, max_ctx = 512, T = 16;
+            struct Fmt3 { const char* name; int kf, vf; };
+            const Fmt3 fmts3[] = {{"chunk==decode fp16", 0, 0}, {"chunk==decode int8", 1, 1},
+                                  {"chunk==decode q4_0", 2, 2}, {"chunk==decode k8v4", 1, 2}};
+            for (const Fmt3& g : fmts3) {
+                auto k = rnd((size_t) T * HK * D, 1.5f), v = rnd((size_t) T * HK * D);
+                float* dkf = to_dev(k), *dvf = to_dev(v);
+                const uint64_t kb = (uint64_t) HK * max_ctx * strata::kernels::dense_kv_cell_bytes(g.kf, D);
+                const uint64_t vb = (uint64_t) HK * max_ctx * strata::kernels::dense_kv_cell_bytes(g.vf, D);
+                void *dk = nullptr, *dv = nullptr;
+                cudaMalloc(&dk, kb); cudaMalloc(&dv, vb);
+                cudaMemset(dk, 0, kb); cudaMemset(dv, 0, vb);
+                // the cache is written by the CHUNK append, then read by both paths
+                strata::kernels::dense_kv_append_rows_fmt(dk, dv, g.kf, g.vf, dkf, dvf, T, 0, HK, D, max_ctx, nullptr);
+                const float scale = 1.0f / std::sqrt((float) D);
+                float *dchunk = nullptr, *ddec = nullptr, *dscr = nullptr;
+                cudaMalloc((void**) &dchunk, (size_t) T * H * D * 4);
+                cudaMalloc((void**) &ddec, (size_t) H * D * 4);
+                cudaMalloc((void**) &dscr, strata::kernels::dense_attn_scratch_bytes(H, D, max_ctx));
+                // one query per (head, dim) at a time, drawn from the same [T, H, D] block the chunk path reads
+                std::vector<float> qh((size_t) H * D);
+                std::mt19937 qrng(5);
+                std::normal_distribution<float> qnd(0.0f, 1.0f);
+                for (auto& x : qh) x = qnd(qrng);
+                float* dqh = to_dev(qh);
+                double worst = 0;
+                for (int t = 0; t < T; ++t) {
+                    // the chunk path: T queries, query t causal over [0, t].  Re-append the same rows each time so
+                    // the cache holds exactly t+1 meaningful cells for the decode call to match.
+                    strata::kernels::dense_attn_chunk_fmt(dqh, dk, dv, g.kf, g.vf, dchunk, 1, t, H, HK, D, max_ctx, scale, nullptr);
+                    strata::kernels::dense_attn_decode_fmt(dqh, dk, dv, g.kf, g.vf, ddec, dscr, H, HK, D, t + 1, max_ctx, scale, nullptr);
+                    worst = std::max(worst, compare(from_dev(dchunk, (size_t) H * D), from_dev(ddec, (size_t) H * D)).abs);
+                }
+                char name[64];
+                std::snprintf(name, sizeof name, "%s (worst query)", g.name);
+                report(name, Diff{worst, worst}, 2e-4);
+                cudaFree(dkf); cudaFree(dvf); cudaFree(dk); cudaFree(dv);
+                cudaFree(dchunk); cudaFree(ddec); cudaFree(dscr); cudaFree(dqh);
+            }
+        }
     } catch (const std::exception& e) {
         std::printf("selftest: exception: %s\n", e.what());
         return 1;
