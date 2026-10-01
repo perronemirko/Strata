@@ -977,6 +977,14 @@ if(STRATA_NATIVE_EXPERTS)
     elseif(STRATA_DENSE_PREFILL)
       message(STATUS "strata-dense: no strata_mmq target - the dense prompt path stays on run()")
     endif()
+    # A UD pack mixes quantizations layer by layer (a UD-Q4_K_M Qwen3.8 file stores seven ffn matrices as Q3_K), and
+    # one type MMQ does not cover switches the whole dense prompt path off.  This checks the MMQ wrapper against
+    # ggml's own quantizer and dequantizer on a synthetic matrix: no model, no tokenizer, a few MiB.
+    add_executable(q3k_mmq_check tests/q3k_mmq_check.cpp)
+    target_include_directories(q3k_mmq_check PRIVATE ${_strata_gg}/include)
+    target_link_libraries(q3k_mmq_check PRIVATE strata_mmq)
+    add_test(NAME q3k_mmq_check COMMAND q3k_mmq_check)
+    set_tests_properties(q3k_mmq_check PROPERTIES TIMEOUT 120)
   elseif(STRATA_PREFILL_MMQ)
     # Compile only the pinned GGML MMQ and activation-quantizer sources used by prefill. This uses
     # common.cuh's native HIP path without enabling a second GGML HIP backend.
@@ -993,8 +1001,9 @@ if(STRATA_NATIVE_EXPERTS)
       src/prefill/moe_mmq.cu
       src/prefill/ggml_cuda_host.cu
       "${_strata_mmq}/quantize.cu")
-    # the HIP side mirrors the CUDA one: the pack types, plus q4_k q5_k q6_k for the dense runner
-    set(_strata_mmq_hip_types ${_strata_mmq_types})
+    # the HIP side mirrors the CUDA one: the pack types, the UD packs' mixed quants, plus q4_k q5_k q6_k
+    # for the dense runner
+    set(_strata_mmq_hip_types ${_strata_mmq_types} q2_k q3_k q4_0 q4_1 q5_0 q5_1 iq1_s)
     if(STRATA_DENSE_PREFILL)
       list(APPEND _strata_mmq_hip_types q4_k q5_k q6_k)
     endif()

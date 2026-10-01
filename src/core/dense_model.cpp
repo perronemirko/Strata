@@ -1191,10 +1191,14 @@ bool DenseModel::prefill_setup(int64_t chunk, std::string& err) {
             return false;
     }
 
+    // Size the scratch for one chunk.  A bigger chunk reads every weight fewer times, so the caller halves the
+    // chunk when the scratch does not fit rather than switching the path off: even 64 tokens at a time is many
+    // times faster than run().
+    auto size_scratch = [&](int64_t t) -> bool {
     I.pf.reset(new Impl::Pf);
     Impl::Pf& P = *I.pf;
-    P.T = chunk;
-    const uint64_t f = 4, T = (uint64_t) chunk;
+    P.T = t;
+    const uint64_t f = 4, T = (uint64_t) t;
     const int max_in = std::max({E, V, cfg_.n_ff, H * D});
     auto pf_alloc = [&](void** out, uint64_t bytes, const char* what) {
         void* p = nullptr;
@@ -1220,7 +1224,7 @@ bool DenseModel::prefill_setup(int64_t chunk, std::string& err) {
               pf_alloc((void**) &P.ffn_g, T * cfg_.n_ff * f, "ffn_g") &&
               pf_alloc((void**) &P.ffn_u, T * cfg_.n_ff * f, "ffn_u") &&
               pf_alloc((void**) &P.ffn_h, T * cfg_.n_ff * f, "ffn_h") &&
-              pf_alloc((void**) &P.xq, strata::prefill::mmq::q8_bytes(chunk, max_in), "q8_1") &&
+              pf_alloc((void**) &P.xq, strata::prefill::mmq::q8_bytes(t, max_in), "q8_1") &&
               pf_alloc((void**) &P.ids, T * 4, "row ids") && pf_alloc((void**) &P.bounds, 2 * 4, "group bounds") &&
               pf_alloc((void**) &P.pos_dev, T * (uint64_t) std::max(H, HK) * 4, "positions");
     if (ok) {
@@ -1234,19 +1238,25 @@ bool DenseModel::prefill_setup(int64_t chunk, std::string& err) {
         ok = s == cudaSuccess;
     }
     if (ok) {
-        strata::prefill::mmq::iota(P.ids, chunk, I.stream);
+        strata::prefill::mmq::iota(P.ids, t, I.stream);
         for (int k = 0; k < Impl::Pf::kBoundsSlots; ++k) {
             P.bounds_host[2 * k] = 0;
-            P.bounds_host[2 * k + 1] = (int32_t) chunk;
+            P.bounds_host[2 * k + 1] = (int32_t) t;
         }
         const cudaError_t s = cudaMemcpyAsync(P.bounds, P.bounds_host, 2 * sizeof(int32_t), cudaMemcpyHostToDevice,
                                               I.stream);
         if (s != cudaSuccess) err = std::string("dense model: prefill tables: ") + cudaGetErrorString(s);
         ok = s == cudaSuccess;
     }
-    if (!ok) {
-        I.pf.reset();
-        return false;
+    if (!ok) I.pf.reset();   // pf_alloc already named the buffer that did not fit
+    return ok;
+    };
+    for (;;) {
+        if (size_scratch(chunk)) break;
+        if (chunk <= NC) return false;
+        std::fprintf(stderr, "strata-dense: the prefill scratch for %lld tokens does not fit; trying %lld\n",
+                     (long long) chunk, (long long) (chunk / 2));
+        chunk /= 2;
     }
     pf_chunk_ = chunk;
     pf_ready_ = true;

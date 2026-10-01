@@ -69,8 +69,9 @@ public:
     /// Largest chunk prefill_setup() will size its scratch for.  The GEMVs of a chunk are read once for all of its
     /// tokens, so a bigger chunk is nearly free until the chunk's activations stop fitting comfortably in VRAM.
     static constexpr int64_t kPrefillMaxCols = 512;
-    /// The chunk prefill_setup() uses when asked for 0.
-    static constexpr int64_t kPrefillDefaultCols = 64;
+    /// The chunk prefill_setup() uses when asked for 0.  The scratch for one chunk is a couple of hundred MiB,
+    /// which is nothing next to the weights, and every extra token in a chunk is one more weight read avoided.
+    static constexpr int64_t kPrefillDefaultCols = kPrefillMaxCols;
 
     DenseModel();
     ~DenseModel();
