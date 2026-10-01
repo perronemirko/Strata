@@ -3,6 +3,8 @@
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
+#include <mma.h>
+#include <cstdlib>
 
 #include <cfloat>
 #include <climits>
@@ -598,6 +600,165 @@ __global__ void attn_chunk_g_kernel(const float* __restrict__ q, const uint8_t* 
         __syncthreads();                                  // sacc is rewritten by the next head
     }
 }
+// ---- tensor-core chunk attention: block = (KV head, tile of 8 tokens) x the 6 query heads that share the KV head =
+// 48 rows.  K/V cells are dequantized to half in shared memory once per block and multiplied with WMMA.
+// Two passes over the cells: pass 1 finds each row's max, pass 2 recomputes S, forms P = exp(S - max) and accumulates
+// P V in registers with no rescaling (WMMA does not expose which row an accumulator element belongs to).
+// head_dim == 256, 256 threads, G == 6.  Dynamic shared memory: 54144 bytes.
+constexpr int kTcSmem = 54144;
+
+template <int F>
+__device__ __forceinline__ void tc_load_tile(__half* dst, const uint8_t* Base, size_t cellb, int c0, int cmax) {
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;       // thread == dim (lane + 32 * warp)
+    for (int c = 0; c < 32; ++c) {
+        float v = 0.0f;
+        if (c0 + c < cmax) v = kv_val<F>(Base + (size_t) (c0 + c) * cellb, warp, lane);
+        dst[c * 264 + threadIdx.x] = __float2half(v);
+    }
+}
+
+template <int KF, int VF>
+__global__ void __launch_bounds__(256) attn_chunk_tc_kernel(const float* __restrict__ q, const uint8_t* __restrict__ K,
+                                                            const uint8_t* __restrict__ V, float* __restrict__ out,
+                                                            int T, int n_head, int pos0, int max_ctx, float scale) {
+    using namespace nvcuda;
+    constexpr int D = 256, G = 6, BQ = 8, R = 48, BK = 32, LD = 264, SL = 40;
+    extern __shared__ __align__(128) uint8_t smem_raw[];
+    __half* Qs = (__half*) smem_raw;                       // [48][264]
+    __half* KVs = (__half*) (smem_raw + 25344);            // [32][264]  (reused as Os float [16][264] at the end)
+    float* Os = (float*) KVs;
+    float* Ss = (float*) (smem_raw + 42240);               // [48][40]
+    __half* Ps = (__half*) (smem_raw + 49920);             // [48][40]
+    float* ms = (float*) (smem_raw + 53760);
+    float* ls = ms + R;
+
+    const int kvh = blockIdx.x, t0 = blockIdx.y * BQ;
+    const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+    const int ntok = min(BQ, T - t0);
+    const size_t kcell = (size_t) cell_bytes(KF, D), vcell = (size_t) cell_bytes(VF, D);
+    const uint8_t* Kb = K + (size_t) kvh * max_ctx * kcell;
+    const uint8_t* Vb = V + (size_t) kvh * max_ctx * vcell;
+
+    // ---- Q (scaled, rotated for Q4 keys) -> half, row r = token * 6 + head-in-group
+    for (int r = 0; r < R; ++r) {
+        const int tl = r / G, g = r % G;
+        float v = 0.0f;
+        if (tl < ntok) v = q[((size_t) (t0 + tl) * n_head + kvh * G + g) * D + tid];
+        if (KF == kQ4) {
+            Ss[tid] = v;
+            __syncthreads();
+            fwht256_shared(Ss);
+            v = Ss[tid];
+            __syncthreads();
+        }
+        Qs[r * LD + tid] = __float2half(v * scale);
+    }
+    if (tid < R) { ms[tid] = -FLT_MAX; ls[tid] = 0.0f; }
+    __syncthreads();
+
+    const int cmax = pos0 + t0 + ntok;                          // cells [0, cmax) can be seen by some row of the tile
+    const int ntiles = (cmax + BK - 1) / BK;
+
+    auto compute_S = [&]() {
+        if (warp < 6) {
+            const int rt = warp >> 1, ct = warp & 1;
+            wmma::fragment<wmma::accumulator, 16, 16, 16, float> c;
+            wmma::fill_fragment(c, 0.0f);
+            for (int k = 0; k < 16; ++k) {
+                wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> a;
+                wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::col_major> b;
+                wmma::load_matrix_sync(a, Qs + rt * 16 * LD + k * 16, LD);
+                wmma::load_matrix_sync(b, KVs + ct * 16 * LD + k * 16, LD);
+                wmma::mma_sync(c, a, b, c);
+            }
+            wmma::store_matrix_sync(Ss + rt * 16 * SL + ct * 16, c, SL, wmma::mem_row_major);
+        }
+    };
+
+    // ---- pass 1: row maxima
+    for (int tile = 0; tile < ntiles; ++tile) {
+        const int c0 = tile * BK;
+        tc_load_tile<KF>(KVs, Kb, kcell, c0, cmax);
+        __syncthreads();
+        compute_S();
+        __syncthreads();
+        for (int j = 0; j < 6; ++j) {
+            const int r = warp * 6 + j, tl = r / G;
+            const int lim = tl < ntok ? pos0 + t0 + tl + 1 : 0;
+            float s = (c0 + lane < lim) ? Ss[r * SL + lane] : -FLT_MAX;
+            for (int o = 16; o > 0; o >>= 1) s = fmaxf(s, __shfl_xor_sync(0xffffffffu, s, o));
+            if (lane == 0) ms[r] = fmaxf(ms[r], s);
+        }
+    }
+    __syncthreads();
+
+    // ---- pass 2: P = exp(S - max), l = sum P, O += P V
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> oacc[3][2];
+#pragma unroll
+    for (int rt = 0; rt < 3; ++rt)
+#pragma unroll
+        for (int i = 0; i < 2; ++i) wmma::fill_fragment(oacc[rt][i], 0.0f);
+
+    for (int tile = 0; tile < ntiles; ++tile) {
+        const int c0 = tile * BK;
+        tc_load_tile<KF>(KVs, Kb, kcell, c0, cmax);
+        __syncthreads();
+        compute_S();
+        __syncthreads();
+        for (int j = 0; j < 6; ++j) {
+            const int r = warp * 6 + j, tl = r / G;
+            const int lim = tl < ntok ? pos0 + t0 + tl + 1 : 0;
+            const float p = (c0 + lane < lim) ? __expf(Ss[r * SL + lane] - ms[r]) : 0.0f;
+            Ps[r * SL + lane] = __float2half(p);
+            const float ps = warp_sum(p);
+            if (lane == 0) ls[r] += ps;
+        }
+        tc_load_tile<VF>(KVs, Vb, vcell, c0, cmax);        // K is no longer needed: S is in Ss
+        __syncthreads();
+        for (int ks = 0; ks < 2; ++ks) {
+            wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> a[3];
+            wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::row_major> b[2];
+#pragma unroll
+            for (int rt = 0; rt < 3; ++rt) wmma::load_matrix_sync(a[rt], Ps + rt * 16 * SL + ks * 16, SL);
+#pragma unroll
+            for (int i = 0; i < 2; ++i) wmma::load_matrix_sync(b[i], KVs + ks * 16 * LD + (warp * 2 + i) * 16, LD);
+#pragma unroll
+            for (int rt = 0; rt < 3; ++rt)
+#pragma unroll
+                for (int i = 0; i < 2; ++i) wmma::mma_sync(oacc[rt][i], a[rt], b[i], oacc[rt][i]);
+        }
+        __syncthreads();
+    }
+
+    // ---- output: stage 16 rows at a time through shared memory, normalise, (inverse rotation for Q4 values), store
+    for (int rt = 0; rt < 3; ++rt) {
+#pragma unroll
+        for (int i = 0; i < 2; ++i)
+            wmma::store_matrix_sync(Os + (warp * 2 + i) * 16, oacc[rt][i], LD, wmma::mem_row_major);
+        __syncthreads();
+        for (int i = 0; i < 16; ++i) {
+            const int r = rt * 16 + i, tl = r / G, g = r % G;
+            float* row = Os + i * LD;
+            const float inv = ls[r] > 0.0f ? 1.0f / ls[r] : 0.0f;
+            row[tid] *= inv;
+            __syncthreads();
+            if (VF == kQ4) fwht256_shared(row);
+            if (tl < ntok) out[((size_t) (t0 + tl) * n_head + kvh * G + g) * D + tid] = row[tid];
+        }
+        __syncthreads();
+    }
+}
+
+template <int KF, int VF>
+void launch_attn_chunk_tc(const float* q, const uint8_t* K, const uint8_t* V, float* out, int T, int n_head, int n_kv,
+                          int pos0, int max_ctx, float scale, cudaStream_t st) {
+    static bool armed = false;                             // one flag per instantiation
+    if (!armed) {
+        cudaFuncSetAttribute(attn_chunk_tc_kernel<KF, VF>, cudaFuncAttributeMaxDynamicSharedMemorySize, kTcSmem);
+        armed = true;
+    }
+    attn_chunk_tc_kernel<KF, VF><<<dim3(n_kv, (T + 7) / 8), 256, kTcSmem, st>>>(q, K, V, out, T, n_head, pos0, max_ctx, scale);
+}
 // grid (ceil(n_out / 4), rows): one warp per output row of W for one input row.
 __global__ void gemv_f32_rows_kernel(const float* __restrict__ W, const float* __restrict__ X, float* __restrict__ y,
                                      int n_in, int n_out) {
@@ -931,6 +1092,27 @@ void dense_attn_chunk_fmt(const float* q, const void* k_cache, const void* v_cac
                           int T, int pos0, int n_head, int n_kv, int head_dim, int max_ctx, float scale, void* stream) {
     if (T < 1 || pos0 < 0 || pos0 + T > max_ctx)
         throw std::runtime_error("dense_attn_chunk: positions outside the cache");
+        static const bool use_tc = !(std::getenv("STRATA_DENSE_ATTN_TC") && std::getenv("STRATA_DENSE_ATTN_TC")[0] == '0');
+    if (use_tc && n_head / n_kv == 6 && head_dim == 256) {
+        const cudaStream_t st = (cudaStream_t) stream;
+        const uint8_t* K = (const uint8_t*) k_cache;
+        const uint8_t* V = (const uint8_t*) v_cache;
+#define STRATA_ATTTC(KF, VF) launch_attn_chunk_tc<KF, VF>(q, K, V, out, T, n_head, n_kv, pos0, max_ctx, scale, st)
+        switch (k_fmt * 3 + v_fmt) {
+            case 0: STRATA_ATTTC(kF16, kF16); break;
+            case 1: STRATA_ATTTC(kF16, kQ8); break;
+            case 2: STRATA_ATTTC(kF16, kQ4); break;
+            case 3: STRATA_ATTTC(kQ8, kF16); break;
+            case 4: STRATA_ATTTC(kQ8, kQ8); break;
+            case 5: STRATA_ATTTC(kQ8, kQ4); break;
+            case 6: STRATA_ATTTC(kQ4, kF16); break;
+            case 7: STRATA_ATTTC(kQ4, kQ8); break;
+            default: STRATA_ATTTC(kQ4, kQ4); break;
+        }
+#undef STRATA_ATTTC
+        check("dense_attn_chunk_tc");
+        return;
+    }
     if (n_head % n_kv != 0)
         throw std::runtime_error("dense_attn_chunk: n_head must be a multiple of n_kv");
     check_kv_formats("dense_attn_chunk", k_fmt, v_fmt, head_dim);

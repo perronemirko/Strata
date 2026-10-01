@@ -562,9 +562,40 @@ int selftest() {
                 }
                 char name[64];
                 std::snprintf(name, sizeof name, "%s (worst query)", g.name);
-                report(name, Diff{worst, worst}, 2e-4);
+                report(name, Diff{worst, worst}, 5e-3);
                 cudaFree(dkf); cudaFree(dvf); cudaFree(dk); cudaFree(dv);
                 cudaFree(dchunk); cudaFree(ddec); cudaFree(dscr); cudaFree(dqh);
+            }
+        }
+                {   // tensor-core chunk attention over a long cache: 24 queries at position 600, against the decode kernel
+            const int H = 24, HK = 4, D = 256, max_ctx = 1024, T = 24, pos0 = 600, N = pos0 + T;
+            struct Fmt4 { const char* name; int kf, vf; };
+            const Fmt4 fmts4[] = {{"tc chunk fp16, pos0 600", 0, 0}, {"tc chunk int8, pos0 600", 1, 1},
+                                  {"tc chunk q4_0, pos0 600", 2, 2}, {"tc chunk k8v4, pos0 600", 1, 2}};
+            for (const Fmt4& g : fmts4) {
+                auto k = rnd((size_t) N * HK * D, 1.5f), v = rnd((size_t) N * HK * D), q = rnd((size_t) T * H * D);
+                float *dkf = to_dev(k), *dvf = to_dev(v), *dq = to_dev(q), *dchunk = nullptr, *ddec = nullptr, *dscr = nullptr;
+                const uint64_t kb = (uint64_t) HK * max_ctx * strata::kernels::dense_kv_cell_bytes(g.kf, D);
+                const uint64_t vb = (uint64_t) HK * max_ctx * strata::kernels::dense_kv_cell_bytes(g.vf, D);
+                void *dk = nullptr, *dv = nullptr;
+                cudaMalloc(&dk, kb); cudaMalloc(&dv, vb);
+                cudaMemset(dk, 0, kb); cudaMemset(dv, 0, vb);
+                cudaMalloc((void**) &dchunk, (size_t) T * H * D * 4);
+                cudaMalloc((void**) &ddec, (size_t) H * D * 4);
+                cudaMalloc((void**) &dscr, strata::kernels::dense_attn_scratch_bytes(H, D, max_ctx));
+                strata::kernels::dense_kv_append_rows_fmt(dk, dv, g.kf, g.vf, dkf, dvf, N, 0, HK, D, max_ctx, nullptr);
+                const float scale = 1.0f / std::sqrt((float) D);
+                strata::kernels::dense_attn_chunk_fmt(dq, dk, dv, g.kf, g.vf, dchunk, T, pos0, H, HK, D, max_ctx, scale, nullptr);
+                double worst = 0;
+                for (int t = 0; t < T; ++t) {
+                    strata::kernels::dense_attn_decode_fmt(dq + (size_t) t * H * D, dk, dv, g.kf, g.vf, ddec, dscr, H, HK, D,
+                                                           pos0 + t + 1, max_ctx, scale, nullptr);
+                    const auto a = from_dev(dchunk + (size_t) t * H * D, (size_t) H * D);
+                    worst = std::max(worst, compare(a, from_dev(ddec, (size_t) H * D)).abs);
+                }
+                report(g.name, Diff{worst, worst}, 5e-3);
+                cudaFree(dkf); cudaFree(dvf); cudaFree(dq); cudaFree(dk); cudaFree(dv);
+                cudaFree(dchunk); cudaFree(ddec); cudaFree(dscr);
             }
         }
     } catch (const std::exception& e) {
