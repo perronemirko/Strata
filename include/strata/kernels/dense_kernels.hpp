@@ -48,6 +48,27 @@ void dense_fill_i32(int32_t* dst, int n, int32_t value, void* stream);
 void dense_kv_append(uint16_t* k_cache, uint16_t* v_cache, const float* k, const float* v, int pos, int n_kv,
                      int head_dim, int max_ctx, void* stream);
 
+/// How the KV cache stores one head's values (the --kv option; the same names as strata's).
+///   F16 : head_dim halves.
+///   Q8  : head_dim/32 blocks of {half d; int8 q[32]}   (ggml Q8_0, "int8")
+///   Q4  : head_dim/32 blocks of {half d; uint8 q[16]}  (ggml Q4_0, "q4_0"), stored after an orthonormal
+///         Walsh-Hadamard rotation of the head's 256 values: the attention rotates q the same way and rotates its
+///         output back, so the cache needs head_dim == 256 for this format.
+/// K and V have a format each: `--kv k8v4` is Q8 keys (exact scores) with Q4 values.
+enum DenseKvFormat : int { DENSE_KV_F16 = 0, DENSE_KV_Q8 = 1, DENSE_KV_Q4 = 2 };
+
+/// Bytes of ONE head's ONE cell in `fmt` (a cache is [n_kv][max_ctx][this]).
+uint64_t dense_kv_cell_bytes(int fmt, int head_dim);
+
+/// dense_kv_append for any format: k_cache / v_cache are [n_kv][max_ctx][dense_kv_cell_bytes(fmt)] bytes.
+void dense_kv_append_fmt(void* k_cache, void* v_cache, int k_fmt, int v_fmt, const float* k, const float* v, int pos,
+                         int n_kv, int head_dim, int max_ctx, void* stream);
+
+/// dense_attn_decode for any format.  q is NOT rotated by the caller and out comes back in the original space.
+void dense_attn_decode_fmt(const float* q, const void* k_cache, const void* v_cache, int k_fmt, int v_fmt, float* out,
+                           float* scratch, int n_head, int n_kv, int head_dim, int n_ctx, int max_ctx, float scale,
+                           void* stream);
+
 /// Bytes of scratch dense_attn_decode needs for a cache of `max_ctx` cells.
 uint64_t dense_attn_scratch_bytes(int n_head, int head_dim, int max_ctx);
 

@@ -90,13 +90,15 @@ bool parse_ids(const char* p, std::vector<int32_t>& ids) {
 
 void usage() {
     std::fprintf(stderr,
-                 "usage: strata-dense --serve --native <model.gguf> [--context N] [--mtp [--draft-max N] [--draft-min N] [--draft-p-min P] [--mtp-force]]\n"
+                 "usage: strata-dense --serve --native <model.gguf> [--context N] [--kv fp16|int8|q4_0|k8v4] [--mtp [--draft-max N] [--draft-min N] [--draft-p-min P] [--mtp-force]]\n"
                  "                  [--prompt-chunk N | --no-prefill]\n"
-                 "       strata-dense --selftest | --check <model.gguf> [--mtp]\n"
+                 "       strata-dense --selftest | --check <model.gguf> [--mtp] [--kv fp16|int8|q4_0|k8v4]\n"
                  "  a dense qwen35 GGUF (Qwen3.8-27B) behind Strata's server protocol; the server runs it with\n"
                  "  `serve/server.py --engine strata --config <run config>` whose `exe` is this program.\n"
                  "  --prompt-chunk N feeds the prompt N tokens at a time through MMQ instead of 8 at a time through\n"
-                 "  the GEMVs (0 is the default; --no-prefill forces the old path).\n");
+                 "  the GEMVs (0 is the default; --no-prefill forces the old path).  A quantized --kv cache always\n"
+                 "  uses the GEMV path, because the chunked one only reads an fp16 cache.\n"
+                 "  --kv: the KV cache storage, the same option strata has (int8 about 53%% of fp16, q4_0 about 28%%, k8v4 about 40%%).\n");
 }
 
 // ---- `strata-dense --selftest`: the new CUDA kernels against a CPU reference, no model needed.
@@ -135,6 +137,35 @@ std::vector<float> from_dev(const float* d, size_t n) {
     std::vector<float> h(n);
     cudaMemcpy(h.data(), d, n * 4, cudaMemcpyDeviceToHost);
     return h;
+}
+
+// The KV cache formats, modelled on the host: the same rules the kernels follow (ggml Q8_0 / Q4_0 blocks of 32, the
+// orthonormal Walsh-Hadamard rotation before a Q4 store), so the GPU can be compared with them value by value.
+void host_fwht256(float* x) {
+    for (int len = 1; len < 256; len <<= 1)
+        for (int i = 0; i < 256; i += 2 * len)
+            for (int j = i; j < i + len; ++j) { const float a = x[j], b = x[j + len]; x[j] = a + b; x[j + len] = a - b; }
+    for (int i = 0; i < 256; ++i) x[i] *= 0.0625f;
+}
+
+float host_half_round(float f) { return strata::fp16_to_fp32(f32_to_f16_bits(f)); }
+
+// quantize + dequantize 256 values in place (fmt: 1 = Q8_0, 2 = Q4_0)
+void host_kv_roundtrip(int fmt, std::vector<float>& v) {
+    for (int g = 0; g < 8; ++g) {
+        float* x = &v[(size_t) g * 32];
+        if (fmt == 1) {
+            float amax = 0;
+            for (int i = 0; i < 32; ++i) amax = std::max(amax, std::fabs(x[i]));
+            const float d = amax / 127.0f, id = d != 0.0f ? 1.0f / d : 0.0f, dh = host_half_round(d);
+            for (int i = 0; i < 32; ++i) x[i] = std::nearbyint(x[i] * id) * dh;
+        } else {
+            float mx = 0, ax = 0;
+            for (int i = 0; i < 32; ++i) if (std::fabs(x[i]) > ax) { ax = std::fabs(x[i]); mx = x[i]; }
+            const float d = mx / -8.0f, id = d != 0.0f ? 1.0f / d : 0.0f, dh = host_half_round(d);
+            for (int i = 0; i < 32; ++i) x[i] = (float) (std::min(15, (int) (x[i] * id + 8.5f)) - 8) * dh;
+        }
+    }
 }
 
 int selftest() {
@@ -252,6 +283,71 @@ int selftest() {
             }
             report("kv_append (K cell)", compare(got, ref), 1e-6);
         }
+        {   // the KV cache formats (--kv): the quantizing append + the attention that reads it, against the host model
+            const int H = 24, HK = 4, D = 256, max_ctx = 512, n_ctx = 300;
+            using strata::kernels::dense_kv_cell_bytes;
+            if (dense_kv_cell_bytes(1, D) != 272 || dense_kv_cell_bytes(2, D) != 144 || dense_kv_cell_bytes(0, D) != 512) {
+                std::printf("%-34s FAIL (cell bytes %llu / %llu / %llu, expected 512 / 272 / 144)\n", "kv cell sizes",
+                            (unsigned long long) dense_kv_cell_bytes(0, D), (unsigned long long) dense_kv_cell_bytes(1, D),
+                            (unsigned long long) dense_kv_cell_bytes(2, D));
+                ++bad;
+            }
+            struct Fmt { const char* name; int kf, vf; };
+            const Fmt fmts[] = {{"kv int8 (K and V)", 1, 1}, {"kv q4_0 (K and V, rotated)", 2, 2}, {"kv k8v4 (int8 K, q4 V)", 1, 2}};
+            for (const Fmt& f : fmts) {
+                auto q = rnd((size_t) H * D), k = rnd((size_t) n_ctx * HK * D, 1.5f), v = rnd((size_t) n_ctx * HK * D);
+                float *dq = to_dev(q), *dkf = to_dev(k), *dvf = to_dev(v), *dout = nullptr, *dscr = nullptr;
+                const uint64_t kb = (uint64_t) HK * max_ctx * dense_kv_cell_bytes(f.kf, D), vb = (uint64_t) HK * max_ctx * dense_kv_cell_bytes(f.vf, D);
+                void *dk = nullptr, *dv = nullptr;
+                cudaMalloc(&dk, kb); cudaMalloc(&dv, vb);
+                cudaMemset(dk, 0, kb); cudaMemset(dv, 0, vb);
+                cudaMalloc((void**) &dout, (size_t) H * D * 4);
+                cudaMalloc((void**) &dscr, strata::kernels::dense_attn_scratch_bytes(H, D, max_ctx));
+                for (int pos = 0; pos < n_ctx; ++pos)
+                    strata::kernels::dense_kv_append_fmt(dk, dv, f.kf, f.vf, dkf + (size_t) pos * HK * D, dvf + (size_t) pos * HK * D,
+                                                         pos, HK, D, max_ctx, nullptr);
+                const float scale = 1.0f / std::sqrt((float) D);
+                strata::kernels::dense_attn_decode_fmt(dq, dk, dv, f.kf, f.vf, dout, dscr, H, HK, D, n_ctx, max_ctx, scale, nullptr);
+                // the host: what the cache holds (rotated + quantized + dequantized), and the attention over it
+                std::vector<float> kd((size_t) HK * n_ctx * D), vd(kd.size());
+                for (int t = 0; t < n_ctx; ++t)
+                    for (int h = 0; h < HK; ++h) {
+                        const float* ks = &k[((size_t) t * HK + h) * D];
+                        const float* vs = &v[((size_t) t * HK + h) * D];
+                        std::vector<float> a(ks, ks + D), b(vs, vs + D);
+                        if (f.kf == 2) host_fwht256(a.data());
+                        if (f.vf == 2) host_fwht256(b.data());
+                        host_kv_roundtrip(f.kf, a);
+                        host_kv_roundtrip(f.vf, b);
+                        std::copy(a.begin(), a.end(), kd.begin() + ((size_t) h * n_ctx + t) * D);
+                        std::copy(b.begin(), b.end(), vd.begin() + ((size_t) h * n_ctx + t) * D);
+                    }
+                std::vector<float> ref((size_t) H * D);
+                for (int h = 0; h < H; ++h) {
+                    const int kvh = h / (H / HK);
+                    std::vector<float> qh(q.begin() + (size_t) h * D, q.begin() + (size_t) (h + 1) * D);
+                    if (f.kf == 2) host_fwht256(qh.data());
+                    std::vector<double> sc((size_t) n_ctx);
+                    double mx = -1e300;
+                    for (int t = 0; t < n_ctx; ++t) {
+                        double d = 0;
+                        for (int i = 0; i < D; ++i) d += (double) qh[(size_t) i] * kd[((size_t) kvh * n_ctx + t) * D + i];
+                        sc[(size_t) t] = d * scale; mx = std::max(mx, sc[(size_t) t]);
+                    }
+                    double den = 0; for (auto& x : sc) { x = std::exp(x - mx); den += x; }
+                    std::vector<float> o(D);
+                    for (int i = 0; i < D; ++i) {
+                        double a = 0;
+                        for (int t = 0; t < n_ctx; ++t) a += sc[(size_t) t] * vd[((size_t) kvh * n_ctx + t) * D + i];
+                        o[(size_t) i] = (float) (a / den);
+                    }
+                    if (f.vf == 2) host_fwht256(o.data());
+                    std::copy(o.begin(), o.end(), ref.begin() + (size_t) h * D);
+                }
+                report(f.name, compare(from_dev(dout, ref.size()), ref), 5e-3);
+                cudaFree(dq); cudaFree(dkf); cudaFree(dvf); cudaFree(dk); cudaFree(dv); cudaFree(dout); cudaFree(dscr);
+            }
+        }
     } catch (const std::exception& e) {
         std::printf("selftest: exception: %s\n", e.what());
         return 1;
@@ -284,7 +380,7 @@ std::vector<float> read_logits(strata::core::DenseModel& m, int col) {
 
 int argmax_of(const std::vector<float>& v) { return (int) (std::max_element(v.begin(), v.end()) - v.begin()); }
 
-int check_model(const std::string& gguf, bool with_mtp) {
+int check_model(const std::string& gguf, bool with_mtp, const std::string& kv) {
     using strata::core::Logits;
     strata::core::DenseModel m;
     std::string err;
@@ -292,6 +388,7 @@ int check_model(const std::string& gguf, bool with_mtp) {
     opt.mtp = with_mtp;
     opt.mtp_force = true;                     // a check must not be switched off by the VRAM rule
     opt.draft_max = 3;
+    opt.kv = kv;
     if (!m.load(gguf, 512, err, opt)) { std::printf("load: %s\n", err.c_str()); return 1; }
     std::mt19937 rng(11);
     std::vector<int32_t> T(40);
@@ -395,19 +492,21 @@ int main(int argc, char** argv) {
         if (std::string(argv[i]) == "--selftest") return selftest();
         if (std::string(argv[i]) == "--check") {
             bool mtp = false;
-            std::string path;
+            std::string path, kv = "fp16";
             for (int j = 1; j < argc; ++j) {
                 const std::string a = argv[j];
                 if (a == "--mtp") mtp = true;
+                else if (a == "--kv" && j + 1 < argc) kv = argv[++j];
                 else if (a != "--check" && a.rfind("--", 0) != 0) path = a;
             }
-            if (path.empty()) { std::fprintf(stderr, "usage: strata-dense --check <model.gguf> [--mtp]\n"); return 2; }
-            return check_model(path, mtp);
+            if (path.empty()) { std::fprintf(stderr, "usage: strata-dense --check <model.gguf> [--mtp] [--kv fp16|int8|q4_0|k8v4]\n"); return 2; }
+            return check_model(path, mtp, kv);
         }
     }
     std::string gguf;
     long long context = 32768;
     bool serve = false, want_mtp = false, mtp_force = false;
+    std::string kv_type = "fp16";
     int draft_max = 2, draft_min = 1;
     float draft_p_min = 0.0f;
     // 0: the default prompt chunk; >0: ask for that chunk; <0 (--no-prefill): feed the prompt through run()
@@ -420,6 +519,7 @@ int main(int argc, char** argv) {
         };
         if (a == "--serve") serve = true;
         else if (a == "--mtp") want_mtp = true;
+        else if (a == "--kv") kv_type = next("--kv");
         else if (a == "--mtp-force") mtp_force = true;
         else if (a == "--draft-max" || a == "--spec-draft-n-max") draft_max = std::atoi(next("--draft-max"));
         else if (a == "--draft-min" || a == "--spec-draft-n-min") draft_min = std::atoi(next("--draft-min"));
@@ -449,6 +549,7 @@ int main(int argc, char** argv) {
     opt.mtp = want_mtp;
     opt.mtp_force = mtp_force;
     opt.draft_max = draft_max;
+    opt.kv = kv_type;
     if (!model.load(gguf, context, err, opt)) {
         std::fprintf(stderr, "strata-dense: %s\n", err.c_str());
         std::printf("ERR %s\n", err.c_str());
@@ -489,15 +590,15 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    std::printf("INFO engine=dense-0.2 model=%s layers=%d n_embd=%d weights_mib=%llu host_mib=%llu kv_mib=%llu context=%lld mtp=%d draft_max=%d draft_min=%d draft_p_min=%.2f\n",
+    std::printf("INFO engine=dense-0.2 model=%s layers=%d n_embd=%d weights_mib=%llu host_mib=%llu kv_mib=%llu context=%lld kv=%s mtp=%d draft_max=%d draft_min=%d draft_p_min=%.2f\n",
                 cfg.arch.c_str(), cfg.n_layer, cfg.n_embd, (unsigned long long) (model.weight_bytes() >> 20),
                 (unsigned long long) (model.host_weight_bytes() >> 20), (unsigned long long) (model.kv_bytes() >> 20),
-                (long long) model.max_context(), model.has_mtp() ? 1 : 0, model.has_mtp() ? draft_max : 0,
+                (long long) model.max_context(), model.kv_type().c_str(), model.has_mtp() ? 1 : 0, model.has_mtp() ? draft_max : 0,
                 model.has_mtp() ? draft_min : 0, (double) draft_p_min);
     std::printf("READY %lld stop\n", (long long) model.max_context());
     std::fflush(stdout);
-    std::fprintf(stderr, "strata-dense: ready - %.2f GiB of weights, %.2f GiB of KV cache, context %lld%s\n",
-                 model.weight_bytes() / 1073741824.0, model.kv_bytes() / 1073741824.0, (long long) model.max_context(),
+    std::fprintf(stderr, "strata-dense: ready - %.2f GiB of weights, %.2f GiB of KV cache (%s), context %lld%s\n",
+                 model.weight_bytes() / 1073741824.0, model.kv_bytes() / 1073741824.0, model.kv_type().c_str(), (long long) model.max_context(),
                  model.has_mtp() ? ", MTP speculative decoding on" : (want_mtp ? ", MTP requested but OFF (see above)" : ""));
 
     Lines in;

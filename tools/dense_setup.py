@@ -86,6 +86,11 @@ def main() -> int:
     ap.add_argument("--context", type=int, default=32768)
     ap.add_argument("--build", action="store_true", help="build strata-dense (CUDA)")
     ap.add_argument("--arch", default="native", help="CMAKE_CUDA_ARCHITECTURES, e.g. 86 (RTX 30), 89 (RTX 40), 120 (RTX 50)")
+    ap.add_argument("--kv", choices=["fp16", "int8", "q4_0", "k8v4"], default="fp16",
+                    help="KV cache storage, the same option as strata's setup: fp16 (default), int8 (~53%% of the memory), "
+                         "q4_0 (~28%%, Hadamard-rotated 4-bit) or k8v4 (int8 keys + 4-bit values, ~40%%). Per 1K tokens of "
+                         "this model (17 attention layers incl. MTP): fp16 ~ 71 MB, int8 ~ 38, k8v4 ~ 29, q4_0 ~ 20. "
+                         "A quantized cache feeds the prompt through the FP32 GEMVs, not through MMQ")
     ap.add_argument("--mtp", action="store_true",
                     help="speculative decoding with the model's own MTP block (it is inside the GGUF; ~1.4 GB more VRAM)")
     ap.add_argument("--draft-max", type=int, default=2, metavar="N",
@@ -124,7 +129,8 @@ def main() -> int:
             say(f"NOTE: {exe} does not exist yet - run again with --build")
 
     cfg = {
-        "exe": str(exe), "args": ["--native", str(gguf), "--context", str(a.context)] + (
+        "exe": str(exe), "args": ["--native", str(gguf), "--context", str(a.context)] +
+            (["--kv", a.kv] if a.kv != "fp16" else []) + (
             ["--mtp", "--draft-max", str(a.draft_max), "--draft-min", str(a.draft_min), "--draft-p-min", str(a.draft_p_min)]
             + (["--mtp-force"] if a.mtp_force else []) if a.mtp else []), "cwd": str(ROOT),
         "tokenizer": str(pack / "tokenizer"), "model_name": "qwen3.8-27b", "port": a.port,

@@ -147,22 +147,109 @@ __global__ void fill_i32_kernel(int32_t* dst, int n, int32_t v) {
 }
 
 // ------------------------------------------------------------------------------------------------ KV cache
-__global__ void kv_append_kernel(__half* __restrict__ kc, __half* __restrict__ vc, const float* __restrict__ k,
-                                 const float* __restrict__ v, int pos, int head_dim, int max_ctx) {
-    const int h = blockIdx.x;
-    const size_t cell = ((size_t) h * max_ctx + pos) * head_dim;
-    for (int i = threadIdx.x; i < head_dim; i += blockDim.x) {
-        kc[cell + i] = __float2half(k[(size_t) h * head_dim + i]);
-        vc[cell + i] = __float2half(v[(size_t) h * head_dim + i]);
+// One head's one cell is head_dim values in one of three layouts (see DenseKvFormat).  Q8 and Q4 are ggml's Q8_0 and
+// Q4_0 blocks of 32 values, so lane l of a warp that owns the dims lane + 32 * i finds dim i's block at block i.
+struct Q8Blk { __half d; int8_t q[32]; };      // x ~ q * d
+struct Q4Blk { __half d; uint8_t q[16]; };     // x ~ (nibble - 8) * d; byte j holds value j (low) and j + 16 (high)
+static_assert(sizeof(Q8Blk) == 34 && sizeof(Q4Blk) == 18, "KV block layout");
+
+constexpr int kF16 = DENSE_KV_F16, kQ8 = DENSE_KV_Q8, kQ4 = DENSE_KV_Q4;
+
+__host__ __device__ constexpr int cell_bytes(int fmt, int head_dim) {
+    return fmt == kF16 ? head_dim * 2 : fmt == kQ8 ? head_dim / 32 * 34 : head_dim / 32 * 18;
+}
+
+// In-place orthonormal Walsh-Hadamard transform of 256 floats in shared memory, by the 256 threads of the block.
+// It is symmetric and its own inverse: applying it twice gives the input back.
+__device__ __forceinline__ void fwht256_shared(float* buf) {
+    const int t = threadIdx.x;
+    for (int len = 1; len < 256; len <<= 1) {
+        __syncthreads();
+        const float a = buf[t], b = buf[t ^ len];
+        __syncthreads();
+        buf[t] = (t & len) ? (b - a) : (a + b);
     }
+    __syncthreads();
+    buf[t] *= 0.0625f;                      // 1 / sqrt(256)
+    __syncthreads();
+}
+
+// Stores buf[0..head_dim) as one cell.  One warp per block of 32 values; blockDim.x == head_dim.
+template <int F>
+__device__ __forceinline__ void kv_store_cell(uint8_t* cell, const float* buf) {
+    const int t = threadIdx.x;
+    if (F == kF16) { ((__half*) cell)[t] = __float2half(buf[t]); return; }
+    const int warp = t >> 5, lane = t & 31;
+    const float x = buf[t];
+    if (F == kQ8) {
+        float amax = fabsf(x);
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
+        const float d = amax / 127.0f;
+        const float id = d != 0.0f ? 1.0f / d : 0.0f;
+        Q8Blk* b = (Q8Blk*) cell + warp;
+        b->q[lane] = (int8_t) rintf(x * id);
+        if (lane == 0) b->d = __float2half(d);
+    } else {
+        // ggml's Q4_0 rule: d = (the value of largest magnitude, with its sign) / -8; q = min(15, trunc(x / d + 8.5)).
+        // The pair (|x|, lane) is a total order, so every lane of the butterfly ends on the same winner.
+        float mx = x, ax = fabsf(x);
+        int idx = lane;
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) {
+            const float om = __shfl_xor_sync(0xffffffffu, mx, o);
+            const int oi = __shfl_xor_sync(0xffffffffu, idx, o);
+            const float oa = fabsf(om);
+            if (oa > ax || (oa == ax && oi < idx)) { mx = om; ax = oa; idx = oi; }
+        }
+        const float d = mx / -8.0f;
+        const float id = d != 0.0f ? 1.0f / d : 0.0f;
+        const int q = min(15, (int) (x * id + 8.5f));
+        const int qh = __shfl_down_sync(0xffffffffu, q, 16);
+        Q4Blk* b = (Q4Blk*) cell + warp;
+        if (lane < 16) b->q[lane] = (uint8_t) (q | (qh << 4));
+        if (lane == 0) b->d = __float2half(d);
+    }
+}
+
+// The value of dim (lane + 32 * i) of a cell.
+template <int F>
+__device__ __forceinline__ float kv_val(const uint8_t* cell, int i, int lane) {
+    if (F == kF16) return __half2float(((const __half*) cell)[lane + 32 * i]);
+    if (F == kQ8) {
+        const Q8Blk* b = (const Q8Blk*) cell + i;
+        return (float) b->q[lane] * __half2float(b->d);
+    }
+    const Q4Blk* b = (const Q4Blk*) cell + i;
+    const int by = b->q[lane & 15];
+    return (float) ((lane < 16 ? (by & 15) : (by >> 4)) - 8) * __half2float(b->d);
+}
+
+template <int KF, int VF>
+__global__ void kv_append_kernel(uint8_t* __restrict__ kc, uint8_t* __restrict__ vc, const float* __restrict__ k,
+                                 const float* __restrict__ v, int pos, int head_dim, int max_ctx) {
+    __shared__ float buf[kMaxHeadDim];
+    const int h = blockIdx.x, t = threadIdx.x;
+    const size_t cell = (size_t) h * max_ctx + pos;
+    buf[t] = k[(size_t) h * head_dim + t];
+    __syncthreads();
+    if (KF == kQ4) fwht256_shared(buf);
+    kv_store_cell<KF>(kc + cell * cell_bytes(KF, head_dim), buf);
+    __syncthreads();
+    buf[t] = v[(size_t) h * head_dim + t];
+    __syncthreads();
+    if (VF == kQ4) fwht256_shared(buf);
+    kv_store_cell<VF>(vc + cell * cell_bytes(VF, head_dim), buf);
 }
 
 // ------------------------------------------------------------------------------------------------ attention
 // Grid (n_head, n_splits), 256 threads = 8 warps.  A warp owns a cell at a time: its 32 lanes hold head_dim/32
-// dims each (strided by 32 so the half loads coalesce), the dot product is a warp reduction, and the warp's
+// dims each (strided by 32 so the loads coalesce), the dot product is a warp reduction, and the warp's
 // running (m, l, acc) is the online softmax over the cells it visited (cells t = begin + warp, +8, ...).
-__global__ void attn_partial_kernel(const float* __restrict__ q, const __half* __restrict__ K,
-                                    const __half* __restrict__ V, float* __restrict__ part_acc,
+// With Q4 keys q is rotated (Walsh-Hadamard) first; the scores q . k are the same in the rotated space.
+template <int KF, int VF>
+__global__ void attn_partial_kernel(const float* __restrict__ q, const uint8_t* __restrict__ K,
+                                    const uint8_t* __restrict__ V, float* __restrict__ part_acc,
                                     float* __restrict__ part_ml, int n_head, int n_kv, int head_dim, int n_ctx,
                                     int max_ctx, float scale, int n_splits) {
     const int h = blockIdx.x, split = blockIdx.y;
@@ -170,12 +257,22 @@ __global__ void attn_partial_kernel(const float* __restrict__ q, const __half* _
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int per = head_dim >> 5;                       // dims per lane, <= 8
 
+    __shared__ float sq[kMaxHeadDim];
     float qv[8];
+    if (KF == kQ4) {                                      // head_dim == 256: one thread per dim
+        sq[threadIdx.x] = q[(size_t) h * head_dim + threadIdx.x];
+        __syncthreads();
+        fwht256_shared(sq);
 #pragma unroll
-    for (int i = 0; i < 8; ++i) qv[i] = i < per ? q[(size_t) h * head_dim + lane + 32 * i] * scale : 0.0f;
+        for (int i = 0; i < 8; ++i) qv[i] = i < per ? sq[lane + 32 * i] * scale : 0.0f;
+    } else {
+#pragma unroll
+        for (int i = 0; i < 8; ++i) qv[i] = i < per ? q[(size_t) h * head_dim + lane + 32 * i] * scale : 0.0f;
+    }
 
-    const __half* Kb = K + (size_t) kvh * max_ctx * head_dim;
-    const __half* Vb = V + (size_t) kvh * max_ctx * head_dim;
+    const size_t kcell = (size_t) cell_bytes(KF, head_dim), vcell = (size_t) cell_bytes(VF, head_dim);
+    const uint8_t* Kb = K + (size_t) kvh * max_ctx * kcell;
+    const uint8_t* Vb = V + (size_t) kvh * max_ctx * vcell;
     const int begin = split * kChunk;
     const int end = min(n_ctx, begin + kChunk);
 
@@ -184,18 +281,20 @@ __global__ void attn_partial_kernel(const float* __restrict__ q, const __half* _
     for (int i = 0; i < 8; ++i) acc[i] = 0.0f;
 
     for (int t = begin + warp; t < end; t += kWarps) {
+        const uint8_t* kcl = Kb + (size_t) t * kcell;
         float d = 0.0f;
 #pragma unroll
         for (int i = 0; i < 8; ++i)
-            if (i < per) d += qv[i] * __half2float(Kb[(size_t) t * head_dim + lane + 32 * i]);
+            if (i < per) d += qv[i] * kv_val<KF>(kcl, i, lane);
         d = warp_sum(d);
         const float mn = fmaxf(m, d);
         const float corr = __expf(m - mn);               // m == -FLT_MAX on the first cell: exp(-huge) = 0
         const float p = __expf(d - mn);
         l = l * corr + p;
+        const uint8_t* vcl = Vb + (size_t) t * vcell;
 #pragma unroll
         for (int i = 0; i < 8; ++i)
-            if (i < per) acc[i] = acc[i] * corr + p * __half2float(Vb[(size_t) t * head_dim + lane + 32 * i]);
+            if (i < per) acc[i] = acc[i] * corr + p * kv_val<VF>(vcl, i, lane);
         m = mn;
     }
 
@@ -225,9 +324,12 @@ __global__ void attn_partial_kernel(const float* __restrict__ q, const __half* _
     }
 }
 
-// Grid n_head, head_dim threads: merges the chunks of one head.
+// Grid n_head, head_dim threads: merges the chunks of one head.  With Q4 values the sum is in the rotated space:
+// the rotation (its own inverse) takes it back.
+template <int VF>
 __global__ void attn_merge_kernel(const float* __restrict__ part_acc, const float* __restrict__ part_ml,
                                   float* __restrict__ out, int head_dim, int n_splits) {
+    __shared__ float so[kMaxHeadDim];
     const int h = blockIdx.x;
     float gm = -FLT_MAX;
     for (int s = 0; s < n_splits; ++s) gm = fmaxf(gm, part_ml[((size_t) h * n_splits + s) * 2]);
@@ -239,7 +341,14 @@ __global__ void attn_merge_kernel(const float* __restrict__ part_acc, const floa
         a += part_acc[((size_t) h * n_splits + s) * head_dim + threadIdx.x] * f;
         L += l * f;
     }
-    out[(size_t) h * head_dim + threadIdx.x] = L > 0.0f ? a / L : 0.0f;
+    float val = L > 0.0f ? a / L : 0.0f;
+    if (VF == kQ4) {
+        so[threadIdx.x] = val;
+        __syncthreads();
+        fwht256_shared(so);
+        val = so[threadIdx.x];
+    }
+    out[(size_t) h * head_dim + threadIdx.x] = val;
 }
 
 int splits_for(int cells) { return (cells + kChunk - 1) / kChunk; }
@@ -513,12 +622,48 @@ void dense_fill_i32(int32_t* dst, int n, int32_t value, void* stream) {
     check("dense_fill_i32");
 }
 
+uint64_t dense_kv_cell_bytes(int fmt, int head_dim) {
+    if (fmt < kF16 || fmt > kQ4) throw std::runtime_error("dense_kv_cell_bytes: unknown KV format");
+    return (uint64_t) cell_bytes(fmt, head_dim);
+}
+
+namespace {
+void check_kv_formats(const char* who, int k_fmt, int v_fmt, int head_dim) {
+    if (k_fmt < kF16 || k_fmt > kQ4 || v_fmt < kF16 || v_fmt > kQ4)
+        throw std::runtime_error(std::string(who) + ": unknown KV format");
+    if (head_dim <= 0 || head_dim % 32 != 0 || head_dim > kMaxHeadDim)
+        throw std::runtime_error(std::string(who) + ": head_dim must be a multiple of 32 up to 256");
+    if ((k_fmt == kQ4 || v_fmt == kQ4) && head_dim != 256)
+        throw std::runtime_error(std::string(who) + ": the Q4 KV format rotates 256 values per head, so head_dim must be 256");
+}
+}  // namespace
+
+void dense_kv_append_fmt(void* k_cache, void* v_cache, int k_fmt, int v_fmt, const float* k, const float* v, int pos,
+                         int n_kv, int head_dim, int max_ctx, void* stream) {
+    if (pos < 0 || pos >= max_ctx) throw std::runtime_error("dense_kv_append: position outside the cache");
+    check_kv_formats("dense_kv_append", k_fmt, v_fmt, head_dim);
+    const cudaStream_t st = (cudaStream_t) stream;
+    uint8_t* kc = (uint8_t*) k_cache;
+    uint8_t* vc = (uint8_t*) v_cache;
+#define STRATA_KVAPP(K, V) kv_append_kernel<K, V><<<n_kv, head_dim, 0, st>>>(kc, vc, k, v, pos, head_dim, max_ctx)
+    switch (k_fmt * 3 + v_fmt) {
+        case 0: STRATA_KVAPP(kF16, kF16); break;
+        case 1: STRATA_KVAPP(kF16, kQ8); break;
+        case 2: STRATA_KVAPP(kF16, kQ4); break;
+        case 3: STRATA_KVAPP(kQ8, kF16); break;
+        case 4: STRATA_KVAPP(kQ8, kQ8); break;
+        case 5: STRATA_KVAPP(kQ8, kQ4); break;
+        case 6: STRATA_KVAPP(kQ4, kF16); break;
+        case 7: STRATA_KVAPP(kQ4, kQ8); break;
+        default: STRATA_KVAPP(kQ4, kQ4); break;
+    }
+#undef STRATA_KVAPP
+    check("dense_kv_append");
+}
+
 void dense_kv_append(uint16_t* k_cache, uint16_t* v_cache, const float* k, const float* v, int pos, int n_kv,
                      int head_dim, int max_ctx, void* stream) {
-    if (pos < 0 || pos >= max_ctx) throw std::runtime_error("dense_kv_append: position outside the cache");
-    kv_append_kernel<<<n_kv, 128, 0, (cudaStream_t) stream>>>((__half*) k_cache, (__half*) v_cache, k, v, pos,
-                                                              head_dim, max_ctx);
-    check("dense_kv_append");
+    dense_kv_append_fmt(k_cache, v_cache, kF16, kF16, k, v, pos, n_kv, head_dim, max_ctx, stream);
 }
 
 uint64_t dense_attn_scratch_bytes(int n_head, int head_dim, int max_ctx) {
@@ -526,23 +671,46 @@ uint64_t dense_attn_scratch_bytes(int n_head, int head_dim, int max_ctx) {
     return (uint64_t) n_head * splits * ((uint64_t) head_dim + 2) * sizeof(float);
 }
 
-void dense_attn_decode(const float* q, const uint16_t* k_cache, const uint16_t* v_cache, float* out, float* scratch,
-                       int n_head, int n_kv, int head_dim, int n_ctx, int max_ctx, float scale, void* stream) {
+void dense_attn_decode_fmt(const float* q, const void* k_cache, const void* v_cache, int k_fmt, int v_fmt, float* out,
+                           float* scratch, int n_head, int n_kv, int head_dim, int n_ctx, int max_ctx, float scale,
+                           void* stream) {
     if (n_ctx < 1 || n_ctx > max_ctx) throw std::runtime_error("dense_attn_decode: n_ctx outside the cache");
     if (head_dim % 32 != 0 || head_dim > kMaxHeadDim || n_head % n_kv != 0)
         throw std::runtime_error("dense_attn_decode: head_dim must be a multiple of 32 up to 256 and n_head a multiple of n_kv");
+    check_kv_formats("dense_attn_decode", k_fmt, v_fmt, head_dim);
     const int n_splits = splits_for(n_ctx);
     const int max_splits = splits_for(max_ctx);
     // the partials sit at a stride of n_splits of THIS call; the scratch was sized for max_splits
     float* part_acc = scratch;
     float* part_ml = scratch + (size_t) n_head * max_splits * head_dim;
-    dim3 grid(n_head, n_splits);
-    attn_partial_kernel<<<grid, kWarps * 32, 0, (cudaStream_t) stream>>>(
-        q, (const __half*) k_cache, (const __half*) v_cache, part_acc, part_ml, n_head, n_kv, head_dim, n_ctx,
-        max_ctx, scale, n_splits);
+    const cudaStream_t st = (cudaStream_t) stream;
+    const uint8_t* K = (const uint8_t*) k_cache;
+    const uint8_t* V = (const uint8_t*) v_cache;
+    const dim3 grid(n_head, n_splits);
+#define STRATA_ATT(KF, VF)                                                                                      \
+    attn_partial_kernel<KF, VF><<<grid, kWarps * 32, 0, st>>>(q, K, V, part_acc, part_ml, n_head, n_kv,         \
+                                                              head_dim, n_ctx, max_ctx, scale, n_splits)
+    switch (k_fmt * 3 + v_fmt) {
+        case 0: STRATA_ATT(kF16, kF16); break;
+        case 1: STRATA_ATT(kF16, kQ8); break;
+        case 2: STRATA_ATT(kF16, kQ4); break;
+        case 3: STRATA_ATT(kQ8, kF16); break;
+        case 4: STRATA_ATT(kQ8, kQ8); break;
+        case 5: STRATA_ATT(kQ8, kQ4); break;
+        case 6: STRATA_ATT(kQ4, kF16); break;
+        case 7: STRATA_ATT(kQ4, kQ8); break;
+        default: STRATA_ATT(kQ4, kQ4); break;
+    }
+#undef STRATA_ATT
     check("dense_attn_partial");
-    attn_merge_kernel<<<n_head, head_dim, 0, (cudaStream_t) stream>>>(part_acc, part_ml, out, head_dim, n_splits);
+    if (v_fmt == kQ4) attn_merge_kernel<kQ4><<<n_head, head_dim, 0, st>>>(part_acc, part_ml, out, head_dim, n_splits);
+    else attn_merge_kernel<kF16><<<n_head, head_dim, 0, st>>>(part_acc, part_ml, out, head_dim, n_splits);
     check("dense_attn_merge");
+}
+
+void dense_attn_decode(const float* q, const uint16_t* k_cache, const uint16_t* v_cache, float* out, float* scratch,
+                       int n_head, int n_kv, int head_dim, int n_ctx, int max_ctx, float scale, void* stream) {
+    dense_attn_decode_fmt(q, k_cache, v_cache, kF16, kF16, out, scratch, n_head, n_kv, head_dim, n_ctx, max_ctx, scale, stream);
 }
 
 // ============================================================================ the batched prompt path

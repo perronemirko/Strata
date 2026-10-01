@@ -19,6 +19,7 @@
 
 #include <algorithm>
 #include <climits>
+#include <cctype>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -254,6 +255,7 @@ struct DenseModel::Impl {
     int host_tensors = 0;
     long long dbg_from = -1, dbg_to = -1;           // STRATA_DENSE_DEBUG=A:B traces the steps with A <= position < B
     Prof prof;                                      // STRATA_DENSE_PROF=1
+    int kfmt = DENSE_KV_F16, vfmt = DENSE_KV_F16;   // how the KV cache stores K and V (--kv)
     cudaStream_t stream = nullptr;
     cudaEvent_t embed_done = nullptr;
 
@@ -553,9 +555,9 @@ void DenseModel::Impl::attn_block(const DenseConfig& c, const QMat& wq, const QM
         dense_fill_i32(pos_dev, mh, (int32_t) (pos0 + j), s);
         native_rope_apply(qj, qj, H, D, c.n_rot, rope, pos_dev, s);
         native_rope_apply(kj, kj, HK, D, c.n_rot, rope, pos_dev, s);
-        dense_kv_append(kc, vc, kj, vcur + (size_t) j * HK * D, pos0 + j, HK, D, (int) max_context, s);
-        dense_attn_decode(qj, kc, vc, attn + (size_t) j * H * D, attn_scratch, H, HK, D, pos0 + j + 1, (int) max_context,
-                          scale, s);
+        dense_kv_append_fmt(kc, vc, kfmt, vfmt, kj, vcur + (size_t) j * HK * D, pos0 + j, HK, D, (int) max_context, s);
+        dense_attn_decode_fmt(qj, kc, vc, kfmt, vfmt, attn + (size_t) j * H * D, attn_scratch, H, HK, D, pos0 + j + 1,
+                              (int) max_context, scale, s);
         native_qsa_gate_apply(attn + (size_t) j * H * D, qfj, attn32 + (size_t) j * H * D, H, D, s);
     }
     }
@@ -831,6 +833,23 @@ bool DenseModel::load(const std::string& path, int64_t max_context, std::string&
         const Found* mtp_embd = with_mtp ? I.find(mp + "nextn.embed_tokens.weight") : nullptr;
         if (mtp_embd && !I.setup_embd(I.embd_mtp, mtp_embd, E, err)) return false;
 
+        // ---- 3b. the KV cache format (strata's --kv)
+        {
+            std::string kv = opt.kv;
+            for (char& ch : kv) ch = (char) std::tolower((unsigned char) ch);
+            if (kv.empty() || kv == "fp16" || kv == "f16") { I.kfmt = DENSE_KV_F16; I.vfmt = DENSE_KV_F16; kv_name_ = "fp16"; }
+            else if (kv == "int8" || kv == "q8_0" || kv == "q8") { I.kfmt = DENSE_KV_Q8; I.vfmt = DENSE_KV_Q8; kv_name_ = "int8"; }
+            else if (kv == "q4_0" || kv == "q4") { I.kfmt = DENSE_KV_Q4; I.vfmt = DENSE_KV_Q4; kv_name_ = "q4_0"; }
+            else if (kv == "k8v4") { I.kfmt = DENSE_KV_Q8; I.vfmt = DENSE_KV_Q4; kv_name_ = "k8v4"; }
+            else { err = "dense model: --kv must be fp16, int8, q4_0 or k8v4 (got '" + opt.kv + "')"; return false; }
+            if ((I.kfmt == DENSE_KV_Q4 || I.vfmt == DENSE_KV_Q4) && cfg_.head_dim != 256) {
+                err = "dense model: --kv " + kv_name_ + " rotates 256 values per head, but this model's head_dim is " +
+                      std::to_string(cfg_.head_dim) + "; use fp16 or int8";
+                return false;
+            }
+        }
+        const uint64_t kcell = dense_kv_cell_bytes(I.kfmt, cfg_.head_dim), vcell = dense_kv_cell_bytes(I.vfmt, cfg_.head_dim);
+
         // ---- 4. the VRAM budget for the weights
         uint64_t total = 0;
         const int C = cfg_.conv_channels(), V = cfg_.value_dim(), H = cfg_.n_head, HK = cfg_.n_head_kv, D = cfg_.head_dim;
@@ -840,7 +859,7 @@ bool DenseModel::load(const std::string& path, int64_t max_context, std::string&
             for (int l = 0; l < cfg_.n_layer; ++l) {
                 if (I.find("blk." + std::to_string(l) + ".attn_q.weight")) ++n_attn; else ++n_gdn;
             }
-            const uint64_t kv_per_layer = 2ull * (uint64_t) HK * (uint64_t) max_context * (uint64_t) D * 2;
+            const uint64_t kv_per_layer = (uint64_t) HK * (uint64_t) max_context * (kcell + vcell);
             const uint64_t snap_one = (uint64_t) cfg_.ssm_state * cfg_.ssm_v_heads * cfg_.ssm_state * 4 +
                                       (uint64_t) C * (cfg_.ssm_d_conv - 1) * 4;     // one snapshot of one GDN layer
             auto reserved_for = [&](bool mtp) {
@@ -869,7 +888,7 @@ bool DenseModel::load(const std::string& path, int64_t max_context, std::string&
             const bool user_cap = std::getenv("STRATA_DENSE_GPU_MIB") != nullptr;
             if (with_mtp && !user_cap && !opt.mtp_force && budget_for(true) < (int64_t) (trunk_bytes + mtp_bytes)) {
                 // the longest context at which everything, MTP included, stays in VRAM
-                const int64_t per_token = (int64_t) (n_attn + 1) * 2 * HK * D * 2;          // KV bytes per token, MTP layer too
+                const int64_t per_token = (int64_t) (n_attn + 1) * HK * (int64_t) (kcell + vcell);   // KV bytes per token, MTP layer too
                 const int64_t room = (int64_t) free_b - (int64_t) margin - (int64_t) (trunk_bytes + mtp_bytes) -
                                      (int64_t) ((uint64_t) n_gdn * snap_one * (uint64_t) draft_max);
                 const int64_t fit_ctx = room > 0 ? (room / per_token) / 1024 * 1024 : 0;
@@ -897,9 +916,9 @@ bool DenseModel::load(const std::string& path, int64_t max_context, std::string&
                       " MiB of VRAM are free (1 GiB is kept as margin). Use a shorter --context.";
                 return false;
             }
-            std::fprintf(stderr, "strata-dense: VRAM %zu MiB free of %zu; KV cache %llu MiB (context %lld)%s; "
+            std::fprintf(stderr, "strata-dense: VRAM %zu MiB free of %zu; KV cache %llu MiB (%s, context %lld)%s; "
                          "%llu MiB of weights may go to the GPU (the model needs %.0f MiB), the rest stays in host memory\n",
-                         free_b >> 20, total_b >> 20, (unsigned long long) (kv_need >> 20), (long long) max_context,
+                         free_b >> 20, total_b >> 20, (unsigned long long) (kv_need >> 20), kv_name_.c_str(), (long long) max_context,
                          with_mtp ? " + MTP snapshots" : "", (unsigned long long) (I.budget >> 20),
                          (double) (trunk_bytes + (with_mtp ? mtp_bytes : 0)) / 1048576.0);
         }
@@ -929,9 +948,9 @@ bool DenseModel::load(const std::string& path, int64_t max_context, std::string&
             if (I.find(mp + "nextn.shared_head_head.weight") &&
                 !mat("nextn.shared_head_head.weight", E, cfg_.n_vocab, M.head))
                 return false;                              // otherwise the trunk's head is shared (set below)
-            const uint64_t kv = (uint64_t) HK * (uint64_t) max_context * (uint64_t) D * 2;
-            if (!I.alloc(&M.kc, kv, err, "MTP K cache") || !I.alloc(&M.vc, kv, err, "MTP V cache")) return false;
-            kv_bytes_ += 2 * kv;
+            const uint64_t kb = (uint64_t) HK * (uint64_t) max_context * kcell, vb = (uint64_t) HK * (uint64_t) max_context * vcell;
+            if (!I.alloc(&M.kc, kb, err, "MTP K cache") || !I.alloc(&M.vc, vb, err, "MTP V cache")) return false;
+            kv_bytes_ += kb + vb;
         }
 
         // ---- 6. the trunk layers
@@ -999,9 +1018,9 @@ bool DenseModel::load(const std::string& path, int64_t max_context, std::string&
                 if (!I.upload_floats(I.find(p + "attn_q_norm.weight"), p + "attn_q_norm.weight", D, &L.q_norm, err) ||
                     !I.upload_floats(I.find(p + "attn_k_norm.weight"), p + "attn_k_norm.weight", D, &L.k_norm, err))
                     return false;
-                const uint64_t kv = (uint64_t) HK * (uint64_t) max_context * (uint64_t) D * 2;   // half
-                if (!I.alloc(&L.kc, kv, err, "K cache") || !I.alloc(&L.vc, kv, err, "V cache")) return false;
-                kv_bytes_ += 2 * kv;
+                const uint64_t kb = (uint64_t) HK * (uint64_t) max_context * kcell, vb = (uint64_t) HK * (uint64_t) max_context * vcell;
+                if (!I.alloc(&L.kc, kb, err, "K cache") || !I.alloc(&L.vc, vb, err, "V cache")) return false;
+                kv_bytes_ += kb + vb;
             }
         }
 
@@ -1158,6 +1177,14 @@ bool DenseModel::prefill_setup(int64_t chunk, std::string& err) {
     pf_chunk_ = 0;
 #ifdef STRATA_DENSE_MMQ
     Impl& I = *impl_;
+    // The batched prompt path appends and reads the cache through the fp16 kernels (dense_kv_append_rows,
+    // dense_attn_chunk).  A quantized --kv cache is a different layout, so the chunked path stays off and the
+    // caller feeds the prompt through run(), which uses the format-aware kernels.
+    if (I.kfmt != DENSE_KV_F16 || I.vfmt != DENSE_KV_F16) {
+        err = "dense model: prefill() only reads an fp16 KV cache; --kv " + kv_name_ +
+              " feeds the prompt with run() instead";
+        return false;
+    }
     if (chunk <= 0) chunk = kPrefillDefaultCols;
     chunk = std::max<int64_t>(NC, std::min<int64_t>(chunk, kPrefillMaxCols));
     const int E = cfg_.n_embd, C = cfg_.conv_channels(), V = cfg_.value_dim();

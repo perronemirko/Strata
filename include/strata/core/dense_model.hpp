@@ -61,6 +61,10 @@ struct DenseOptions {
     bool mtp = false;            ///< load the MTP block and allow mtp_draft()
     bool mtp_force = false;      ///< keep MTP even when the weights do not all fit in VRAM (otherwise it is switched off)
     int draft_max = 2;           ///< most tokens one draft proposes (1..kMaxCols-1); sizes the rollback snapshots
+    /// KV cache storage, spelled as strata's own `--kv`: "fp16" (default), "int8" (8-bit, about 53% of fp16),
+    /// "q4_0" (4-bit after a Hadamard rotation, about 28%) or "k8v4" (int8 keys, 4-bit values, about 40%).
+    /// "f16", "q8_0" and "q4" are accepted too.  The 4-bit formats need head_dim 256.
+    std::string kv = "fp16";
 };
 
 class DenseModel {
@@ -93,6 +97,8 @@ public:
     uint64_t host_weight_bytes() const { return host_bytes_; }
     uint64_t kv_bytes() const { return kv_bytes_; }
     bool has_mtp() const { return has_mtp_; }
+    /// The KV cache format in use, as `--kv` spells it: fp16, int8, q4_0 or k8v4.
+    const std::string& kv_type() const { return kv_name_; }
     int draft_max() const { return draft_max_; }
 
     /// Forgets the conversation: zeroes the recurrent state, the last hidden state and the position.
@@ -162,6 +168,7 @@ private:
     bool pf_ready_ = false;
     int snap_cols_ = 0, draft_max_ = 0;
     bool snap_valid_ = false, has_mtp_ = false;
+    std::string kv_name_ = "fp16";
     uint64_t weight_bytes_ = 0, kv_bytes_ = 0, host_bytes_ = 0;
     std::unique_ptr<Impl> impl_;
 };
