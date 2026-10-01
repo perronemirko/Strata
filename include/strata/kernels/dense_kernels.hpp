@@ -118,8 +118,20 @@ void dense_gemv_f32_rows(const float* W, const float* X, float* y, int n_in, int
 /// The 4-tap causal conv + SiLU over a chunk: history is [channels, 3] (oldest first, updated in place to the
 /// chunk's last three inputs), qkv and h are [T, channels].  Only the SiLU output is written (the decode path keeps
 /// the raw conv output in its own buffer; the prompt path does not need it).
+///
+/// A speculative pass feeds several columns at once and has to be able to undo the columns after any of them, which
+/// means the recurrent state has to be captured after every column.  The chunk kernels walk the columns inside one
+/// launch with the state already in registers, so they can write those snapshots as they go: `snap.slot[j]` receives
+/// the state as it was right after column j, for j < snap.n.  Doing it here costs one extra store per column instead
+/// of a separate copy per column, and it costs nothing at all when snap.n is 0.
+struct DenseGdnSnap {
+    static constexpr int kMaxSlots = 8;
+    float* slot[kMaxSlots] = {};    ///< slot[j] = the state right after column j (state) / history after column j (conv)
+    int n = 0;                      ///< how many slots are live; 0 asks for no snapshots
+};
+
 void dense_gdn_conv_chunk(float* history, const float* qkv, const float* conv_w, float* h, int channels, int T,
-                          void* stream);
+                          const DenseGdnSnap& snap = {}, void* stream = nullptr);
 
 /// In-place L2 norm of the q and k heads of every token of a chunk: row (t, r) of the norm lives at
 /// h + t*channels + base + r*cols, cols = 128 (the heads of one token are contiguous inside the token's C channels).
@@ -133,7 +145,11 @@ void dense_gdn_gates(const float* alpha, const float* dt, const float* ssm_a, fl
 /// The delta-rule recurrence over a chunk, state in registers, block per (value head, 32 state columns), walking the
 /// T tokens in order, then the output norm y = rms_norm(o) * gamma * SiLU(z) - SiLU, not the MoE path's sigmoid.
 /// h is [T, 2*S*k_heads + S*v_heads], gate/beta [T, v_heads], z and y [T, v_heads * S], state [S, v_heads, S].
+/// `snap` works as in dense_gdn_conv_chunk: snap.slot[j] receives the delta-rule state right after column j.  The
+/// state is read from and written to memory once per CHUNK instead of once per token, which is what makes a
+/// multi-column decode pass cheap: the state is 3 MiB per layer.
 void dense_gdn_rec_chunk(float* state, const float* h, const float* gate, const float* beta, const float* z,
-                         const float* gamma, float eps, float* y, int k_heads, int v_heads, int T, void* stream);
+                         const float* gamma, float eps, float* y, int k_heads, int v_heads, int T,
+                         const DenseGdnSnap& snap = {}, void* stream = nullptr);
 
 }  // namespace strata::kernels

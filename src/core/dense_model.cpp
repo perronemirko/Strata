@@ -306,13 +306,13 @@ struct DenseModel::Impl {
 
     // activations (device, f32), NC columns each
     float *x = nullptr, *xn = nullptr, *mix = nullptr;
-    float *qkv = nullptr, *conv_out = nullptr, *h = nullptr, *alpha = nullptr, *beta = nullptr, *gate = nullptr;
-    float *o = nullptr, *z = nullptr, *y = nullptr;
+    float *qkv = nullptr, *h = nullptr, *alpha = nullptr, *beta = nullptr, *gate = nullptr;
+    float *z = nullptr, *y = nullptr;
     float *q_full = nullptr, *qcur = nullptr, *kcur = nullptr, *vcur = nullptr, *attn = nullptr, *attn32 = nullptr;
     float *ffn_g = nullptr, *ffn_u = nullptr, *ffn_h = nullptr;
     float* logits = nullptr;
     float* attn_scratch = nullptr;
-    int32_t* pos_dev = nullptr;
+    int32_t* pos_dev = nullptr;                     // one position per row, for NC columns' worth of rows
     // The rope configuration the analytic kernel is launched with (rope_scaling.hpp).  Seeded from the
     // process config and re-based on the file's rope.freq_base at load(): the dense path has no CLI rope
     // knobs, so this stays `none` (the identity) unless something else has set a scaling.
@@ -493,6 +493,12 @@ struct DenseModel::Impl {
 #endif
 };
 
+// The GDN mixer over n columns.  The recurrence is order-dependent, but "order-dependent" does not mean "one launch
+// per column": the chunk kernels walk the columns inside a single launch with the state in registers, so n columns
+// cost the same handful of launches as one.  That matters twice over here.  The delta-rule state is 3 MiB per layer,
+// and the per-column kernels read and write it once per column; over 48 GDN layers and a 3-column speculative pass
+// that is 446 MB of traffic that a chunk does not have.  And the rollback snapshots, which used to be two 3 MiB
+// copies per column, are now stores the recurrence makes from registers it already holds.
 void DenseModel::Impl::gdn_block(const DenseConfig& c, Layer& L, int n, bool snapshot, void* s) {
     const int C = c.conv_channels(), V = c.value_dim(), E = c.n_embd;
     const int S = c.ssm_state, KH = c.ssm_k_heads, VH = c.ssm_v_heads, qk = S * KH;
@@ -503,30 +509,24 @@ void DenseModel::Impl::gdn_block(const DenseConfig& c, Layer& L, int n, bool sna
         gemv(L.alpha_q, alpha, n, s);
         gemv(L.beta_q, beta, n, s);
     } else {
-        for (int j = 0; j < n; ++j) {
-            dense_gemv_f32(L.alpha_w, xn + (size_t) j * E, alpha + (size_t) j * VH, E, VH, s);
-            dense_gemv_f32(L.beta_w, xn + (size_t) j * E, beta + (size_t) j * VH, E, VH, s);
-        }
+        dense_gemv_f32_rows(L.alpha_w, xn, alpha, E, VH, n, s);
+        dense_gemv_f32_rows(L.beta_w, xn, beta, E, VH, n, s);
     }
-    GdnShapes gs{S, KH, VH};
     {
     PScope ps_gdn(&prof, Prof::GDN_LOOP, s);
-    for (int j = 0; j < n; ++j) {                   // the recurrence is order-dependent: one column at a time
-        float* hj = h + (size_t) j * C;
-        native_gdn_conv_silu(L.conv_state, qkv + (size_t) j * C, L.conv_w, conv_out + (size_t) j * C, hj, C, c.ssm_d_conv, s);
-        native_gdn_l2_norm(hj, KH, S, c.rms_eps, s);
-        native_gdn_l2_norm(hj + qk, KH, S, c.rms_eps, s);
-        native_gdn_beta_gate(beta + (size_t) j * VH, VH, s);
-        native_gdn_gate(alpha + (size_t) j * VH, L.dt, L.ssm_a, gate + (size_t) j * VH, VH, s);
-        native_gdn_step(L.state, hj, hj + qk, hj + 2 * qk, gate + (size_t) j * VH, beta + (size_t) j * VH,
-                        o + (size_t) j * V, gs, s);
-        dense_gdn_out_norm(o + (size_t) j * V, z + (size_t) j * V, L.ssm_norm, y + (size_t) j * V, VH, S, c.rms_eps, s);
-        if (snapshot && j < n - 1) {                // the state a rollback to "j accepted drafts" restores
-            cudaMemcpyAsync(L.st_slots[(size_t) j], L.state, (size_t) S * VH * S * 4, cudaMemcpyDeviceToDevice, (cudaStream_t) s);
-            cudaMemcpyAsync(L.cv_slots[(size_t) j], L.conv_state, (size_t) C * (c.ssm_d_conv - 1) * 4, cudaMemcpyDeviceToDevice,
-                            (cudaStream_t) s);
-        }
+    // slot[j] receives the state right after column j, which is what rollback(j) restores.  run() guarantees
+    // n - 1 <= draft_max, so the slots allocated at load() are exactly enough.
+    DenseGdnSnap snaps, snapc;
+    if (snapshot) {
+        for (int j = 0; j < n - 1; ++j) { snaps.slot[j] = L.st_slots[(size_t) j]; snapc.slot[j] = L.cv_slots[(size_t) j]; }
+        snaps.n = n - 1;
+        snapc.n = n - 1;
     }
+    dense_gdn_conv_chunk(L.conv_state, qkv, L.conv_w, h, C, n, snapc, s);
+    dense_gdn_l2_norm(h, n, C, 0, KH, S, c.rms_eps, s);
+    dense_gdn_l2_norm(h, n, C, qk, KH, S, c.rms_eps, s);
+    dense_gdn_gates(alpha, L.dt, L.ssm_a, gate, beta, VH, n, s);
+    dense_gdn_rec_chunk(L.state, h, gate, beta, z, L.ssm_norm, c.rms_eps, y, KH, VH, n, snaps, s);
     }
     quantize(y, V, n, s);
     gemv(L.ssm_out, mix, n, s);
@@ -535,7 +535,6 @@ void DenseModel::Impl::gdn_block(const DenseConfig& c, Layer& L, int n, bool sna
 void DenseModel::Impl::attn_block(const DenseConfig& c, const QMat& wq, const QMat& wk, const QMat& wv, const QMat& wo,
                                   const float* qn, const float* kn, uint16_t* kc, uint16_t* vc, int n, int pos0, void* s) {
     const int E = c.n_embd, H = c.n_head, HK = c.n_head_kv, D = c.head_dim;
-    const int mh = std::max(H, HK);
     quantize(xn, E, n, s);
     gemv(wq, q_full, n, s);
     gemv(wk, kcur, n, s);
@@ -543,23 +542,25 @@ void DenseModel::Impl::attn_block(const DenseConfig& c, const QMat& wq, const QM
     const float scale = 1.0f / std::sqrt((float) D);
     {
     PScope ps_attn(&prof, Prof::ATTN_LOOP, s);
+    // Everything up to the attention itself is per-row work with no dependency between rows, so it runs over all n
+    // columns at once: the strided copy that splits q from its output gate, the per-head norms, RoPE and the KV
+    // append are one launch each instead of one per column.  The attention stays the split-K decode kernel, which
+    // parallelises over the cache - the one part that wants the columns kept apart.
+    dense_split_q(q_full, qcur, n * H, D, s);
+    rms_norm_weighted(qcur, qn, n * H, D, c.rms_eps, s);
+    rms_norm_weighted(kcur, kn, n * HK, D, c.rms_eps, s);
+    // The position of a row is its column, so the table is written per tensor: rows / n_head for q, rows / n_kv for
+    // k.  Two writes, exactly as the prompt path does, into a buffer sized for the wider of the two.
+    dense_positions_i32(pos_dev, n * H, H, pos0, s);
+    native_rope_apply(qcur, qcur, n * H, D, c.n_rot, rope, pos_dev, s);
+    dense_positions_i32(pos_dev, n * HK, HK, pos0, s);
+    native_rope_apply(kcur, kcur, n * HK, D, c.n_rot, rope, pos_dev, s);
+    dense_kv_append_rows_fmt(kc, vc, kfmt, vfmt, kcur, vcur, n, pos0, HK, D, (int) max_context, s);
     for (int j = 0; j < n; ++j) {
-        float* qj = qcur + (size_t) j * H * D;
-        float* kj = kcur + (size_t) j * HK * D;
-        const float* qfj = q_full + (size_t) j * H * 2 * D;
-        // q is the FIRST head_dim of every head's 2*head_dim block; the second half is the output gate
-        cudaMemcpy2DAsync(qj, (size_t) D * 4, qfj, (size_t) D * 2 * 4, (size_t) D * 4, (size_t) H, cudaMemcpyDeviceToDevice,
-                          (cudaStream_t) s);
-        rms_norm_weighted(qj, qn, H, D, c.rms_eps, s);
-        rms_norm_weighted(kj, kn, HK, D, c.rms_eps, s);
-        dense_fill_i32(pos_dev, mh, (int32_t) (pos0 + j), s);
-        native_rope_apply(qj, qj, H, D, c.n_rot, rope, pos_dev, s);
-        native_rope_apply(kj, kj, HK, D, c.n_rot, rope, pos_dev, s);
-        dense_kv_append_fmt(kc, vc, kfmt, vfmt, kj, vcur + (size_t) j * HK * D, pos0 + j, HK, D, (int) max_context, s);
-        dense_attn_decode_fmt(qj, kc, vc, kfmt, vfmt, attn + (size_t) j * H * D, attn_scratch, H, HK, D, pos0 + j + 1,
-                              (int) max_context, scale, s);
-        native_qsa_gate_apply(attn + (size_t) j * H * D, qfj, attn32 + (size_t) j * H * D, H, D, s);
+        dense_attn_decode_fmt(qcur + (size_t) j * H * D, kc, vc, kfmt, vfmt, attn + (size_t) j * H * D, attn_scratch,
+                              H, HK, D, pos0 + j + 1, (int) max_context, scale, s);
     }
+    dense_gate_apply(attn, q_full, attn32, n * H, H, D, s);
     }
     quantize(attn32, H * D, n, s);
     gemv(wo, mix, n, s);
@@ -633,11 +634,12 @@ void DenseModel::Impl::pf_gdn_block(const DenseConfig& c, Layer& L, int64_t T, v
         PScope ps_gdn(&prof, Prof::GDN_LOOP, s);
         // conv + SiLU over the chunk (the 3-value history carries over), the L2 norm of the q and k heads of every
         // token, the per-head gates, then the delta-rule recurrence walking the chunk with the output norm folded in.
-        dense_gdn_conv_chunk(L.conv_state, pf->qkv, L.conv_w, pf->h, C, (int) T, s);
+        // {} = no rollback snapshots: a prompt chunk is never partially undone.
+        dense_gdn_conv_chunk(L.conv_state, pf->qkv, L.conv_w, pf->h, C, (int) T, {}, s);
         dense_gdn_l2_norm(pf->h, (int) T, C, 0, KH, S, c.rms_eps, s);
         dense_gdn_l2_norm(pf->h, (int) T, C, S * KH, KH, S, c.rms_eps, s);
         dense_gdn_gates(pf->alpha, L.dt, L.ssm_a, pf->gate, pf->beta, VH, (int) T, s);
-        dense_gdn_rec_chunk(L.state, pf->h, pf->gate, pf->beta, pf->z, L.ssm_norm, c.rms_eps, pf->y, KH, VH, (int) T, s);
+        dense_gdn_rec_chunk(L.state, pf->h, pf->gate, pf->beta, pf->z, L.ssm_norm, c.rms_eps, pf->y, KH, VH, (int) T, {}, s);
     }
     pf_quantize(pf->y, L.ssm_out.type, V, T, s);
     pf_gemv(L.ssm_out, pf->mix, T, s);
@@ -1045,9 +1047,9 @@ bool DenseModel::load(const std::string& path, int64_t max_context, std::string&
         bool ok = I.alloc(&I.q8_1, native_q8_1_bytes(max_in, NC), err, "q8_1 scratch") &&
                   I.alloc(&I.x, K * E * f, err, "x") && I.alloc(&I.xn, K * E * f, err, "xn") &&
                   I.alloc(&I.mix, K * E * f, err, "mix") && I.alloc(&I.qkv, K * C * f, err, "qkv") &&
-                  I.alloc(&I.conv_out, K * C * f, err, "conv_out") && I.alloc(&I.h, K * C * f, err, "h") &&
+                  I.alloc(&I.h, K * C * f, err, "h") &&
                   I.alloc(&I.alpha, K * cfg_.ssm_v_heads * f, err, "alpha") && I.alloc(&I.beta, K * cfg_.ssm_v_heads * f, err, "beta") &&
-                  I.alloc(&I.gate, K * cfg_.ssm_v_heads * f, err, "gate") && I.alloc(&I.o, K * V * f, err, "o") &&
+                  I.alloc(&I.gate, K * cfg_.ssm_v_heads * f, err, "gate") &&
                   I.alloc(&I.z, K * V * f, err, "z") && I.alloc(&I.y, K * V * f, err, "y") &&
                   I.alloc(&I.q_full, K * H * 2 * D * f, err, "q_full") && I.alloc(&I.qcur, K * H * D * f, err, "qcur") &&
                   I.alloc(&I.kcur, K * HK * D * f, err, "kcur") && I.alloc(&I.vcur, K * HK * D * f, err, "vcur") &&
@@ -1055,7 +1057,8 @@ bool DenseModel::load(const std::string& path, int64_t max_context, std::string&
                   I.alloc(&I.ffn_g, K * cfg_.n_ff * f, err, "ffn_g") && I.alloc(&I.ffn_u, K * cfg_.n_ff * f, err, "ffn_u") &&
                   I.alloc(&I.ffn_h, K * cfg_.n_ff * f, err, "ffn_h") && I.alloc(&I.logits, K * cfg_.n_vocab * f, err, "logits") &&
                   I.alloc(&I.attn_scratch, dense_attn_scratch_bytes(H, D, (int) max_context), err, "attention scratch") &&
-                  I.alloc(&I.pos_dev, (uint64_t) std::max(H, HK) * 4, err, "positions") &&
+                  // one position per row of a full NC-column pass: the attention's RoPE is batched over the columns
+                  I.alloc(&I.pos_dev, K * (uint64_t) std::max(H, HK) * 4, err, "positions") &&
                   I.alloc(&I.hid, K * E * f, err, "hidden") && I.alloc(&I.h_last, (uint64_t) E * f, err, "last hidden") &&
                   I.alloc(&I.d_tok, 16, err, "sampler output") && I.alloc(&I.d_prob, 16, err, "draft probability");
         if (ok && with_mtp)

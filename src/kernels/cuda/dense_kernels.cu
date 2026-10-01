@@ -374,8 +374,12 @@ __global__ void gate_apply_kernel(const float* __restrict__ attn, const float* _
     out[i] = attn[i] * (1.0f / (1.0f + __expf(-g)));
 }
 
-__global__ void positions_kernel(int32_t* dst, int heads, int32_t pos0) {
+// The grid rounds rows up to a whole number of blocks, so the tail threads have to be turned off: a short final
+// prompt chunk (or a decode pass whose n * n_head is not a multiple of the block size) would otherwise write past the
+// end of the position buffer and into whatever allocation follows it.
+__global__ void positions_kernel(int32_t* dst, int rows, int heads, int32_t pos0) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= rows) return;
     dst[i] = pos0 + (int32_t) (i / heads);
 }
 
@@ -502,8 +506,11 @@ __global__ void gemv_f32_rows_kernel(const float* __restrict__ W, const float* _
 }
 
 // One thread per conv channel, walking the chunk inside the launch (the decode path's conv_silu with a token loop).
+// The thread owns its channel's whole 4-tap window, so a snapshot of the history after column j is three stores from
+// registers it already has: that is how a speculative pass gets its rollback points without a copy per column.
 __global__ void gdn_conv_chunk_kernel(float* __restrict__ history, const float* __restrict__ qkv,
-                                      const float* __restrict__ weights, float* __restrict__ h, int channels, int T) {
+                                      const float* __restrict__ weights, float* __restrict__ h, int channels, int T,
+                                      DenseGdnSnap snap) {
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= channels) return;
     float v[4] = {history[c * 3], history[c * 3 + 1], history[c * 3 + 2], 0.0f};
@@ -518,6 +525,12 @@ __global__ void gdn_conv_chunk_kernel(float* __restrict__ history, const float* 
         h[(size_t) t * channels + c] = sum / (1.0f + __expf(-sum));
 #pragma unroll
         for (int tap = 0; tap < 3; ++tap) v[tap] = v[tap + 1];
+        if (t < snap.n) {
+            float* s = snap.slot[t] + (size_t) c * 3;
+            s[0] = v[0];
+            s[1] = v[1];
+            s[2] = v[2];
+        }
     }
     history[c * 3] = v[0];
     history[c * 3 + 1] = v[1];
@@ -561,7 +574,7 @@ __global__ void gdn_gates_kernel(const float* __restrict__ alpha, const float* _
 __global__ void __launch_bounds__(128 * 4) gdn_rec_chunk_kernel(
         float* __restrict__ state, const float* __restrict__ h, const float* __restrict__ gate,
         const float* __restrict__ beta, const float* __restrict__ z, const float* __restrict__ gamma, float eps,
-        float* __restrict__ y, int k_heads, int v_heads, int T) {
+        float* __restrict__ y, int k_heads, int v_heads, int T, DenseGdnSnap snap) {
     constexpr int W = 128, RG = 4, RPG = W / RG;
     __shared__ float sq[W], sk[W], red[RG][W], wsum[16];
     const int head = blockIdx.x, col = threadIdx.x, rg = threadIdx.y, tid = rg * W + col;
@@ -598,6 +611,14 @@ __global__ void __launch_bounds__(128 * 4) gdn_rec_chunk_kernel(
         for (int r = 0; r < RPG; ++r) {
             s[r] = g * s[r] + sk[rg * RPG + r] * delta;
             o += s[r] * sq[rg * RPG + r];
+        }
+        // The state lives in registers for the whole chunk, which is the point of this kernel: a 3 MiB state is read
+        // and written once per chunk instead of once per token.  The rollback snapshots come out of the same
+        // registers, so a speculative pass pays one extra store per column and nothing else.
+        if (t < snap.n) {
+            float* sb = snap.slot[t] + ((size_t) (rg * RPG) * v_heads + head) * W + col;
+#pragma unroll
+            for (int r = 0; r < RPG; ++r) sb[r * rs] = s[r];
         }
         __syncthreads();
         red[rg][col] = o;
@@ -764,7 +785,7 @@ void dense_gate_apply(const float* attn, const float* q_full, float* out, int ro
 
 void dense_positions_i32(int32_t* dst, int rows, int heads, int32_t pos0, void* stream) {
     if (rows < 1) return;
-    positions_kernel<<<(rows + 127) / 128, 128, 0, (cudaStream_t) stream>>>(dst, heads, pos0);
+    positions_kernel<<<(rows + 127) / 128, 128, 0, (cudaStream_t) stream>>>(dst, rows, heads, pos0);
     check("dense_positions_i32");
 }
 
@@ -841,10 +862,14 @@ void dense_gemv_f32_rows(const float* W, const float* X, float* y, int n_in, int
 }
 
 void dense_gdn_conv_chunk(float* history, const float* qkv, const float* conv_w, float* h, int channels, int T,
-                          void* stream) {
+                          const DenseGdnSnap& snap, void* stream) {
     if (T < 1) return;
+    if (snap.n > DenseGdnSnap::kMaxSlots || snap.n > T)
+        throw std::runtime_error("dense_gdn_conv_chunk: snapshot slots outside the chunk");
+    for (int j = 0; j < snap.n; ++j)
+        if (!snap.slot[j]) throw std::runtime_error("dense_gdn_conv_chunk: a snapshot slot is null");
     gdn_conv_chunk_kernel<<<(unsigned) ((channels + 255) / 256), 256, 0, (cudaStream_t) stream>>>(
-        history, qkv, conv_w, h, channels, T);
+        history, qkv, conv_w, h, channels, T, snap);
     check("dense_gdn_conv_chunk");
 }
 
@@ -869,12 +894,17 @@ void dense_gdn_gates(const float* alpha, const float* dt, const float* ssm_a, fl
 }
 
 void dense_gdn_rec_chunk(float* state, const float* h, const float* gate, const float* beta, const float* z,
-                         const float* gamma, float eps, float* y, int k_heads, int v_heads, int T, void* stream) {
+                         const float* gamma, float eps, float* y, int k_heads, int v_heads, int T,
+                         const DenseGdnSnap& snap, void* stream) {
     if (T < 1 || k_heads < 1 || v_heads < 1 || v_heads % k_heads != 0)
         throw std::runtime_error("dense_gdn_rec_chunk: T >= 1 and v_heads a positive multiple of k_heads");
+    if (snap.n > DenseGdnSnap::kMaxSlots || snap.n > T)
+        throw std::runtime_error("dense_gdn_rec_chunk: snapshot slots outside the chunk");
+    for (int j = 0; j < snap.n; ++j)
+        if (!snap.slot[j]) throw std::runtime_error("dense_gdn_rec_chunk: a snapshot slot is null");
     const dim3 block(128, 4);
     gdn_rec_chunk_kernel<<<v_heads, block, 0, (cudaStream_t) stream>>>(state, h, gate, beta, z, gamma, eps, y,
-                                                                       k_heads, v_heads, T);
+                                                                       k_heads, v_heads, T, snap);
     check("dense_gdn_rec_chunk");
 }
 

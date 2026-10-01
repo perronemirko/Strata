@@ -26,6 +26,8 @@
 #include "strata/core/dense_model.hpp"
 #include "strata/artifact/dequant.hpp"
 #include "strata/kernels/dense_kernels.hpp"
+#include "strata/kernels/native_gdn.hpp"
+#include "strata/kernels/native_gdn_preprocess.hpp"
 #include "strata/kernels/sampler.hpp"
 
 #include <cuda_runtime.h>
@@ -219,6 +221,120 @@ int selftest() {
             cudaMalloc((void**) &dout, o.size() * 4);
             strata::kernels::dense_gdn_out_norm(d_o, d_z, d_w, dout, heads, cols, 1e-6f, nullptr);
             report("gdn_out_norm 48 x 128 (SiLU gate)", compare(from_dev(dout, o.size()), ref), 1e-4);
+        }
+        {   // The GDN mixer: the chunk kernels against the per-token kernels, column by column, including the
+            // rollback snapshots.  run() feeds several columns at once and has to be able to undo the ones after any
+            // column, so the snapshots are not a convenience - if slot[j] is the state one column off, a rejected
+            // draft silently corrupts every token that follows it.  The reference here is the token loop the decode
+            // path used before the chunk path existed, so this is the gate for that switch.
+            using namespace strata::kernels;   // the block calls a dozen of them; the prefix would bury the test
+            const int S = 128, KH = 2, VH = 4, T = 5;
+            const int qk = S * KH, C = 2 * qk + S * VH, V = S * VH;
+            auto qkv = rnd((size_t) T * C), z = rnd((size_t) T * V);
+            auto conv_w = rnd((size_t) C * 4, 0.5f), dt = rnd(VH, 0.5f), a_ssm = rnd(VH, 0.5f);
+            auto gamma = rnd(S, 1.0f), alpha = rnd((size_t) T * VH), beta = rnd((size_t) T * VH);
+            auto st0 = rnd((size_t) S * VH * S, 0.3f), hist0 = rnd((size_t) C * 3, 0.5f);
+
+            cudaStream_t st = nullptr;
+            if (cudaStreamCreate(&st) != cudaSuccess) { std::printf("selftest: cannot create a stream\n"); return 1; }
+
+            // ---- the reference: the per-token kernels, one column at a time
+            float* d_qkv = to_dev(qkv);
+            float* d_z = to_dev(z);
+            float* d_cw = to_dev(conv_w);
+            float* d_dt = to_dev(dt);
+            float* d_as = to_dev(a_ssm);
+            float* d_gm = to_dev(gamma);
+            float* d_alpha = to_dev(alpha);
+            float* d_beta = to_dev(beta);       // dense_gdn_gates sigmoidises this in place: the chunk path's copy
+            float* d_hist_a = to_dev(hist0);
+            float* d_state_a = to_dev(st0);
+            float* d_h_a = nullptr;
+            float* d_gate_a = nullptr;
+            float* d_y_a = nullptr;
+            float* d_beta_a = to_dev(beta);     // native_gdn_beta_gate also works in place: a copy of its own
+            cudaMalloc((void**) &d_h_a, (size_t) T * C * 4);
+            cudaMalloc((void**) &d_gate_a, (size_t) T * VH * 4);
+            cudaMalloc((void**) &d_y_a, (size_t) T * V * 4);
+            std::vector<float> hist_ref, state_ref;
+            std::vector<std::vector<float>> state_after((size_t) T - 1), hist_after((size_t) T - 1);
+            std::vector<float> y_ref((size_t) T * V), h_ref((size_t) T * C);
+            {
+                float* d_raw = nullptr;
+                cudaMalloc((void**) &d_raw, (size_t) C * 4);
+                float* d_o = nullptr;
+                cudaMalloc((void**) &d_o, (size_t) V * 4);
+                const GdnShapes gs{S, KH, VH};
+                for (int t = 0; t < T; ++t) {
+                    float* ht = d_h_a + (size_t) t * C;
+                    native_gdn_conv_silu(d_hist_a, d_qkv + (size_t) t * C, d_cw, d_raw, ht, C, 4, st);
+                    native_gdn_l2_norm(ht, KH, S, 1e-6f, st);
+                    native_gdn_l2_norm(ht + qk, KH, S, 1e-6f, st);
+                    native_gdn_beta_gate(d_beta_a + (size_t) t * VH, VH, st);
+                    native_gdn_gate(d_alpha + (size_t) t * VH, d_dt, d_as, d_gate_a + (size_t) t * VH, VH, st);
+                    native_gdn_step(d_state_a, ht, ht + qk, ht + 2 * qk, d_gate_a + (size_t) t * VH,
+                                    d_beta_a + (size_t) t * VH, d_o, gs, st);
+                    dense_gdn_out_norm(d_o, d_z + (size_t) t * V, d_gm, d_y_a + (size_t) t * V, VH, S, 1e-6f, st);
+                    if (t < T - 1) {
+                        state_after[(size_t) t].assign((size_t) S * VH * S, 0.0f);
+                        hist_after[(size_t) t].assign((size_t) C * 3, 0.0f);
+                        cudaMemcpy(state_after[(size_t) t].data(), d_state_a, (size_t) S * VH * S * 4, cudaMemcpyDeviceToHost);
+                        cudaMemcpy(hist_after[(size_t) t].data(), d_hist_a, (size_t) C * 3 * 4, cudaMemcpyDeviceToHost);
+                    }
+                }
+                cudaStreamSynchronize(st);
+                y_ref = from_dev(d_y_a, (size_t) T * V);
+                h_ref = from_dev(d_h_a, (size_t) T * C);
+                state_ref = from_dev(d_state_a, (size_t) S * VH * S);
+                hist_ref = from_dev(d_hist_a, (size_t) C * 3);
+                cudaFree(d_raw);
+                cudaFree(d_o);
+            }
+
+            // ---- the chunk path: one launch per step, with the snapshots written inside the recurrence
+            float* d_hist_b = to_dev(hist0);
+            float* d_state_b = to_dev(st0);
+            float* d_h_b = nullptr;
+            float* d_y_b = nullptr;
+            float* d_gate_b = nullptr;
+            cudaMalloc((void**) &d_h_b, (size_t) T * C * 4);
+            cudaMalloc((void**) &d_y_b, (size_t) T * V * 4);
+            cudaMalloc((void**) &d_gate_b, (size_t) T * VH * 4);
+            DenseGdnSnap snaps, snapc;
+            std::vector<float*> d_slot_s((size_t) T - 1), d_slot_c((size_t) T - 1);
+            for (int j = 0; j < T - 1; ++j) {
+                cudaMalloc((void**) &d_slot_s[(size_t) j], (size_t) S * VH * S * 4);
+                cudaMalloc((void**) &d_slot_c[(size_t) j], (size_t) C * 3 * 4);
+                snaps.slot[j] = d_slot_s[(size_t) j];
+                snapc.slot[j] = d_slot_c[(size_t) j];
+            }
+            snaps.n = T - 1;
+            snapc.n = T - 1;
+            dense_gdn_conv_chunk(d_hist_b, d_qkv, d_cw, d_h_b, C, T, snapc, st);
+            dense_gdn_l2_norm(d_h_b, T, C, 0, KH, S, 1e-6f, st);
+            dense_gdn_l2_norm(d_h_b, T, C, qk, KH, S, 1e-6f, st);
+            dense_gdn_gates(d_alpha, d_dt, d_as, d_gate_b, d_beta, VH, T, st);
+            dense_gdn_rec_chunk(d_state_b, d_h_b, d_gate_b, d_beta, d_z, d_gm, 1e-6f, d_y_b, KH, VH, T, snaps, st);
+            cudaStreamSynchronize(st);
+
+            report("gdn chunk conv vs token loop", compare(from_dev(d_h_b, (size_t) T * C), h_ref), 1e-3);
+            report("gdn chunk rec+norm vs token loop", compare(from_dev(d_y_b, (size_t) T * V), y_ref), 1e-3);
+            report("gdn chunk final state", compare(from_dev(d_state_b, (size_t) S * VH * S), state_ref), 1e-3);
+            report("gdn chunk final history", compare(from_dev(d_hist_b, (size_t) C * 3), hist_ref), 1e-3);
+            for (int j = 0; j < T - 1; ++j) {
+                char name[64];
+                std::snprintf(name, sizeof name, "gdn snapshot state after col %d", j);
+                report(name, compare(from_dev(d_slot_s[(size_t) j], (size_t) S * VH * S), state_after[(size_t) j]), 1e-3);
+                std::snprintf(name, sizeof name, "gdn snapshot conv after col %d", j);
+                report(name, compare(from_dev(d_slot_c[(size_t) j], (size_t) C * 3), hist_after[(size_t) j]), 1e-3);
+            }
+
+            cudaFree(d_qkv); cudaFree(d_z); cudaFree(d_cw); cudaFree(d_dt); cudaFree(d_as); cudaFree(d_gm);
+            cudaFree(d_alpha); cudaFree(d_beta); cudaFree(d_beta_a); cudaFree(d_gate_a); cudaFree(d_y_a);
+            cudaFree(d_hist_a); cudaFree(d_state_a); cudaFree(d_h_a);
+            cudaFree(d_hist_b); cudaFree(d_state_b); cudaFree(d_h_b); cudaFree(d_y_b); cudaFree(d_gate_b);
+            for (int j = 0; j < T - 1; ++j) { cudaFree(d_slot_s[(size_t) j]); cudaFree(d_slot_c[(size_t) j]); }
+            cudaStreamDestroy(st);
         }
         {   // F32 GEMV
             const int n_in = 5120, n_out = 48;
