@@ -90,7 +90,7 @@ def main() -> int:
                     help="KV cache storage, the same option as strata's setup: fp16 (default), int8 (~53%% of the memory), "
                          "q4_0 (~28%%, Hadamard-rotated 4-bit) or k8v4 (int8 keys + 4-bit values, ~40%%). Per 1K tokens of "
                          "this model (17 attention layers incl. MTP): fp16 ~ 71 MB, int8 ~ 38, k8v4 ~ 29, q4_0 ~ 20. "
-                         "A quantized cache feeds the prompt through the FP32 GEMVs, not through MMQ")
+                         "The MMQ prompt prefill reads whichever format you pick")
     ap.add_argument("--mtp", action="store_true",
                     help="speculative decoding with the model's own MTP block (it is inside the GGUF; ~1.4 GB more VRAM)")
     ap.add_argument("--draft-max", type=int, default=2, metavar="N",

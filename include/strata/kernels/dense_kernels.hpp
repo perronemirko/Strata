@@ -98,11 +98,19 @@ void dense_positions_i32(int32_t* dst, int rows, int heads, int32_t pos0, void* 
 void dense_kv_append_rows(uint16_t* k_cache, uint16_t* v_cache, const float* k, const float* v, int T, int pos0,
                           int n_kv, int head_dim, int max_ctx, void* stream);
 
+/// dense_kv_append_rows for any KV format: the caches are [n_kv][max_ctx][dense_kv_cell_bytes(fmt)] bytes.
+void dense_kv_append_rows_fmt(void* k_cache, void* v_cache, int k_fmt, int v_fmt, const float* k, const float* v,
+                              int T, int pos0, int n_kv, int head_dim, int max_ctx, void* stream);
+
 /// Causal attention for T consecutive queries at positions pos0..pos0+T-1: one block per (head, token), the same
 /// warp-per-cell online softmax as dense_attn_decode, restricted to cells [0, pos0 + t].  q is [T, n_head, head_dim]
 /// f32 (normalised and rotated), out is the same shape.
 void dense_attn_chunk(const float* q, const uint16_t* k_cache, const uint16_t* v_cache, float* out, int T, int pos0,
                       int n_head, int n_kv, int head_dim, int max_ctx, float scale, void* stream);
+
+/// dense_attn_chunk for any KV format.  q is NOT rotated by the caller and out comes back in the original space.
+void dense_attn_chunk_fmt(const float* q, const void* k_cache, const void* v_cache, int k_fmt, int v_fmt, float* out,
+                          int T, int pos0, int n_head, int n_kv, int head_dim, int max_ctx, float scale, void* stream);
 
 /// y[r, :] = W x[r, :] for r in [0, rows): the batched form of dense_gemv_f32 (one warp per output row per input row).
 void dense_gemv_f32_rows(const float* W, const float* X, float* y, int n_in, int n_out, int rows, void* stream);

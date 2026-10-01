@@ -664,8 +664,8 @@ void DenseModel::Impl::pf_attn_block(const DenseConfig& c, const QMat& wq, const
         native_rope_apply(pf->qcur, pf->qcur, (int) (T * H), D, c.n_rot, rope, pf->pos_dev, s);
         dense_positions_i32(pf->pos_dev, (int) (T * HK), HK, (int32_t) pos0, s);
         native_rope_apply(pf->kcur, pf->kcur, (int) (T * HK), D, c.n_rot, rope, pf->pos_dev, s);
-        dense_kv_append_rows(kc, vc, pf->kcur, pf->vcur, (int) T, pos0, HK, D, (int) max_context, s);
-        dense_attn_chunk(pf->qcur, kc, vc, pf->attn, (int) T, pos0, H, HK, D, (int) max_context, scale, s);
+        dense_kv_append_rows_fmt(kc, vc, kfmt, vfmt, pf->kcur, pf->vcur, (int) T, pos0, HK, D, (int) max_context, s);
+        dense_attn_chunk_fmt(pf->qcur, kc, vc, kfmt, vfmt, pf->attn, (int) T, pos0, H, HK, D, (int) max_context, scale, s);
         dense_gate_apply(pf->attn, pf->q_full, pf->attn32, (int) (T * H), H, D, s);
     }
     pf_quantize(pf->attn32, wo.type, H * D, T, s);
@@ -1177,14 +1177,6 @@ bool DenseModel::prefill_setup(int64_t chunk, std::string& err) {
     pf_chunk_ = 0;
 #ifdef STRATA_DENSE_MMQ
     Impl& I = *impl_;
-    // The batched prompt path appends and reads the cache through the fp16 kernels (dense_kv_append_rows,
-    // dense_attn_chunk).  A quantized --kv cache is a different layout, so the chunked path stays off and the
-    // caller feeds the prompt through run(), which uses the format-aware kernels.
-    if (I.kfmt != DENSE_KV_F16 || I.vfmt != DENSE_KV_F16) {
-        err = "dense model: prefill() only reads an fp16 KV cache; --kv " + kv_name_ +
-              " feeds the prompt with run() instead";
-        return false;
-    }
     if (chunk <= 0) chunk = kPrefillDefaultCols;
     chunk = std::max<int64_t>(NC, std::min<int64_t>(chunk, kPrefillMaxCols));
     const int E = cfg_.n_embd, C = cfg_.conv_channels(), V = cfg_.value_dim();

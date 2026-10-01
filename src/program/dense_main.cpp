@@ -96,8 +96,8 @@ void usage() {
                  "  a dense qwen35 GGUF (Qwen3.8-27B) behind Strata's server protocol; the server runs it with\n"
                  "  `serve/server.py --engine strata --config <run config>` whose `exe` is this program.\n"
                  "  --prompt-chunk N feeds the prompt N tokens at a time through MMQ instead of 8 at a time through\n"
-                 "  the GEMVs (0 is the default; --no-prefill forces the old path).  A quantized --kv cache always\n"
-                 "  uses the GEMV path, because the chunked one only reads an fp16 cache.\n"
+                 "  the GEMVs (0 is the default; --no-prefill forces the old path).  The chunked path reads the KV\n"
+                 "  cache in whatever format --kv picked.\n"
                  "  --kv: the KV cache storage, the same option strata has (int8 about 53%% of fp16, q4_0 about 28%%, k8v4 about 40%%).\n");
 }
 
@@ -346,6 +346,66 @@ int selftest() {
                 }
                 report(f.name, compare(from_dev(dout, ref.size()), ref), 5e-3);
                 cudaFree(dq); cudaFree(dkf); cudaFree(dvf); cudaFree(dk); cudaFree(dv); cudaFree(dout); cudaFree(dscr);
+            }
+        }
+        {   // the same formats through the BATCHED prompt kernels: T queries at a time, query t causal over [0, pos0+t]
+            const int H = 24, HK = 4, D = 256, max_ctx = 512, T = 16, pos0 = 0;
+            struct Fmt2 { const char* name; int kf, vf; };
+            const Fmt2 fmts2[] = {{"kv chunk int8", 1, 1}, {"kv chunk q4_0", 2, 2}, {"kv chunk k8v4", 1, 2}};
+            for (const Fmt2& g : fmts2) {
+                auto q = rnd((size_t) T * H * D), k = rnd((size_t) T * HK * D, 1.5f), v = rnd((size_t) T * HK * D);
+                float *dq = to_dev(q), *dkf = to_dev(k), *dvf = to_dev(v), *dout = nullptr;
+                const uint64_t kb = (uint64_t) HK * max_ctx * strata::kernels::dense_kv_cell_bytes(g.kf, D);
+                const uint64_t vb = (uint64_t) HK * max_ctx * strata::kernels::dense_kv_cell_bytes(g.vf, D);
+                void *dk = nullptr, *dv = nullptr;
+                cudaMalloc(&dk, kb); cudaMalloc(&dv, vb);
+                cudaMemset(dk, 0, kb); cudaMemset(dv, 0, vb);
+                cudaMalloc((void**) &dout, (size_t) T * H * D * 4);
+                strata::kernels::dense_kv_append_rows_fmt(dk, dv, g.kf, g.vf, dkf, dvf, T, pos0, HK, D, max_ctx, nullptr);
+                const float scale = 1.0f / std::sqrt((float) D);
+                strata::kernels::dense_attn_chunk_fmt(dq, dk, dv, g.kf, g.vf, dout, T, pos0, H, HK, D, max_ctx, scale, nullptr);
+                // the host model, causal: query t attends to cells [0, pos0 + t]
+                std::vector<float> kd((size_t) HK * T * D), vd(kd.size());
+                for (int t = 0; t < T; ++t)
+                    for (int h = 0; h < HK; ++h) {
+                        const float* ks = &k[((size_t) t * HK + h) * D];
+                        const float* vs = &v[((size_t) t * HK + h) * D];
+                        std::vector<float> a(ks, ks + D), b(vs, vs + D);
+                        if (g.kf == 2) host_fwht256(a.data());
+                        if (g.vf == 2) host_fwht256(b.data());
+                        host_kv_roundtrip(g.kf, a);
+                        host_kv_roundtrip(g.vf, b);
+                        std::copy(a.begin(), a.end(), kd.begin() + ((size_t) h * T + t) * D);
+                        std::copy(b.begin(), b.end(), vd.begin() + ((size_t) h * T + t) * D);
+                    }
+                std::vector<float> ref((size_t) T * H * D);
+                for (int tq = 0; tq < T; ++tq) {
+                    const int n_ctx = pos0 + tq + 1;
+                    for (int h = 0; h < H; ++h) {
+                        const int kvh = h / (H / HK);
+                        std::vector<float> qh(q.begin() + ((size_t) tq * H + h) * D,
+                                             q.begin() + ((size_t) tq * H + h) * D + D);
+                        if (g.kf == 2) host_fwht256(qh.data());
+                        std::vector<double> sc((size_t) n_ctx);
+                        double mx = -1e300;
+                        for (int t = 0; t < n_ctx; ++t) {
+                            double d = 0;
+                            for (int i = 0; i < D; ++i) d += (double) qh[(size_t) i] * kd[((size_t) kvh * T + t) * D + i];
+                            sc[(size_t) t] = d * scale; mx = std::max(mx, sc[(size_t) t]);
+                        }
+                        double den = 0; for (auto& x : sc) { x = std::exp(x - mx); den += x; }
+                        std::vector<float> o(D);
+                        for (int i = 0; i < D; ++i) {
+                            double a = 0;
+                            for (int t = 0; t < n_ctx; ++t) a += sc[(size_t) t] * vd[((size_t) kvh * T + t) * D + i];
+                            o[(size_t) i] = (float) (a / den);
+                        }
+                        if (g.vf == 2) host_fwht256(o.data());
+                        std::copy(o.begin(), o.end(), ref.begin() + ((size_t) tq * H + h) * D);
+                    }
+                }
+                report(g.name, compare(from_dev(dout, ref.size()), ref), 5e-3);
+                cudaFree(dq); cudaFree(dkf); cudaFree(dvf); cudaFree(dk); cudaFree(dv); cudaFree(dout);
             }
         }
     } catch (const std::exception& e) {

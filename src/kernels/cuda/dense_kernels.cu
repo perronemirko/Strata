@@ -379,36 +379,57 @@ __global__ void positions_kernel(int32_t* dst, int heads, int32_t pos0) {
     dst[i] = pos0 + (int32_t) (i / heads);
 }
 
-// grid (n_kv, T): one block per (KV head, token) writes that token's cell of that head's cache.
-__global__ void kv_append_rows_kernel(__half* __restrict__ kc, __half* __restrict__ vc, const float* __restrict__ k,
+// grid (n_kv, T): one block per (KV head, token) writes that token's cell of that head's cache.  blockDim.x ==
+// head_dim, the same requirement kv_append_kernel has: kv_store_cell wants one thread per value and fwht256_shared
+// wants the 256 threads of a 256-wide head.
+template <int KF, int VF>
+__global__ void kv_append_rows_kernel(uint8_t* __restrict__ kc, uint8_t* __restrict__ vc, const float* __restrict__ k,
                                       const float* __restrict__ v, int pos0, int n_kv, int head_dim, int max_ctx) {
+    __shared__ float buf[kMaxHeadDim];
     const int h = blockIdx.x, t = blockIdx.y;
-    const size_t cell = ((size_t) h * max_ctx + pos0 + t) * head_dim;
+    const size_t cell = (size_t) h * max_ctx + pos0 + t;
     const float* kh = k + ((size_t) t * n_kv + h) * head_dim;
     const float* vh = v + ((size_t) t * n_kv + h) * head_dim;
-    for (int i = threadIdx.x; i < head_dim; i += blockDim.x) {
-        kc[cell + i] = __float2half(kh[i]);
-        vc[cell + i] = __float2half(vh[i]);
-    }
+    buf[threadIdx.x] = kh[threadIdx.x];
+    __syncthreads();
+    if (KF == kQ4) fwht256_shared(buf);
+    kv_store_cell<KF>(kc + cell * cell_bytes(KF, head_dim), buf);
+    __syncthreads();
+    buf[threadIdx.x] = vh[threadIdx.x];
+    __syncthreads();
+    if (VF == kQ4) fwht256_shared(buf);
+    kv_store_cell<VF>(vc + cell * cell_bytes(VF, head_dim), buf);
 }
 
 // One block per (query head, token): the decode kernel's warp-per-cell online softmax, restricted to the causal
-// range [0, pos0 + t].  No split-K: the (head, token) grid already gives n_head * T blocks.
-__global__ void attn_chunk_kernel(const float* __restrict__ q, const __half* __restrict__ K,
-                                  const __half* __restrict__ V, float* __restrict__ out, int n_head, int n_kv,
+// range [0, pos0 + t].  No split-K: the (head, token) grid already gives n_head * T blocks.  The KV formats are the
+// same the decode path reads, so a chunk and a token at a time land on the same cache.
+template <int KF, int VF>
+__global__ void attn_chunk_kernel(const float* __restrict__ q, const uint8_t* __restrict__ K,
+                                  const uint8_t* __restrict__ V, float* __restrict__ out, int n_head, int n_kv,
                                   int head_dim, int pos0, int max_ctx, float scale) {
     const int h = blockIdx.x, t = blockIdx.y;
     const int kvh = h / (n_head / n_kv);
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int per = head_dim >> 5;
 
+    __shared__ float sq[kMaxHeadDim];
     float qv[8];
+    if (KF == kQ4) {                                      // head_dim == 256: one thread per dim
+        sq[threadIdx.x] = q[((size_t) t * n_head + h) * head_dim + threadIdx.x];
+        __syncthreads();
+        fwht256_shared(sq);
 #pragma unroll
-    for (int i = 0; i < 8; ++i)
-        qv[i] = i < per ? q[((size_t) t * n_head + h) * head_dim + lane + 32 * i] * scale : 0.0f;
+        for (int i = 0; i < 8; ++i) qv[i] = i < per ? sq[lane + 32 * i] * scale : 0.0f;
+    } else {
+#pragma unroll
+        for (int i = 0; i < 8; ++i)
+            qv[i] = i < per ? q[((size_t) t * n_head + h) * head_dim + lane + 32 * i] * scale : 0.0f;
+    }
 
-    const __half* Kb = K + (size_t) kvh * max_ctx * head_dim;
-    const __half* Vb = V + (size_t) kvh * max_ctx * head_dim;
+    const size_t kcell = (size_t) cell_bytes(KF, head_dim), vcell = (size_t) cell_bytes(VF, head_dim);
+    const uint8_t* Kb = K + (size_t) kvh * max_ctx * kcell;
+    const uint8_t* Vb = V + (size_t) kvh * max_ctx * vcell;
     const int end = pos0 + t + 1;
 
     float m = -FLT_MAX, l = 0.0f, acc[8];
@@ -416,29 +437,34 @@ __global__ void attn_chunk_kernel(const float* __restrict__ q, const __half* __r
     for (int i = 0; i < 8; ++i) acc[i] = 0.0f;
 
     for (int c = warp; c < end; c += kWarps) {
+        const uint8_t* kcl = Kb + (size_t) c * kcell;
         float d = 0.0f;
 #pragma unroll
         for (int i = 0; i < 8; ++i)
-            if (i < per) d += qv[i] * __half2float(Kb[(size_t) c * head_dim + lane + 32 * i]);
+            if (i < per) d += qv[i] * kv_val<KF>(kcl, i, lane);
         d = warp_sum(d);
         const float mn = fmaxf(m, d);
         const float corr = __expf(m - mn);
         const float p = __expf(d - mn);
         l = l * corr + p;
+        const uint8_t* vcl = Vb + (size_t) c * vcell;
 #pragma unroll
         for (int i = 0; i < 8; ++i)
-            if (i < per) acc[i] = acc[i] * corr + p * __half2float(Vb[(size_t) c * head_dim + lane + 32 * i]);
+            if (i < per) acc[i] = acc[i] * corr + p * kv_val<VF>(vcl, i, lane);
         m = mn;
     }
 
     __shared__ float sm[kWarps], sl[kWarps];
     __shared__ float sacc[kWarps][kMaxHeadDim];
+    __shared__ float so[kMaxHeadDim];
     if (lane == 0) { sm[warp] = m; sl[warp] = l; }
 #pragma unroll
     for (int i = 0; i < 8; ++i)
         if (i < per) sacc[warp][lane + 32 * i] = acc[i];
     __syncthreads();
 
+    // A Q4 value cache means head_dim == 256, so every thread of the block is inside this branch and the rotation's
+    // __syncthreads() stay aligned.
     if (threadIdx.x < head_dim) {
         float gm = -FLT_MAX;
         for (int w = 0; w < kWarps; ++w) gm = fmaxf(gm, sm[w]);
@@ -449,7 +475,14 @@ __global__ void attn_chunk_kernel(const float* __restrict__ q, const __half* __r
             a += sacc[w][threadIdx.x] * f;
             L += sl[w] * f;
         }
-        out[((size_t) t * n_head + h) * head_dim + threadIdx.x] = L > 0.0f ? a / L : 0.0f;
+        float val = L > 0.0f ? a / L : 0.0f;
+        if (VF == kQ4) {                                  // back from the rotated space
+            so[threadIdx.x] = val;
+            __syncthreads();
+            fwht256_shared(so);
+            val = so[threadIdx.x];
+        }
+        out[((size_t) t * n_head + h) * head_dim + threadIdx.x] = val;
     }
 }
 
@@ -735,26 +768,68 @@ void dense_positions_i32(int32_t* dst, int rows, int heads, int32_t pos0, void* 
     check("dense_positions_i32");
 }
 
-void dense_kv_append_rows(uint16_t* k_cache, uint16_t* v_cache, const float* k, const float* v, int T, int pos0,
-                          int n_kv, int head_dim, int max_ctx, void* stream) {
+void dense_kv_append_rows_fmt(void* k_cache, void* v_cache, int k_fmt, int v_fmt, const float* k, const float* v,
+                              int T, int pos0, int n_kv, int head_dim, int max_ctx, void* stream) {
     if (T < 1 || pos0 < 0 || pos0 + T > max_ctx)
         throw std::runtime_error("dense_kv_append_rows: positions outside the cache");
-    const dim3 grid(n_kv, T);
-    kv_append_rows_kernel<<<grid, 128, 0, (cudaStream_t) stream>>>((__half*) k_cache, (__half*) v_cache, k, v, pos0,
-                                                                   n_kv, head_dim, max_ctx);
+    check_kv_formats("dense_kv_append_rows", k_fmt, v_fmt, head_dim);
+    const cudaStream_t st = (cudaStream_t) stream;
+    uint8_t* kc = (uint8_t*) k_cache;
+    uint8_t* vc = (uint8_t*) v_cache;
+#define STRATA_KVROWS(K, V) \
+    kv_append_rows_kernel<K, V><<<dim3(n_kv, T), head_dim, 0, st>>>(kc, vc, k, v, pos0, n_kv, head_dim, max_ctx)
+    switch (k_fmt * 3 + v_fmt) {
+        case 0: STRATA_KVROWS(kF16, kF16); break;
+        case 1: STRATA_KVROWS(kF16, kQ8); break;
+        case 2: STRATA_KVROWS(kF16, kQ4); break;
+        case 3: STRATA_KVROWS(kQ8, kF16); break;
+        case 4: STRATA_KVROWS(kQ8, kQ8); break;
+        case 5: STRATA_KVROWS(kQ8, kQ4); break;
+        case 6: STRATA_KVROWS(kQ4, kF16); break;
+        case 7: STRATA_KVROWS(kQ4, kQ8); break;
+        default: STRATA_KVROWS(kQ4, kQ4); break;
+    }
+#undef STRATA_KVROWS
     check("dense_kv_append_rows");
+}
+
+void dense_kv_append_rows(uint16_t* k_cache, uint16_t* v_cache, const float* k, const float* v, int T, int pos0,
+                          int n_kv, int head_dim, int max_ctx, void* stream) {
+    dense_kv_append_rows_fmt(k_cache, v_cache, kF16, kF16, k, v, T, pos0, n_kv, head_dim, max_ctx, stream);
+}
+
+void dense_attn_chunk_fmt(const float* q, const void* k_cache, const void* v_cache, int k_fmt, int v_fmt, float* out,
+                          int T, int pos0, int n_head, int n_kv, int head_dim, int max_ctx, float scale, void* stream) {
+    if (T < 1 || pos0 < 0 || pos0 + T > max_ctx)
+        throw std::runtime_error("dense_attn_chunk: positions outside the cache");
+    if (n_head % n_kv != 0)
+        throw std::runtime_error("dense_attn_chunk: n_head must be a multiple of n_kv");
+    check_kv_formats("dense_attn_chunk", k_fmt, v_fmt, head_dim);
+    const cudaStream_t st = (cudaStream_t) stream;
+    const uint8_t* K = (const uint8_t*) k_cache;
+    const uint8_t* V = (const uint8_t*) v_cache;
+    const dim3 grid(n_head, T);
+#define STRATA_ATTCH(KF, VF)                                                            \
+    attn_chunk_kernel<KF, VF><<<grid, kWarps * 32, 0, st>>>(q, K, V, out, n_head, n_kv,  \
+                                                            head_dim, pos0, max_ctx, scale)
+    switch (k_fmt * 3 + v_fmt) {
+        case 0: STRATA_ATTCH(kF16, kF16); break;
+        case 1: STRATA_ATTCH(kF16, kQ8); break;
+        case 2: STRATA_ATTCH(kF16, kQ4); break;
+        case 3: STRATA_ATTCH(kQ8, kF16); break;
+        case 4: STRATA_ATTCH(kQ8, kQ8); break;
+        case 5: STRATA_ATTCH(kQ8, kQ4); break;
+        case 6: STRATA_ATTCH(kQ4, kF16); break;
+        case 7: STRATA_ATTCH(kQ4, kQ8); break;
+        default: STRATA_ATTCH(kQ4, kQ4); break;
+    }
+#undef STRATA_ATTCH
+    check("dense_attn_chunk");
 }
 
 void dense_attn_chunk(const float* q, const uint16_t* k_cache, const uint16_t* v_cache, float* out, int T, int pos0,
                       int n_head, int n_kv, int head_dim, int max_ctx, float scale, void* stream) {
-    if (T < 1 || pos0 < 0 || pos0 + T > max_ctx)
-        throw std::runtime_error("dense_attn_chunk: positions outside the cache");
-    if (head_dim % 32 != 0 || head_dim > kMaxHeadDim || n_head % n_kv != 0)
-        throw std::runtime_error("dense_attn_chunk: head_dim must be a multiple of 32 up to 256 and n_head a multiple of n_kv");
-    const dim3 grid(n_head, T);
-    attn_chunk_kernel<<<grid, kWarps * 32, 0, (cudaStream_t) stream>>>(
-        q, (const __half*) k_cache, (const __half*) v_cache, out, n_head, n_kv, head_dim, pos0, max_ctx, scale);
-    check("dense_attn_chunk");
+    dense_attn_chunk_fmt(q, k_cache, v_cache, kF16, kF16, out, T, pos0, n_head, n_kv, head_dim, max_ctx, scale, stream);
 }
 
 void dense_gemv_f32_rows(const float* W, const float* X, float* y, int n_in, int n_out, int rows, void* stream) {
