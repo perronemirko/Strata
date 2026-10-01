@@ -253,6 +253,9 @@ struct DenseModel::Impl {
     uint64_t budget = UINT64_MAX;                   // bytes of weights that may go to VRAM
     uint64_t dev_used = 0, host_bytes = 0;
     int host_tensors = 0;
+    struct Ckpt { uint8_t* host = nullptr; int64_t pos = -1; };
+    std::vector<Ckpt> ckpt;
+    uint64_t ckpt_bytes = 0;
     long long dbg_from = -1, dbg_to = -1;           // STRATA_DENSE_DEBUG=A:B traces the steps with A <= position < B
     Prof prof;                                      // STRATA_DENSE_PROF=1
     int kfmt = DENSE_KV_F16, vfmt = DENSE_KV_F16;   // how the KV cache stores K and V (--kv)
@@ -716,6 +719,7 @@ DenseModel::~DenseModel() {
     if (impl_->stream) cudaStreamSynchronize(impl_->stream);
     for (void* p : impl_->allocations) cudaFree(p);
     for (void* p : impl_->host_allocs) cudaFreeHost(p);
+    for (auto& c : impl_->ckpt) if (c.host) cudaFreeHost(c.host);
 #ifdef STRATA_DENSE_MMQ
     if (impl_->pf && impl_->pf->stage) cudaFreeHost(impl_->pf->stage);
 #endif
@@ -1098,7 +1102,74 @@ bool DenseModel::sync(std::string& err) {
     if (s != cudaSuccess) { err = std::string("dense model: ") + cudaGetErrorString(s); return false; }
     return true;
 }
+int64_t DenseModel::ckpt_pos(int slot) const { return slot >= 0 && slot < ckpt_n_ ? impl_->ckpt[(size_t) slot].pos : -1; }
+void DenseModel::ckpt_drop(int slot) { if (slot >= 0 && slot < ckpt_n_) impl_->ckpt[(size_t) slot].pos = -1; }
 
+bool DenseModel::ckpt_init(int slots, std::string& err) {
+    Impl& I = *impl_;
+    for (auto& c : I.ckpt) if (c.host) cudaFreeHost(c.host);
+    I.ckpt.clear();
+    ckpt_n_ = 0;
+    if (slots <= 0) return true;
+    const uint64_t sb = (uint64_t) cfg_.ssm_state * cfg_.ssm_v_heads * cfg_.ssm_state * 4;
+    const uint64_t cb = (uint64_t) cfg_.conv_channels() * (cfg_.ssm_d_conv - 1) * 4;
+    uint64_t n_gdn = 0;
+    for (const Layer& L : I.layers) if (!L.attn) ++n_gdn;
+    I.ckpt_bytes = n_gdn * (sb + cb) + (uint64_t) cfg_.n_embd * 4;
+    I.ckpt.resize((size_t) slots);
+    for (int k = 0; k < slots; ++k) {
+        void* p = nullptr;
+        const cudaError_t s = cudaHostAlloc(&p, I.ckpt_bytes, cudaHostAllocDefault);
+        if (s != cudaSuccess) {
+            cudaGetLastError();
+            err = "dense model: cannot pin " + std::to_string(I.ckpt_bytes >> 20) + " MiB for checkpoint " +
+                  std::to_string(k + 1) + ": " + cudaGetErrorString(s);
+            for (auto& c : I.ckpt) if (c.host) cudaFreeHost(c.host);
+            I.ckpt.clear();
+            return false;
+        }
+        I.ckpt[(size_t) k].host = (uint8_t*) p;
+    }
+    ckpt_n_ = slots;
+    return true;
+}
+
+bool DenseModel::ckpt_save(int slot, std::string& err) {
+    Impl& I = *impl_;
+    if (slot < 0 || slot >= ckpt_n_) { err = "dense model: no such checkpoint slot"; return false; }
+    const uint64_t sb = (uint64_t) cfg_.ssm_state * cfg_.ssm_v_heads * cfg_.ssm_state * 4;
+    const uint64_t cb = (uint64_t) cfg_.conv_channels() * (cfg_.ssm_d_conv - 1) * 4;
+    uint8_t* at = I.ckpt[(size_t) slot].host;
+    for (const Layer& L : I.layers) {
+        if (L.attn) continue;
+        cudaMemcpyAsync(at, L.state, sb, cudaMemcpyDeviceToHost, I.stream); at += sb;
+        cudaMemcpyAsync(at, L.conv_state, cb, cudaMemcpyDeviceToHost, I.stream); at += cb;
+    }
+    cudaMemcpyAsync(at, I.h_last, (size_t) cfg_.n_embd * 4, cudaMemcpyDeviceToHost, I.stream);
+    const cudaError_t s = cudaGetLastError();
+    if (s != cudaSuccess) { err = std::string("dense model: checkpoint save: ") + cudaGetErrorString(s); return false; }
+    I.ckpt[(size_t) slot].pos = pos_;
+    return true;
+}
+
+bool DenseModel::ckpt_restore(int slot, std::string& err) {
+    Impl& I = *impl_;
+    if (slot < 0 || slot >= ckpt_n_ || I.ckpt[(size_t) slot].pos < 0) { err = "dense model: that checkpoint is empty"; return false; }
+    const uint64_t sb = (uint64_t) cfg_.ssm_state * cfg_.ssm_v_heads * cfg_.ssm_state * 4;
+    const uint64_t cb = (uint64_t) cfg_.conv_channels() * (cfg_.ssm_d_conv - 1) * 4;
+    const uint8_t* at = I.ckpt[(size_t) slot].host;
+    for (Layer& L : I.layers) {
+        if (L.attn) continue;
+        cudaMemcpyAsync(L.state, at, sb, cudaMemcpyHostToDevice, I.stream); at += sb;
+        cudaMemcpyAsync(L.conv_state, at, cb, cudaMemcpyHostToDevice, I.stream); at += cb;
+    }
+    cudaMemcpyAsync(I.h_last, at, (size_t) cfg_.n_embd * 4, cudaMemcpyHostToDevice, I.stream);
+    const cudaError_t s = cudaGetLastError();
+    if (s != cudaSuccess) { err = std::string("dense model: checkpoint restore: ") + cudaGetErrorString(s); return false; }
+    pos_ = I.ckpt[(size_t) slot].pos;
+    snap_valid_ = false;
+    return true;
+}
 void DenseModel::set_last_hidden(int col) {
     cudaMemcpyAsync(impl_->h_last, impl_->hid + (size_t) col * cfg_.n_embd, (size_t) cfg_.n_embd * 4,
                     cudaMemcpyDeviceToDevice, impl_->stream);

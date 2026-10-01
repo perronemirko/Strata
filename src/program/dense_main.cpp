@@ -773,6 +773,7 @@ int main(int argc, char** argv) {
     float draft_p_min = 0.0f;
     // 0: the default prompt chunk; >0: ask for that chunk; <0 (--no-prefill): feed the prompt through run()
     long long prompt_chunk = 0;
+        int n_ckpt = 4;                                // conversation checkpoints (pinned host RAM, ~154 MiB each); 0 = off
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         auto next = [&](const char* what) -> const char* {
@@ -790,6 +791,7 @@ int main(int argc, char** argv) {
         else if (a == "--context" || a == "-c") context = std::atoll(next("--context"));
         else if (a == "--prompt-chunk" || a == "--pp-chunk") prompt_chunk = std::atoll(next("--prompt-chunk"));
         else if (a == "--no-prefill") prompt_chunk = -1;
+        else if (a == "--ckpt") n_ckpt = std::atoi(next("--ckpt"));
         else if (a == "--help" || a == "-h") { usage(); return 0; }
         // the flags setup passes to `strata` (--gpu-layers, --cache, ...) mean nothing here and are not an error
     }
@@ -830,7 +832,11 @@ int main(int argc, char** argv) {
         if (!model.prefill_setup(prompt_chunk, perr))
             std::fprintf(stderr, "strata-dense: prompt prefill off - %s\n", perr.c_str());
     }
-
+    {
+        std::string cerr;
+        if (!model.ckpt_init(n_ckpt, cerr)) std::fprintf(stderr, "strata-dense: checkpoints off - %s\n", cerr.c_str());
+        else if (model.ckpt_slots()) std::fprintf(stderr, "strata-dense: %d conversation checkpoints\n", model.ckpt_slots());
+    }
     // the ids that end an answer, from the model's own vocabulary
     std::vector<int32_t> stop_ids;
     if (cfg.eos_id >= 0) stop_ids.push_back(cfg.eos_id);
@@ -919,26 +925,37 @@ int main(int argc, char** argv) {
         sp.seed = seed;
 
         // ---- what of the state can be kept
-        size_t resume = 0;
-        if (!fed.empty() && fed.size() < ids.size() && std::equal(fed.begin(), fed.end(), ids.begin())) resume = fed.size();
-        if (resume == 0) {
-            // The whole conversation is re-read from token 0.  That is the single most expensive thing this engine
-            // can do (a 36k prompt is 90 s), and it happens whenever the client rewrites anything earlier in the
-            // prompt - an agent that regenerates its system prompt, or a chat template that stamps a clock, breaks
-            // the prefix at token ~100 and loses 35k tokens of work.  Say where the two prompts part, because the
-            // fix is different for each case: a divergence at the head is the client's prompt, one at the tail is
-            // this engine's own bookkeeping.
-            if (!fed.empty()) {
-                size_t common = 0;
-                const size_t lim = std::min(fed.size(), ids.size());
-                while (common < lim && fed[common] == ids[common]) ++common;
-                std::fprintf(stderr, "strata-dense: re-reading from token 0: the previous %zu tokens are not a prefix of "
-                             "the new %zu - they first differ at token %zu (%.1f%% of the prompt lost)\n",
-                             fed.size(), ids.size(), common, 100.0 * (double) (fed.size() - common) / (double) fed.size());
-            }
-            model.reset();
-            fed.clear();
+        size_t common = 0;
+        {
+            const size_t lim = std::min(fed.size(), ids.size());
+            while (common < lim && fed[common] == ids[common]) ++common;
         }
+        size_t resume = 0;
+        if (!fed.empty() && fed.size() < ids.size() && common == fed.size()) resume = fed.size();
+        if (resume == 0) {
+            // The prompts part at `common`.  The GDN state cannot be cut back, but a checkpoint taken at or before
+            // `common` is a state the new prompt also goes through: restore the latest one (it must leave at least
+            // one token to read, or there would be no logits).
+            int best = -1;
+            for (int k = 0; k < model.ckpt_slots(); ++k) {
+                const int64_t p = model.ckpt_pos(k);
+                if (p > 0 && (size_t) p <= common && (size_t) p < ids.size() && (best < 0 || p > model.ckpt_pos(best))) best = k;
+            }
+            if (!fed.empty())
+                std::fprintf(stderr, "strata-dense: previous %zu tokens are not a prefix of the new %zu - they first differ at token %zu%s\n",
+                             fed.size(), ids.size(), common, best >= 0 ? " (restoring a checkpoint)" : " (no checkpoint: re-reading from 0)");
+            if (best >= 0 && model.ckpt_restore(best, err)) {
+                resume = (size_t) model.position();
+                fed.resize(resume);
+                std::fprintf(stderr, "strata-dense: checkpoint restored at token %zu, reading %zu\n", resume, ids.size() - resume);
+            } else {
+                model.reset();
+                fed.clear();
+                for (int k = 0; k < model.ckpt_slots(); ++k) model.ckpt_drop(k);
+            }
+        }
+        for (int k = 0; k < model.ckpt_slots(); ++k)           // a checkpoint past the kept prefix is stale
+            if (model.ckpt_pos(k) > (int64_t) resume) model.ckpt_drop(k);
         const int64_t n = (int64_t) ids.size();
         const long long budget = std::min<long long>(max_new, model.max_context() - n);
         auto fail = [&](const std::string& why) {
@@ -946,6 +963,7 @@ int main(int argc, char** argv) {
             std::fflush(stdout);
             model.reset();
             fed.clear();
+            for (int k = 0; k < model.ckpt_slots(); ++k) model.ckpt_drop(k);
         };
 
         // ---- read the prompt.  With the MMQ prefill available a pass is prefill_chunk() tokens wide and every
@@ -957,8 +975,29 @@ int main(int argc, char** argv) {
         int64_t since_pp = 0;
         const bool use_pf = model.prefill_ready();
         const int64_t pf_step = model.prefill_chunk();      // STOP is checked between steps
+        // Where to save checkpoints: the end of the prompt and a few points before it (the template re-renders the
+        // tail of a turn, so the previous prompt's last tokens are the ones that change).
+        std::vector<int64_t> marks;
+        for (int64_t d : {0, 1, 8, 64}) {
+            const int64_t m = n - d;
+            if (marks.size() < (size_t) model.ckpt_slots() && m > (int64_t) resume && m > 0) marks.push_back(m);
+        }
+        std::sort(marks.begin(), marks.end());
+        auto save_mark = [&](int64_t) {
+            int slot = -1, lo = 0;
+            int64_t lowest = (int64_t) 1 << 62;
+            for (int k = 0; k < model.ckpt_slots(); ++k) {
+                const int64_t p = model.ckpt_pos(k);
+                if (p < 0) { slot = k; break; }
+                if (p < lowest) { lowest = p; lo = k; }
+            }
+            if (slot < 0) slot = lo;
+            std::string cerr;
+            if (!model.ckpt_save(slot, cerr)) std::fprintf(stderr, "strata-dense: checkpoint: %s\n", cerr.c_str());
+        };
         for (int64_t i = (int64_t) resume; i < n && !failed;) {
-            const int64_t step = std::min<int64_t>(use_pf ? pf_step : (int64_t) NC, n - i);
+            int64_t step = std::min<int64_t>(use_pf ? pf_step : (int64_t) NC, n - i);
+            for (int64_t m : marks) if (m > i && m < i + step) { step = m - i; break; }   // stop exactly on a mark
             const bool last = (i + step == n);
             bool ok = false;
             if (use_pf) {
@@ -976,6 +1015,7 @@ int main(int argc, char** argv) {
             fed.insert(fed.end(), ids.begin() + i, ids.begin() + i + step);
             i += step;
             since_pp += step;
+            if (std::binary_search(marks.begin(), marks.end(), i)) save_mark(i);
             if (in.stop.load()) { cancelled = true; model.sync(err); break; }
             if (since_pp >= 32 || last) {
                 if (!model.sync(err)) { fail(err); failed = true; break; }
