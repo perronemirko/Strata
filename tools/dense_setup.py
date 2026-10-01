@@ -86,9 +86,25 @@ def main() -> int:
     ap.add_argument("--context", type=int, default=32768)
     ap.add_argument("--build", action="store_true", help="build strata-dense (CUDA)")
     ap.add_argument("--arch", default="native", help="CMAKE_CUDA_ARCHITECTURES, e.g. 86 (RTX 30), 89 (RTX 40), 120 (RTX 50)")
+    ap.add_argument("--mtp", action="store_true",
+                    help="speculative decoding with the model's own MTP block (it is inside the GGUF; ~1.4 GB more VRAM)")
+    ap.add_argument("--draft-max", type=int, default=2, metavar="N",
+                    help="MTP: most tokens proposed per step, 1..7 (default 2). Each unit costs ~156 MB of VRAM for rollback")
+    ap.add_argument("--draft-min", type=int, default=1, metavar="N",
+                    help="MTP: speculate only when at least N tokens were proposed, 1..draft-max (default 1)")
+    ap.add_argument("--draft-p-min", type=float, default=0.0, metavar="P",
+                    help="MTP: stop drafting at a token the head gives less than this probability, 0..1 (default 0)")
+    ap.add_argument("--mtp-force", action="store_true",
+                    help="MTP: keep it on even when the weights do not all fit in VRAM (by default it switches itself off)")
     ap.add_argument("--port", type=int, default=8080)
     ap.add_argument("--exe", help="use this strata-dense instead of building")
     a = ap.parse_args()
+    if not 1 <= a.draft_max <= 7:
+        sys.exit("--draft-max must be 1..7")
+    if not 1 <= a.draft_min <= a.draft_max:
+        sys.exit(f"--draft-min must be 1..--draft-max ({a.draft_max})")
+    if not 0.0 <= a.draft_p_min <= 1.0:
+        sys.exit("--draft-p-min must be 0..1")
 
     gguf = Path(a.gguf) if a.gguf else download(a.download, Path(a.models_dir))
     if not gguf.exists():
@@ -108,7 +124,9 @@ def main() -> int:
             say(f"NOTE: {exe} does not exist yet - run again with --build")
 
     cfg = {
-        "exe": str(exe), "args": ["--native", str(gguf), "--context", str(a.context)], "cwd": str(ROOT),
+        "exe": str(exe), "args": ["--native", str(gguf), "--context", str(a.context)] + (
+            ["--mtp", "--draft-max", str(a.draft_max), "--draft-min", str(a.draft_min), "--draft-p-min", str(a.draft_p_min)]
+            + (["--mtp-force"] if a.mtp_force else []) if a.mtp else []), "cwd": str(ROOT),
         "tokenizer": str(pack / "tokenizer"), "model_name": "qwen3.8-27b", "port": a.port,
         "log": str(ROOT / "strata-qwen3.8-27b.log"), "lib_dirs": [],
         # the model card's recommended sampling for thinking mode; the request's own values win

@@ -87,7 +87,8 @@ bool parse_ids(const char* p, std::vector<int32_t>& ids) {
 
 void usage() {
     std::fprintf(stderr,
-                 "usage: strata-dense --serve --native <model.gguf> [--context N]\n"
+                 "usage: strata-dense --serve --native <model.gguf> [--context N] [--mtp [--draft-max N] [--draft-min N] [--draft-p-min P] [--mtp-force]]\n"
+                 "       strata-dense --selftest | --check <model.gguf> [--mtp]\n"
                  "  a dense qwen35 GGUF (Qwen3.8-27B) behind Strata's server protocol; the server runs it with\n"
                  "  `serve/server.py --engine strata --config <run config>` whose `exe` is this program.\n");
 }
@@ -165,6 +166,23 @@ int selftest() {
             strata::kernels::dense_swiglu(dg, du, dout, n, nullptr);
             report("swiglu 17408", compare(from_dev(dout, n), ref), 1e-4);
         }
+        {   // GDN output norm: rms(o) * w * silu(z), per value head
+            const int heads = 48, cols = 128;
+            auto o = rnd((size_t) heads * cols, 2.0f), zz = rnd((size_t) heads * cols, 2.0f), w = rnd(cols, 1.0f);
+            std::vector<float> ref(o.size());
+            for (int h = 0; h < heads; ++h) {
+                double ss = 0; for (int i = 0; i < cols; ++i) ss += (double) o[(size_t) h * cols + i] * o[(size_t) h * cols + i];
+                const double sc = 1.0 / std::sqrt(ss / cols + 1e-6);
+                for (int i = 0; i < cols; ++i) {
+                    const double g = zz[(size_t) h * cols + i];
+                    ref[(size_t) h * cols + i] = (float) (o[(size_t) h * cols + i] * sc * w[(size_t) i] * (g / (1.0 + std::exp(-g))));
+                }
+            }
+            float *d_o = to_dev(o), *d_z = to_dev(zz), *d_w = to_dev(w), *dout = nullptr;
+            cudaMalloc((void**) &dout, o.size() * 4);
+            strata::kernels::dense_gdn_out_norm(d_o, d_z, d_w, dout, heads, cols, 1e-6f, nullptr);
+            report("gdn_out_norm 48 x 128 (SiLU gate)", compare(from_dev(dout, o.size()), ref), 1e-4);
+        }
         {   // F32 GEMV
             const int n_in = 5120, n_out = 48;
             auto W = rnd((size_t) n_in * n_out, 0.05f), x = rnd(n_in);
@@ -237,14 +255,145 @@ int selftest() {
     return bad ? 1 : 0;
 }
 
+
+// ---- `strata-dense --check <model.gguf> [--mtp]`: the model against ITSELF - the columns, the snapshot and the
+// rollback must reproduce feeding the tokens one at a time.  Needs the GPU and the model, no reference engine.
+double max_abs_diff(const std::vector<float>& a, const std::vector<float>& b, bool* same) {
+    double d = 0;
+    *same = true;
+    for (size_t i = 0; i < a.size(); ++i) {
+        if (std::memcmp(&a[i], &b[i], 4) != 0) *same = false;
+        d = std::max(d, std::fabs((double) a[i] - (double) b[i]));
+    }
+    return d;
+}
+
+std::vector<float> read_logits(strata::core::DenseModel& m, int col) {
+    std::string err;
+    m.sync(err);
+    std::vector<float> h((size_t) m.config().n_vocab);
+    cudaMemcpy(h.data(), m.logits_col(col), h.size() * 4, cudaMemcpyDeviceToHost);
+    return h;
+}
+
+int argmax_of(const std::vector<float>& v) { return (int) (std::max_element(v.begin(), v.end()) - v.begin()); }
+
+int check_model(const std::string& gguf, bool with_mtp) {
+    using strata::core::Logits;
+    strata::core::DenseModel m;
+    std::string err;
+    strata::core::DenseOptions opt;
+    opt.mtp = with_mtp;
+    opt.mtp_force = true;                     // a check must not be switched off by the VRAM rule
+    opt.draft_max = 3;
+    if (!m.load(gguf, 512, err, opt)) { std::printf("load: %s\n", err.c_str()); return 1; }
+    std::mt19937 rng(11);
+    std::vector<int32_t> T(40);
+    for (auto& t : T) t = 1000 + (int32_t) (rng() % 20000);
+    int bad = 0;
+    auto verdict = [&](const char* what, const std::vector<float>& a, const std::vector<float>& b) {
+        bool same = false;
+        const double d = max_abs_diff(a, b, &same);
+        const bool ok = argmax_of(a) == argmax_of(b) && d < 1e-2;
+        std::printf("%-50s max |dlogit| %.3g  %s  argmax %d / %d  %s\n", what, d, same ? "(bit-identical)" : "", argmax_of(a),
+                    argmax_of(b), ok ? "ok" : "FAIL");
+        if (!ok) ++bad;
+    };
+
+    // A: one token at a time
+    m.reset();
+    for (size_t i = 0; i < T.size(); ++i)
+        if (!m.step(T[i], i + 1 == T.size(), err)) { std::printf("%s\n", err.c_str()); return 1; }
+    const auto LA = read_logits(m, 0);
+
+    // B: the same tokens in uneven chunks
+    m.reset();
+    const int sizes[] = {3, 2, 5, 1, 8, 4};
+    size_t i = 0, k = 0;
+    while (i < T.size()) {
+        const int n = (int) std::min<size_t>((size_t) sizes[k++ % 6], T.size() - i);
+        if (!m.run(&T[i], n, i + (size_t) n == T.size() ? Logits::Last : Logits::None, false, false, err)) { std::printf("%s\n", err.c_str()); return 1; }
+        i += (size_t) n;
+    }
+    verdict("chunks of 3,2,5,1,8,4 vs one at a time", LA, read_logits(m, 0));
+
+    if (m.has_mtp()) {
+        // C1: three columns with two junk drafts, rolled back to column 0, then the real continuation
+        m.reset();
+        for (size_t j = 0; j + 2 < T.size(); ++j) m.step(T[j], false, err);          // T[0..37]
+        const int32_t c1[3] = {T[38], 7, 9};
+        if (!m.run(c1, 3, Logits::All, true, true, err)) { std::printf("%s\n", err.c_str()); return 1; }
+        const auto col0 = read_logits(m, 0);
+        if (!m.rollback(0, err)) { std::printf("%s\n", err.c_str()); return 1; }
+        if (m.position() != 39) { std::printf("rollback(0) left position %lld, expected 39\n", (long long) m.position()); ++bad; }
+        m.step(T[39], true, err);
+        verdict("rollback(0) of two rejected columns, then continue", LA, read_logits(m, 0));
+
+        // C2: three columns where the first draft was right: column 1 must be the one-at-a-time logits, and
+        //     rollback(1) must leave exactly the state after T[39]
+        m.reset();
+        for (size_t j = 0; j + 2 < T.size(); ++j) m.step(T[j], false, err);
+        const int32_t c2[3] = {T[38], T[39], 9};
+        if (!m.run(c2, 3, Logits::All, true, true, err)) { std::printf("%s\n", err.c_str()); return 1; }
+        verdict("3-column run: column 1 vs one at a time", LA, read_logits(m, 1));
+        if (!m.rollback(1, err)) { std::printf("%s\n", err.c_str()); return 1; }
+        m.step(5, true, err);
+        const auto after_rb = read_logits(m, 0);
+        m.reset();
+        for (size_t j = 0; j < T.size(); ++j) m.step(T[j], false, err);
+        m.step(5, true, err);
+        verdict("rollback(1), then one more token vs plain", read_logits(m, 0), after_rb);
+
+        // D: column 0 of a multi-column run equals the single-token logits
+        m.reset();
+        for (size_t j = 0; j < 38; ++j) m.step(T[j], false, err);
+        m.step(T[38], true, err);
+        const auto single = read_logits(m, 0);
+        m.reset();
+        for (size_t j = 0; j < 38; ++j) m.step(T[j], false, err);
+        const int32_t c3[3] = {T[38], 11, 13};
+        m.run(c3, 3, Logits::All, true, true, err);
+        verdict("3-column run: column 0 vs single step", single, read_logits(m, 0));
+
+        // E: the MTP block runs; a chain of drafts comes out with valid ids (compare with llama.cpp by hand)
+        m.reset();
+        m.run(T.data(), 8, Logits::Last, true, false, err);
+        if (!m.mtp_ingest(T.data(), 8, 0, 0, err)) { std::printf("%s\n", err.c_str()); return 1; }
+        int32_t dr[8];
+        int nd = 0;
+        if (!m.mtp_draft(argmax_of(read_logits(m, 0)), 8, 3, 0.0f, dr, &nd, err)) { std::printf("%s\n", err.c_str()); return 1; }
+        std::printf("MTP chain after 8 tokens + the model's own next token:");
+        bool ok = nd == 3;
+        for (int j = 0; j < nd; ++j) { std::printf(" %d", dr[j]); ok = ok && dr[j] >= 0 && dr[j] < m.config().n_vocab; }
+        std::printf("   %s\n", ok ? "ok" : "FAIL");
+        if (!ok) ++bad;
+    }
+    std::printf(bad ? "check: %d FAILED\n" : "check: all passed\n", bad);
+    return bad ? 1 : 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
-    for (int i = 1; i < argc; ++i)
+    for (int i = 1; i < argc; ++i) {
         if (std::string(argv[i]) == "--selftest") return selftest();
+        if (std::string(argv[i]) == "--check") {
+            bool mtp = false;
+            std::string path;
+            for (int j = 1; j < argc; ++j) {
+                const std::string a = argv[j];
+                if (a == "--mtp") mtp = true;
+                else if (a != "--check" && a.rfind("--", 0) != 0) path = a;
+            }
+            if (path.empty()) { std::fprintf(stderr, "usage: strata-dense --check <model.gguf> [--mtp]\n"); return 2; }
+            return check_model(path, mtp);
+        }
+    }
     std::string gguf;
     long long context = 32768;
-    bool serve = false;
+    bool serve = false, want_mtp = false, mtp_force = false;
+    int draft_max = 2, draft_min = 1;
+    float draft_p_min = 0.0f;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         auto next = [&](const char* what) -> const char* {
@@ -252,22 +401,43 @@ int main(int argc, char** argv) {
             return argv[++i];
         };
         if (a == "--serve") serve = true;
+        else if (a == "--mtp") want_mtp = true;
+        else if (a == "--mtp-force") mtp_force = true;
+        else if (a == "--draft-max" || a == "--spec-draft-n-max") draft_max = std::atoi(next("--draft-max"));
+        else if (a == "--draft-min" || a == "--spec-draft-n-min") draft_min = std::atoi(next("--draft-min"));
+        else if (a == "--draft-p-min" || a == "--spec-draft-p-min") draft_p_min = std::strtof(next("--draft-p-min"), nullptr);
         else if (a == "--native" || a == "--model" || a == "--gguf") gguf = next("--native");
         else if (a == "--context" || a == "-c") context = std::atoll(next("--context"));
         else if (a == "--help" || a == "-h") { usage(); return 0; }
         // the flags setup passes to `strata` (--gpu-layers, --cache, ...) mean nothing here and are not an error
     }
     if (!serve || gguf.empty()) { usage(); return 2; }
+    if (draft_max < 1 || draft_max > strata::core::DenseModel::kMaxCols - 1) {
+        std::fprintf(stderr, "strata-dense: --draft-max must be 1..%d\n", strata::core::DenseModel::kMaxCols - 1);
+        return 2;
+    }
+    if (draft_min < 1 || draft_min > draft_max) {
+        std::fprintf(stderr, "strata-dense: --draft-min must be 1..--draft-max (%d)\n", draft_max);
+        return 2;
+    }
+    if (!(draft_p_min >= 0.0f && draft_p_min <= 1.0f)) { std::fprintf(stderr, "strata-dense: --draft-p-min must be 0..1\n"); return 2; }
 
     strata::core::DenseModel model;
     std::string err;
-    std::fprintf(stderr, "strata-dense: loading %s ...\n", gguf.c_str());
-    if (!model.load(gguf, context, err)) {
+    std::fprintf(stderr, "strata-dense: loading %s%s ...\n", gguf.c_str(), want_mtp ? " (with the MTP head)" : "");
+    strata::core::DenseOptions opt;
+    opt.mtp = want_mtp;
+    opt.mtp_force = mtp_force;
+    opt.draft_max = draft_max;
+    if (!model.load(gguf, context, err, opt)) {
         std::fprintf(stderr, "strata-dense: %s\n", err.c_str());
         std::printf("ERR %s\n", err.c_str());
         return 1;
     }
     const auto& cfg = model.config();
+    const int n_vocab = cfg.n_vocab;
+    constexpr int NC = strata::core::DenseModel::kMaxCols;
+    using strata::core::Logits;
 
     // the ids that end an answer, from the model's own vocabulary
     std::vector<int32_t> stop_ids;
@@ -290,13 +460,16 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    std::printf("INFO engine=dense-0.1 model=%s layers=%d n_embd=%d weights_mib=%llu host_mib=%llu kv_mib=%llu context=%lld\n",
+    std::printf("INFO engine=dense-0.2 model=%s layers=%d n_embd=%d weights_mib=%llu host_mib=%llu kv_mib=%llu context=%lld mtp=%d draft_max=%d draft_min=%d draft_p_min=%.2f\n",
                 cfg.arch.c_str(), cfg.n_layer, cfg.n_embd, (unsigned long long) (model.weight_bytes() >> 20),
-                (unsigned long long) (model.host_weight_bytes() >> 20), (unsigned long long) (model.kv_bytes() >> 20), (long long) model.max_context());
+                (unsigned long long) (model.host_weight_bytes() >> 20), (unsigned long long) (model.kv_bytes() >> 20),
+                (long long) model.max_context(), model.has_mtp() ? 1 : 0, model.has_mtp() ? draft_max : 0,
+                model.has_mtp() ? draft_min : 0, (double) draft_p_min);
     std::printf("READY %lld stop\n", (long long) model.max_context());
     std::fflush(stdout);
-    std::fprintf(stderr, "strata-dense: ready - %.2f GiB of weights, %.2f GiB of KV cache, context %lld\n",
-                 model.weight_bytes() / 1073741824.0, model.kv_bytes() / 1073741824.0, (long long) model.max_context());
+    std::fprintf(stderr, "strata-dense: ready - %.2f GiB of weights, %.2f GiB of KV cache, context %lld%s\n",
+                 model.weight_bytes() / 1073741824.0, model.kv_bytes() / 1073741824.0, (long long) model.max_context(),
+                 model.has_mtp() ? ", MTP speculative decoding on" : (want_mtp ? ", MTP requested but OFF (see above)" : ""));
 
     Lines in;
     std::thread reader([&] {
@@ -313,7 +486,6 @@ int main(int argc, char** argv) {
     reader.detach();
 
     std::vector<int32_t> fed;                      // every token the state has consumed, in order
-    uint64_t draw_counter = 0;
     std::string line;
     while (in.pop(line)) {
         if (line == "QUIT") break;
@@ -360,31 +532,47 @@ int main(int argc, char** argv) {
         if (resume == 0) { model.reset(); fed.clear(); }
         const int64_t n = (int64_t) ids.size();
         const long long budget = std::min<long long>(max_new, model.max_context() - n);
+        auto fail = [&](const std::string& why) {
+            std::printf("ERR %s\n", why.c_str());
+            std::fflush(stdout);
+            model.reset();
+            fed.clear();
+        };
 
-        // ---- read the prompt
+        // ---- read the prompt, up to NC tokens per pass (the GEMVs read every weight once per pass)
         bool cancelled = false, failed = false;
         const auto t_prompt = Clock::now();
         auto t_pp = Clock::now();
-        for (int64_t i = (int64_t) resume; i < n; ++i) {
-            const bool last = (i == n - 1);
-            if (!model.step(ids[(size_t) i], last, err)) { std::printf("ERR %s\n", err.c_str()); failed = true; break; }
-            fed.push_back(ids[(size_t) i]);
+        int64_t since_pp = 0;
+        for (int64_t i = (int64_t) resume; i < n && !failed;) {
+            const int chunk = (int) std::min<int64_t>(NC, n - i);
+            const bool last = (i + chunk == n);
+            if (!model.run(&ids[(size_t) i], chunk, last ? Logits::Last : Logits::None, model.has_mtp(), false, err) ||
+                (model.has_mtp() && !model.mtp_ingest(&ids[(size_t) i], chunk, (int) i, 0, err))) {
+                fail(err);
+                failed = true;
+                break;
+            }
+            fed.insert(fed.end(), ids.begin() + i, ids.begin() + i + chunk);
+            i += chunk;
+            since_pp += chunk;
             if (in.stop.load()) { cancelled = true; model.sync(err); break; }
-            if ((i + 1 - (int64_t) resume) % 32 == 0 || last) {
-                if (!model.sync(err)) { std::printf("ERR %s\n", err.c_str()); failed = true; break; }
+            if (since_pp >= 32 || last) {
+                if (!model.sync(err)) { fail(err); failed = true; break; }
                 const double ms = ms_since(t_pp);
-                std::printf("PP %lld %lld %.0f %.1f\n", (long long) (i + 1), (long long) n, ms_since(t_prompt),
-                            ms > 0 ? 1000.0 * 32 / ms : 0.0);
+                std::printf("PP %lld %lld %.0f %.1f\n", (long long) i, (long long) n, ms_since(t_prompt),
+                            ms > 0 ? 1000.0 * (double) since_pp / ms : 0.0);
                 std::fflush(stdout);
                 t_pp = Clock::now();
+                since_pp = 0;
             }
         }
-        if (failed) { model.reset(); fed.clear(); std::fflush(stdout); continue; }
-        if (!model.sync(err)) { std::printf("ERR %s\n", err.c_str()); model.reset(); fed.clear(); std::fflush(stdout); continue; }
+        if (failed) continue;
+        if (!model.sync(err)) { fail(err); continue; }
         const double prompt_ms = ms_since(t_prompt);
 
         // ---- decode
-        long long produced = 0;
+        long long produced = 0, drafts_offered = 0, drafts_accepted = 0;
         const char* finish = "length";
         const auto t_dec = Clock::now();
         std::vector<int32_t> hist;                  // penalty window, most recent last
@@ -392,9 +580,12 @@ int main(int argc, char** argv) {
             const size_t take = std::min<size_t>((size_t) sp.penalty_last_n, fed.size());
             hist.assign(fed.end() - (std::ptrdiff_t) take, fed.end());
         }
-        while (!cancelled && produced < budget) {
-            if (in.stop.load()) { cancelled = true; break; }
-            sp.counter = draw_counter;
+        const bool speculate = model.has_mtp() && sp.penalty_last_n == 0;   // penalties would need the window per draft
+
+        // one draw from device logits; the counter is the POSITION of the token drawn, so a seed gives the same text
+        // whether a token comes from a single step or from a verified pair
+        auto draw = [&](const float* logits, uint64_t counter, int32_t& out) -> bool {
+            sp.counter = counter;
             const int* hp = nullptr;
             int hl = 0;
             if (sp.penalty_last_n > 0) {
@@ -405,29 +596,110 @@ int main(int argc, char** argv) {
                 hl = sp.penalty_last_n;
             }
             try {
-                strata::kernels::sample_tokens(model.logits(), 1, cfg.n_vocab, hp, hl, sp, d_next, model.stream());
-            } catch (const std::exception& e) { std::printf("ERR sampler: %s\n", e.what()); failed = true; break; }
-            int next = -1;
-            cudaMemcpyAsync(&next, d_next, sizeof(int), cudaMemcpyDeviceToHost, (cudaStream_t) model.stream());
-            if (!model.sync(err)) { std::printf("ERR %s\n", err.c_str()); failed = true; break; }
-            ++draw_counter;
+                strata::kernels::sample_tokens(logits, 1, n_vocab, hp, hl, sp, d_next, model.stream());
+            } catch (const std::exception& e) { err = std::string("sampler: ") + e.what(); return false; }
+            int v = -1;
+            cudaMemcpyAsync(&v, d_next, sizeof(int), cudaMemcpyDeviceToHost, (cudaStream_t) model.stream());
+            if (!model.sync(err)) return false;
+            out = v;
+            return true;
+        };
+        // emit one token; true when the answer is over
+        auto emit = [&](int32_t t) -> bool {
+            std::printf("T %d\n", t);
             ++produced;
-            std::printf("T %d\n", next);
+            if (sp.penalty_last_n > 0) { hist.push_back(t); if ((int) hist.size() > sp.penalty_last_n) hist.erase(hist.begin()); }
+            if (is_stop(t)) { finish = "stop"; return true; }
+            return false;
+        };
+
+        int32_t next = -1;
+        bool done = cancelled;                      // a STOP during the prompt: nothing is sampled
+        if (!cancelled) {
+            if (!draw(model.logits_col(0), (uint64_t) model.position(), next)) { fail(err); continue; }
+            done = emit(next);
             std::fflush(stdout);
-            if (sp.penalty_last_n > 0) { hist.push_back(next); if ((int) hist.size() > sp.penalty_last_n) hist.erase(hist.begin()); }
-            if (is_stop(next)) { finish = "stop"; break; }
-            if (produced >= budget) break;
-            if (!model.step(next, true, err)) { std::printf("ERR %s\n", err.c_str()); failed = true; break; }
-            fed.push_back(next);
         }
-        if (failed) { model.reset(); fed.clear(); std::fflush(stdout); continue; }
+        // invariant: `next` has been emitted but not fed; model.position() is where it goes
+        double t_draft = 0, t_verify = 0, t_ingest = 0, t_plain = 0;
+        long long cycles = 0, plain_steps = 0, emitted_spec = 0;
+        while (!done && !cancelled && !failed && produced < budget) {
+            if (in.stop.load()) { cancelled = true; break; }
+            const int64_t p = model.position();
+            const long long remaining = budget - produced;
+            int32_t dr[NC];
+            int nd = 0;
+            if (speculate && remaining >= 2 && p + 2 <= model.max_context()) {
+                const int cap = (int) std::min<long long>({(long long) draft_max, remaining - 1, model.max_context() - p - 1});
+                const auto t0 = Clock::now();
+                if (!model.mtp_draft(next, (int) p, cap, draft_p_min, dr, &nd, err)) { fail(err); failed = true; break; }
+                t_draft += ms_since(t0);
+            }
+            if (nd >= draft_min && nd >= 1) {
+                // verify [next, d1..dnd] in one pass; take tokens while the model agrees with the draft
+                int32_t cols[NC];
+                cols[0] = next;
+                for (int j = 0; j < nd; ++j) cols[j + 1] = dr[j];
+                const auto t1 = Clock::now();
+                if (!model.run(cols, nd + 1, Logits::All, true, true, err)) { fail(err); failed = true; break; }
+                int a = 0;
+                int32_t y = -1;
+                for (int j = 0; j <= nd; ++j) {
+                    if (!draw(model.logits_col(j), (uint64_t) (p + 1 + j), y)) { fail(err); failed = true; break; }
+                    if (j == 0) t_verify += ms_since(t1);   // this first draw waits for the whole verification pass
+                    done = emit(y);
+                    if (done) break;
+                    if (j < nd && y == dr[j]) { ++a; continue; }
+                    break;
+                }
+                if (failed) break;
+                ++cycles;
+                emitted_spec += a + 1;
+                drafts_offered += nd;
+                drafts_accepted += a;
+                if (a < nd && !model.rollback(a, err)) { fail(err); failed = true; break; }
+                fed.push_back(next);
+                for (int j = 0; j < a; ++j) fed.push_back(dr[j]);
+                const auto t2 = Clock::now();
+                if (a >= 1) {                       // the MTP block learns the accepted positions with the trunk's own hidden states
+                    if (!model.mtp_ingest(cols, a + 1, (int) p, 1, err)) { fail(err); failed = true; break; }
+                } else {
+                    model.set_last_hidden(0);
+                }
+                t_ingest += ms_since(t2);
+                next = y;
+            } else {
+                const auto t3 = Clock::now();
+                if (!model.run(&next, 1, Logits::Last, model.has_mtp(), false, err) ||
+                    (model.has_mtp() && !model.mtp_ingest(&next, 1, (int) p, 0, err))) { fail(err); failed = true; break; }
+                fed.push_back(next);
+                int32_t y = -1;
+                if (!draw(model.logits_col(0), (uint64_t) (p + 1), y)) { fail(err); failed = true; break; }
+                t_plain += ms_since(t3);
+                ++plain_steps;
+                done = emit(y);
+                next = y;
+            }
+            std::fflush(stdout);
+        }
+        if (failed) continue;
         if (cancelled) finish = "cancel";
         const double decode_ms = ms_since(t_dec);
-        std::printf("DONE %lld %lld %.1f %.1f %s 0 0 %lld\n", produced, (long long) n, prompt_ms, decode_ms, finish, (long long) resume);
+        std::printf("DONE %lld %lld %.1f %.1f %s %lld %lld %lld\n", produced, (long long) n, prompt_ms, decode_ms, finish,
+                    drafts_accepted, drafts_offered, (long long) resume);
         std::fflush(stdout);
-        std::fprintf(stderr, "strata-dense: prompt %lld tokens = %zu reused + %lld read in %.0f ms, %lld generated in %.0f ms (%.1f tok/s)%s\n",
+        std::fprintf(stderr, "strata-dense: prompt %lld tokens = %zu reused + %lld read in %.0f ms, %lld generated in %.0f ms (%.1f tok/s)%s",
                      (long long) n, resume, (long long) (n - (long long) resume), prompt_ms, produced, decode_ms,
                      decode_ms > 0 ? 1000.0 * produced / decode_ms : 0.0, cancelled ? " (cancelled)" : "");
+        if (drafts_offered) std::fprintf(stderr, ", MTP drafts accepted %lld of %lld (%.0f%%)", drafts_accepted, drafts_offered,
+                                         100.0 * (double) drafts_accepted / (double) drafts_offered);
+        std::fprintf(stderr, "\n");
+        if (cycles + plain_steps > 0 && model.has_mtp())    // where the decode time went, per step
+            std::fprintf(stderr, "strata-dense:   %lld speculative cycles (%.2f tokens each): draft %.1f ms, verify %.1f ms, "
+                         "ingest %.1f ms per cycle; %lld plain steps at %.1f ms\n", cycles,
+                         cycles ? (double) emitted_spec / (double) cycles : 0.0, cycles ? t_draft / (double) cycles : 0.0,
+                         cycles ? t_verify / (double) cycles : 0.0, cycles ? t_ingest / (double) cycles : 0.0, plain_steps,
+                         plain_steps ? t_plain / (double) plain_steps : 0.0);
     }
     cudaFree(d_next);
     cudaFree(d_hist);

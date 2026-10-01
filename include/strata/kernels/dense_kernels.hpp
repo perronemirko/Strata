@@ -24,9 +24,16 @@ namespace strata::kernels {
 /// out[r, :] = x[r, :] * rsqrt(mean(x[r, :]^2) + eps) * w        (w NOT shifted: the GGUF already holds 1 + w)
 void dense_rms_norm(const float* x, const float* w, float* out, int rows, int cols, float eps, void* stream);
 
-/// y[h, :] = rms(o[h, :]) * w * silu(z[h, :]) per 128-wide head (Qwen3.5 gated delta net closing norm; SiLU, not sigmoid)
-void dense_gdn_out_norm_silu(const float* o, const float* z, const float* w, float* y, int heads, int head_dim, float eps,
-                             void* stream);
+/// The GDN output norm of a DENSE qwen35 model: y[h, :] = rms_norm(o[h, :]) * w * SiLU(z[h, :]) for each of `heads`
+/// value heads of `cols` (= state_size) values.  llama.cpp's build_norm_gated for qwen35 uses SiLU; the MoE
+/// engine's native_gdn_out_norm gates with a sigmoid, which is wrong here (it was the cause of the garbage text).
+void dense_gdn_out_norm(const float* o, const float* z, const float* w, float* y, int heads, int cols, float eps,
+                        void* stream);
+
+/// Greedy pick over one row of `n` logits: *out_id = the index of the largest (the lowest on a tie; NaN ignored) and
+/// *out_p = its softmax probability.  Both are DEVICE pointers.  This is what an MTP draft needs (the token and how
+/// sure the head is of it, for the --draft-p-min cut-off).
+void dense_argmax_prob(const float* logits, int n, int* out_id, float* out_p, void* stream);
 
 /// out[i] = silu(gate[i]) * up[i]
 void dense_swiglu(const float* gate, const float* up, float* out, int64_t n, void* stream);

@@ -5,6 +5,7 @@
 #include <cuda_runtime.h>
 
 #include <cfloat>
+#include <climits>
 #include <cmath>
 #include <cstdio>
 #include <stdexcept>
@@ -48,6 +49,75 @@ __global__ void rms_norm_kernel(const float* __restrict__ x, const float* __rest
     }
     __syncthreads();
     for (int i = threadIdx.x; i < cols; i += blockDim.x) orow[i] = xr[i] * scale * w[i];
+}
+
+// One block per value head: rms over `cols`, then * w[i] * silu(z[i]).
+__global__ void gdn_out_norm_kernel(const float* __restrict__ o, const float* __restrict__ z,
+                                    const float* __restrict__ w, float* __restrict__ y, int cols, float eps) {
+    const float* orow = o + (size_t) blockIdx.x * cols;
+    const float* zrow = z + (size_t) blockIdx.x * cols;
+    float* yrow = y + (size_t) blockIdx.x * cols;
+    float acc = 0.0f;
+    for (int i = threadIdx.x; i < cols; i += blockDim.x) acc += orow[i] * orow[i];
+    acc = warp_sum(acc);
+    __shared__ float part[32];
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    if (lane == 0) part[warp] = acc;
+    __syncthreads();
+    __shared__ float scale;
+    if (threadIdx.x == 0) {
+        float s = 0.0f;
+        for (int i = 0; i < (int) (blockDim.x >> 5); ++i) s += part[i];
+        scale = rsqrtf(s / (float) cols + eps);
+    }
+    __syncthreads();
+    for (int i = threadIdx.x; i < cols; i += blockDim.x) {
+        const float g = zrow[i];
+        yrow[i] = orow[i] * scale * w[i] * (g / (1.0f + __expf(-g)));
+    }
+}
+
+// One block of 1024 threads: pass 1 finds the largest logit (lowest index on a tie), pass 2 sums exp(l - max).
+__global__ void argmax_prob_kernel(const float* __restrict__ logits, int n, int* __restrict__ out_id,
+                                   float* __restrict__ out_p) {
+    __shared__ float sv[1024];
+    __shared__ int si[1024];
+    float best = -FLT_MAX;
+    int bi = INT_MAX;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        const float v = logits[i];
+        if (v > best || (v == best && i < bi)) { best = v; bi = i; }    // NaN compares false: never picked
+    }
+    sv[threadIdx.x] = best;
+    si[threadIdx.x] = bi;
+    __syncthreads();
+    for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
+        if (threadIdx.x < s) {
+            const float ov = sv[threadIdx.x + s];
+            const int oi = si[threadIdx.x + s];
+            if (ov > sv[threadIdx.x] || (ov == sv[threadIdx.x] && oi < si[threadIdx.x])) { sv[threadIdx.x] = ov; si[threadIdx.x] = oi; }
+        }
+        __syncthreads();
+    }
+    const float gmax = sv[0];
+    const int gid = si[0];
+    __syncthreads();
+    float sum = 0.0f;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        const float v = logits[i];
+        if (!isnan(v)) sum += __expf(v - gmax);
+    }
+    sv[threadIdx.x] = sum;
+    __syncthreads();
+    for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
+        if (threadIdx.x < s) sv[threadIdx.x] += sv[threadIdx.x + s];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        const bool ok = gid != INT_MAX && sv[0] > 0.0f;
+        *out_id = ok ? gid : 0;
+        *out_p = ok ? 1.0f / sv[0] : 0.0f;
+    }
 }
 
 __global__ void swiglu_kernel(const float* __restrict__ g, const float* __restrict__ u, float* __restrict__ o,
@@ -172,23 +242,6 @@ __global__ void attn_merge_kernel(const float* __restrict__ part_acc, const floa
     out[(size_t) h * head_dim + threadIdx.x] = L > 0.0f ? a / L : 0.0f;
 }
 
-
-// y[h, :] = rms(o[h, :]) * w * silu(z[h, :])   (Qwen3.5 gated delta net closing norm, 128-wide heads, w plain)
-__global__ void gdn_out_norm_silu_kernel(const float* __restrict__ o, const float* __restrict__ z,
-                                         const float* __restrict__ w, float* __restrict__ y, int head_dim, float eps) {
-    __shared__ float part[4];
-    const int h = blockIdx.x, i = threadIdx.x;           // blockDim.x == head_dim == 128
-    const float v = o[(size_t) h * head_dim + i];
-    float acc = v * v;
-    for (int off = 16; off > 0; off >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, off);
-    if ((i & 31) == 0) part[i >> 5] = acc;
-    __syncthreads();
-    const float sum = part[0] + part[1] + part[2] + part[3];
-    const float inv = rsqrtf(sum / (float) head_dim + eps);
-    const float zz = z[(size_t) h * head_dim + i];
-    y[(size_t) h * head_dim + i] = v * inv * w[i] * (zz / (1.0f + expf(-zz)));
-}
-
 int splits_for(int cells) { return (cells + kChunk - 1) / kChunk; }
 
 }  // namespace
@@ -198,11 +251,15 @@ void dense_rms_norm(const float* x, const float* w, float* out, int rows, int co
     check("dense_rms_norm");
 }
 
-void dense_gdn_out_norm_silu(const float* o, const float* z, const float* w, float* y, int heads, int head_dim, float eps,
-                             void* stream) {
-    if (head_dim != 128) throw std::invalid_argument("dense_gdn_out_norm_silu: head_dim must be 128");
-    gdn_out_norm_silu_kernel<<<heads, 128, 0, (cudaStream_t) stream>>>(o, z, w, y, head_dim, eps);
-    check("dense_gdn_out_norm_silu");
+void dense_gdn_out_norm(const float* o, const float* z, const float* w, float* y, int heads, int cols, float eps,
+                        void* stream) {
+    gdn_out_norm_kernel<<<heads, 128, 0, (cudaStream_t) stream>>>(o, z, w, y, cols, eps);
+    check("dense_gdn_out_norm");
+}
+
+void dense_argmax_prob(const float* logits, int n, int* out_id, float* out_p, void* stream) {
+    argmax_prob_kernel<<<1, 1024, 0, (cudaStream_t) stream>>>(logits, n, out_id, out_p);
+    check("dense_argmax_prob");
 }
 
 void dense_swiglu(const float* gate, const float* up, float* out, int64_t n, void* stream) {

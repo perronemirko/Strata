@@ -10,19 +10,21 @@
 #include "strata/kernels/native_mmvq.hpp"
 #include "strata/kernels/native_qsa.hpp"
 #include "strata/kernels/native_rope.hpp"
+#include "strata/kernels/sampler.hpp"
 
 #include <cuda_runtime.h>
 
 #include <algorithm>
 #include <climits>
 #include <cmath>
-#include <cstdlib>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <exception>
 #include <map>
 #include <regex>
 #include <set>
+#include <utility>
 
 namespace strata::core {
 namespace {
@@ -30,12 +32,10 @@ namespace {
 using namespace strata::kernels;
 
 constexpr uint32_t kF32 = 0, kF16 = 1, kBF16 = 30;
+constexpr int NC = DenseModel::kMaxCols;
 
 // The GGUF types a quantized weight may have: exactly what native_mmvq takes.
 const char* kSupported = "Q4_0, Q5_0, Q8_0, Q2_0, Q3_K, Q4_K, Q5_K, Q6_K, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL, IQ4_XS";
-
-// defined below: dequantizes contiguous blocks of any type the host knows (F32/F16/BF16 and the quantized ones)
-bool dequant_row(uint32_t type, const uint8_t* src, int n, float* out);
 
 struct QMat {
     void* dev = nullptr;
@@ -51,14 +51,25 @@ struct Layer {
     // GDN mixer
     QMat qkv, z, ssm_out;
     float *conv_w = nullptr, *dt = nullptr, *ssm_a = nullptr, *ssm_norm = nullptr;
-    float *alpha_w = nullptr, *beta_w = nullptr;   // F32/F16/BF16 files
-    QMat alpha_q, beta_q;                          // quantized files (Q8_0 in the Unsloth GGUFs)
+    float *alpha_w = nullptr, *beta_w = nullptr;    // ssm_alpha / ssm_beta when the file stores them as floats ...
+    QMat alpha_q, beta_q;                           // ... or here when it stores them quantized (UD-Q4_K_M: Q8_0)
     bool ab_quant = false;
     float *state = nullptr, *conv_state = nullptr;
+    std::vector<float*> st_slots, cv_slots;         // snapshots after columns 0..draft_max-1; rollback() swaps one in (MTP only)
     // attention mixer
     QMat q, k, v, o;
     float *q_norm = nullptr, *k_norm = nullptr;
     uint16_t *kc = nullptr, *vc = nullptr;
+};
+
+/// The multi-token-prediction block: a full-attention layer plus the projection of [embedding | hidden].
+struct Mtp {
+    QMat eh_proj;                                   // [2 * n_embd -> n_embd]
+    float *enorm = nullptr, *hnorm = nullptr, *head_norm = nullptr;
+    QMat q, k, v, o, ffn_gate, ffn_up, ffn_down;
+    float *attn_norm = nullptr, *post_norm = nullptr, *q_norm = nullptr, *k_norm = nullptr;
+    uint16_t *kc = nullptr, *vc = nullptr;          // its own KV cache
+    QMat head;                                      // the output head: its own, or the trunk's
 };
 
 std::string upper_type(uint32_t t) { return strata::ggml_type_name(t); }
@@ -69,163 +80,7 @@ struct Found {
     const strata::TensorInfo* tensor = nullptr;
 };
 
-}  // namespace
-
-struct DenseModel::Impl {
-    std::vector<std::unique_ptr<strata::GgufFile>> files;
-    std::map<std::string, Found> index;
-    std::vector<Layer> layers;
-    std::vector<void*> allocations;                 // everything cudaMalloc'ed here, freed in the destructor
-    std::vector<void*> host_allocs;                 // weights that did not fit in VRAM: mapped pinned host memory
-    uint64_t budget = UINT64_MAX;                   // bytes of weights that may go to VRAM
-    uint64_t dev_used = 0, host_bytes = 0;
-    int host_tensors = 0;
-    long long dbg_from = -1, dbg_to = -1;           // STRATA_DENSE_DEBUG=A:B traces the steps with A <= position < B
-    cudaStream_t stream = nullptr;
-    cudaEvent_t embed_done = nullptr;
-
-    // token embedding: rows are dequantized on the host and staged through pinned memory
-    Found embd;
-    uint32_t embd_type = 0;
-    size_t embd_row_bytes = 0;
-    float* embd_stage = nullptr;                    // pinned, n_embd floats
-    std::vector<float> row_tmp;
-
-    float* output_norm = nullptr;
-    QMat head;
-    void* q8_1 = nullptr;                           // shared activation scratch of the native GEMVs
-
-    // activations (device, f32)
-    float *x = nullptr, *xn = nullptr, *mix = nullptr;
-    float *qkv = nullptr, *conv_out = nullptr, *h = nullptr, *alpha = nullptr, *beta = nullptr, *gate = nullptr;
-    float *o = nullptr, *z = nullptr, *y = nullptr;
-    float *q_full = nullptr, *qcur = nullptr, *kcur = nullptr, *vcur = nullptr, *attn = nullptr, *attn32 = nullptr;
-    float *ffn_g = nullptr, *ffn_u = nullptr, *ffn_h = nullptr;
-    float* logits = nullptr;
-    float* attn_scratch = nullptr;
-    int32_t* pos_dev = nullptr;
-
-    // ---- helpers
-    template <class T> bool alloc(T** out, uint64_t bytes, std::string& err, const char* what) {
-        void* p = nullptr;
-        const cudaError_t s = cudaMalloc(&p, bytes ? bytes : 16);
-        if (s != cudaSuccess) {
-            err = std::string("dense model: cannot allocate ") + what + " (" + std::to_string(bytes >> 20) + " MiB): " +
-                  cudaGetErrorString(s);
-            return false;
-        }
-        allocations.push_back(p);
-        *out = (T*) p;
-        return true;
-    }
-
-    const Found* find(const std::string& name) const {
-        auto it = index.find(name);
-        return it == index.end() ? nullptr : &it->second;
-    }
-    const Found* find_any(std::initializer_list<const char*> names, const std::string& prefix) const {
-        for (const char* n : names)
-            if (const Found* f = find(prefix + n)) return f;
-        return nullptr;
-    }
-
-    // A float vector or matrix (F32, F16 or BF16 in the file) uploaded as F32.
-    bool upload_floats(const Found* f, const std::string& name, uint64_t expect, float** out, std::string& err) {
-        if (!f) { err = "dense model: missing tensor " + name; return false; }
-        uint64_t n = 1;
-        for (uint64_t d : f->tensor->shape) n *= d;
-        if (expect && n != expect) {
-            err = "dense model: " + name + " has " + std::to_string(n) + " values, expected " + std::to_string(expect);
-            return false;
-        }
-        const uint8_t* src = f->file->tensor_data(*f->tensor);
-        std::vector<float> host(n);
-        switch (f->tensor->type) {
-        case kF32: strata::dequantize_f32(src, host.data(), (int) n); break;
-        case kF16: strata::dequantize_f16(src, host.data(), (int) n); break;
-        case kBF16: strata::dequantize_bf16(src, host.data(), (int) n); break;
-        default:
-            if (n > (uint64_t) INT_MAX || !dequant_row(f->tensor->type, src, (int) n, host.data())) {
-                err = "dense model: " + name + " is " + upper_type(f->tensor->type) +
-                      ", which cannot be read as floats (expected F32, F16, BF16 or a quantized type)";
-                return false;
-            }
-        }
-        if (!alloc(out, n * 4, err, name.c_str())) return false;
-        const cudaError_t s = cudaMemcpy(*out, host.data(), n * 4, cudaMemcpyHostToDevice);
-        if (s != cudaSuccess) { err = "dense model: upload " + name + ": " + cudaGetErrorString(s); return false; }
-        return true;
-    }
-
-    // A quantized matrix, kept in its GGUF blocks.
-    bool upload_mat(const Found* f, const std::string& name, int n_in, int n_out, QMat& out, uint64_t& total,
-                    std::string& err) {
-        if (!f) { err = "dense model: missing tensor " + name; return false; }
-        const strata::TensorInfo& t = *f->tensor;
-        if (t.shape.size() != 2 || t.shape[0] != (uint64_t) n_in || t.shape[1] != (uint64_t) n_out) {
-            err = "dense model: " + name + " has shape [" + std::to_string(t.shape.empty() ? 0 : t.shape[0]) + ", " +
-                  std::to_string(t.shape.size() > 1 ? t.shape[1] : 0) + "], expected [" + std::to_string(n_in) + ", " +
-                  std::to_string(n_out) + "]";
-            return false;
-        }
-        if (!native_mmvq_supported((int) t.type)) {
-            err = "dense model: " + name + " is " + upper_type(t.type) + ", which the native GEMVs do not take. "
-                  "Supported: " + kSupported + "";
-            return false;
-        }
-        int elems = 0, block_bytes = 0;
-        if (!strata::block_geometry(t.type, elems, block_bytes) || (uint64_t) n_in % (uint64_t) elems) {
-            err = "dense model: " + name + ": invalid block geometry"; return false;
-        }
-        const uint64_t bytes = native_mmvq_weight_bytes((int) t.type, n_in, n_out);
-        const uint64_t in_file = (uint64_t) n_in * n_out / (uint64_t) elems * (uint64_t) block_bytes;
-        const uint64_t payload = f->file->file_size() - f->file->data_start();
-        if (bytes != in_file || t.offset > payload || bytes > payload - t.offset) {
-            err = "dense model: " + name + ": payload size mismatch or truncated file"; return false;
-        }
-        void* dev = nullptr;
-        cudaError_t s = cudaSuccess;
-        if (dev_used + bytes <= budget) {
-            s = cudaMalloc(&dev, bytes);
-            if (s == cudaSuccess) s = cudaMemcpy(dev, f->file->tensor_data(t), bytes, cudaMemcpyHostToDevice);
-            if (s != cudaSuccess) {                 // the card is fuller than cudaMemGetInfo said: spill this one
-                if (dev) cudaFree(dev);
-                dev = nullptr;
-                cudaGetLastError();
-            } else {
-                allocations.push_back(dev);
-                dev_used += bytes;
-            }
-        }
-        if (!dev) {
-            // Host-resident: pinned + mapped, so the GEMV kernel reads the blocks over PCIe on every token.
-            void* host = nullptr;
-            s = cudaHostAlloc(&host, bytes, cudaHostAllocMapped);
-            if (s == cudaSuccess) s = cudaHostGetDevicePointer(&dev, host, 0);
-            if (s != cudaSuccess) {
-                if (host) cudaFreeHost(host);
-                err = "dense model: " + name + " fits neither in VRAM nor in pinned host memory (" +
-                      std::to_string(bytes >> 20) + " MiB): " + cudaGetErrorString(s);
-                return false;
-            }
-            std::memcpy(host, f->file->tensor_data(t), bytes);
-            host_allocs.push_back(host);
-            host_bytes += bytes;
-            ++host_tensors;
-        }
-        out = QMat{dev, (int) t.type, n_in, n_out};
-        total += bytes;
-        return true;
-    }
-
-    // y = W x for a native quantized W; x_q8_1 must already hold x quantized (quantize()).
-    void gemv(const QMat& w, float* y, void* s) { native_mmvq(w.type, w.dev, q8_1, y, w.n_in, w.n_out, 1, s); }
-    void quantize(const float* x, int n_in, void* s) { native_quantize_q8_1(x, q8_1, n_in, 1, s); }
-};
-
-namespace {
-
-// Host-side dequantization of one embedding row (n values, whole blocks).
+// Host-side dequantization of `n` values laid out as whole blocks (a row, or a whole small tensor).
 bool dequant_row(uint32_t type, const uint8_t* src, int n, float* out) {
     switch (type) {
     case kF32: strata::dequantize_f32(src, out, n); return true;
@@ -291,18 +146,16 @@ void trace_vec(const char* what, int64_t pos, int layer, const char* kind, const
         std::fprintf(stderr, "dbg pos=%lld %s: copy failed\n", (long long) pos, what);
         return;
     }
-    double mx = 0.0, sum2 = 0.0, sum = 0.0;
+    double mx = 0.0, sum2 = 0.0;
     int nan = 0, inf = 0;
     for (float v : h) {
         if (std::isnan(v)) { ++nan; continue; }
         if (std::isinf(v)) { ++inf; continue; }
         mx = std::max(mx, (double) std::fabs(v));
         sum2 += (double) v * v;
-        sum += (double) v;
     }
-    std::fprintf(stderr, "dbg pos=%lld layer=%2d %-4s %-7s max|v|=%-12.5g rms=%-12.5g nan=%d inf=%d sum=%.5f v[0..2]=%.5f %.5f %.5f\n",
-                 (long long) pos, layer, kind, what, mx, std::sqrt(sum2 / std::max(1, n)), nan, inf, sum,
-                 n > 0 ? (double) h[0] : 0.0, n > 1 ? (double) h[1] : 0.0, n > 2 ? (double) h[2] : 0.0);
+    std::fprintf(stderr, "dbg pos=%lld layer=%2d %-4s %-7s max|v|=%-12.5g rms=%-12.5g nan=%d inf=%d\n", (long long) pos, layer,
+                 kind, what, mx, std::sqrt(sum2 / std::max(1, n)), nan, inf);
 }
 
 void trace_logits(int64_t pos, const float* dev, int n, void* stream) {
@@ -322,6 +175,304 @@ void trace_logits(int64_t pos, const float* dev, int n, void* stream) {
 
 }  // namespace
 
+struct DenseModel::Impl {
+    std::vector<std::unique_ptr<strata::GgufFile>> files;
+    std::map<std::string, Found> index;
+    std::vector<Layer> layers;
+    Mtp mtp;
+    std::vector<void*> allocations;                 // everything cudaMalloc'ed here, freed in the destructor
+    std::vector<void*> host_allocs;                 // weights that did not fit in VRAM: mapped pinned host memory
+    uint64_t budget = UINT64_MAX;                   // bytes of weights that may go to VRAM
+    uint64_t dev_used = 0, host_bytes = 0;
+    int host_tensors = 0;
+    long long dbg_from = -1, dbg_to = -1;           // STRATA_DENSE_DEBUG=A:B traces the steps with A <= position < B
+    cudaStream_t stream = nullptr;
+    cudaEvent_t embed_done = nullptr;
+
+    // a token embedding table: rows are dequantized on the host and staged through pinned memory
+    struct EmbdSrc {
+        Found f;
+        uint32_t type = 0;
+        size_t row_bytes = 0;
+    };
+    EmbdSrc embd, embd_mtp;
+    float* embd_stage = nullptr;                    // pinned, NC * n_embd floats
+
+    float* output_norm = nullptr;
+    QMat head;
+    void* q8_1 = nullptr;                           // shared activation scratch of the native GEMVs
+    int64_t max_context = 0;
+
+    // activations (device, f32), NC columns each
+    float *x = nullptr, *xn = nullptr, *mix = nullptr;
+    float *qkv = nullptr, *conv_out = nullptr, *h = nullptr, *alpha = nullptr, *beta = nullptr, *gate = nullptr;
+    float *o = nullptr, *z = nullptr, *y = nullptr;
+    float *q_full = nullptr, *qcur = nullptr, *kcur = nullptr, *vcur = nullptr, *attn = nullptr, *attn32 = nullptr;
+    float *ffn_g = nullptr, *ffn_u = nullptr, *ffn_h = nullptr;
+    float* logits = nullptr;
+    float* attn_scratch = nullptr;
+    int32_t* pos_dev = nullptr;
+    // The rope configuration the analytic kernel is launched with (rope_scaling.hpp).  Seeded from the
+    // process config and re-based on the file's rope.freq_base at load(): the dense path has no CLI rope
+    // knobs, so this stays `none` (the identity) unless something else has set a scaling.
+    RopeScaling rope;
+    // the hidden state and the MTP side
+    float *hid = nullptr;                           // post-norm hidden of the last run(), NC columns
+    float *h_last = nullptr;                        // post-norm hidden at the last fed position
+    float *m_e = nullptr, *hin = nullptr, *cat = nullptr, *mtp_logits = nullptr;
+    float* mtp_h = nullptr;                         // the MTP block's own output hidden (chains the next draft step)
+    int* d_tok = nullptr;
+    float* d_prob = nullptr;
+
+    // ---- helpers
+    template <class T> bool alloc(T** out, uint64_t bytes, std::string& err, const char* what) {
+        void* p = nullptr;
+        const cudaError_t s = cudaMalloc(&p, bytes ? bytes : 16);
+        if (s != cudaSuccess) {
+            err = std::string("dense model: cannot allocate ") + what + " (" + std::to_string(bytes >> 20) + " MiB): " +
+                  cudaGetErrorString(s);
+            return false;
+        }
+        allocations.push_back(p);
+        *out = (T*) p;
+        return true;
+    }
+
+    const Found* find(const std::string& name) const {
+        auto it = index.find(name);
+        return it == index.end() ? nullptr : &it->second;
+    }
+    const Found* find_any(std::initializer_list<const char*> names, const std::string& prefix) const {
+        for (const char* n : names)
+            if (const Found* f = find(prefix + n)) return f;
+        return nullptr;
+    }
+
+    // A float vector or matrix (F32, F16, BF16 or any type the host can dequantize) uploaded as F32.
+    bool upload_floats(const Found* f, const std::string& name, uint64_t expect, float** out, std::string& err) {
+        if (!f) { err = "dense model: missing tensor " + name; return false; }
+        uint64_t n = 1;
+        for (uint64_t d : f->tensor->shape) n *= d;
+        if (expect && n != expect) {
+            err = "dense model: " + name + " has " + std::to_string(n) + " values, expected " + std::to_string(expect);
+            return false;
+        }
+        const uint8_t* src = f->file->tensor_data(*f->tensor);
+        std::vector<float> host(n);
+        if (n > (uint64_t) INT_MAX || !dequant_row(f->tensor->type, src, (int) n, host.data())) {
+            err = "dense model: " + name + " is " + upper_type(f->tensor->type) +
+                  ", which cannot be read as floats (expected F32, F16, BF16 or a quantized type)";
+            return false;
+        }
+        if (!alloc(out, n * 4, err, name.c_str())) return false;
+        const cudaError_t s = cudaMemcpy(*out, host.data(), n * 4, cudaMemcpyHostToDevice);
+        if (s != cudaSuccess) { err = "dense model: upload " + name + ": " + cudaGetErrorString(s); return false; }
+        return true;
+    }
+
+    // A quantized matrix, kept in its GGUF blocks: in VRAM while the budget lasts, in mapped host memory after.
+    bool upload_mat(const Found* f, const std::string& name, int n_in, int n_out, QMat& out, uint64_t& total,
+                    std::string& err) {
+        if (!f) { err = "dense model: missing tensor " + name; return false; }
+        const strata::TensorInfo& t = *f->tensor;
+        if (t.shape.size() != 2 || t.shape[0] != (uint64_t) n_in || t.shape[1] != (uint64_t) n_out) {
+            err = "dense model: " + name + " has shape [" + std::to_string(t.shape.empty() ? 0 : t.shape[0]) + ", " +
+                  std::to_string(t.shape.size() > 1 ? t.shape[1] : 0) + "], expected [" + std::to_string(n_in) + ", " +
+                  std::to_string(n_out) + "]";
+            return false;
+        }
+        if (!native_mmvq_supported((int) t.type)) {
+            err = "dense model: " + name + " is " + upper_type(t.type) + ", which the native GEMVs do not take. "
+                  "Supported: " + kSupported;
+            return false;
+        }
+        int elems = 0, block_bytes = 0;
+        if (!strata::block_geometry(t.type, elems, block_bytes) || (uint64_t) n_in % (uint64_t) elems) {
+            err = "dense model: " + name + ": invalid block geometry"; return false;
+        }
+        const uint64_t bytes = native_mmvq_weight_bytes((int) t.type, n_in, n_out);
+        const uint64_t in_file = (uint64_t) n_in * n_out / (uint64_t) elems * (uint64_t) block_bytes;
+        const uint64_t payload = f->file->file_size() - f->file->data_start();
+        if (bytes != in_file || t.offset > payload || bytes > payload - t.offset) {
+            err = "dense model: " + name + ": payload size mismatch or truncated file"; return false;
+        }
+        void* dev = nullptr;
+        cudaError_t s = cudaSuccess;
+        if (dev_used + bytes <= budget) {
+            s = cudaMalloc(&dev, bytes);
+            if (s == cudaSuccess) s = cudaMemcpy(dev, f->file->tensor_data(t), bytes, cudaMemcpyHostToDevice);
+            if (s != cudaSuccess) {                 // the card is fuller than cudaMemGetInfo said: spill this one
+                if (dev) cudaFree(dev);
+                dev = nullptr;
+                cudaGetLastError();
+            } else {
+                allocations.push_back(dev);
+                dev_used += bytes;
+            }
+        }
+        if (!dev) {
+            // Host-resident: pinned + mapped, so the GEMV kernel reads the blocks over PCIe on every token.
+            void* host = nullptr;
+            s = cudaHostAlloc(&host, bytes, cudaHostAllocMapped);
+            if (s == cudaSuccess) s = cudaHostGetDevicePointer(&dev, host, 0);
+            if (s != cudaSuccess) {
+                if (host) cudaFreeHost(host);
+                err = "dense model: " + name + " fits neither in VRAM nor in pinned host memory (" +
+                      std::to_string(bytes >> 20) + " MiB): " + cudaGetErrorString(s);
+                return false;
+            }
+            std::memcpy(host, f->file->tensor_data(t), bytes);
+            host_allocs.push_back(host);
+            host_bytes += bytes;
+            ++host_tensors;
+        }
+        out = QMat{dev, (int) t.type, n_in, n_out};
+        total += bytes;
+        return true;
+    }
+
+    bool setup_embd(EmbdSrc& e, const Found* f, int n_embd, std::string& err) {
+        e.f = *f;
+        e.type = f->tensor->type;
+        int elems = 0, bytes = 0;
+        if (!strata::block_geometry(e.type, elems, bytes) || n_embd % elems) {
+            err = "dense model: " + std::string("embedding table has an unsupported type ") + upper_type(e.type);
+            return false;
+        }
+        e.row_bytes = (size_t) n_embd / (size_t) elems * (size_t) bytes;
+        std::vector<float> probe((size_t) n_embd);      // a dry run on row 0 tells now whether the host knows the type
+        if (!dequant_row(e.type, f->file->tensor_data(*f->tensor), n_embd, probe.data())) {
+            err = "dense model: cannot dequantize the embedding table of type " + upper_type(e.type);
+            return false;
+        }
+        return true;
+    }
+
+    // n embedding rows -> device, one copy; the pinned stage is reused only after the previous copy finished
+    bool upload_embeddings(const EmbdSrc& src, const int32_t* toks, int n, int E, int n_vocab, float* dst, std::string& err) {
+        if (cudaEventSynchronize(embed_done) != cudaSuccess) { err = "dense model: embedding event"; return false; }
+        for (int j = 0; j < n; ++j) {
+            if (toks[j] < 0 || toks[j] >= n_vocab) { err = "dense model: token id outside the vocabulary"; return false; }
+            const uint8_t* row = src.f.file->tensor_data(*src.f.tensor) + (size_t) toks[j] * src.row_bytes;
+            if (!dequant_row(src.type, row, E, embd_stage + (size_t) j * E)) { err = "dense model: embedding dequantization"; return false; }
+        }
+        cudaMemcpyAsync(dst, embd_stage, (size_t) n * E * 4, cudaMemcpyHostToDevice, stream);
+        cudaEventRecord(embed_done, stream);
+        return true;
+    }
+
+    // y = W x for n columns; the activation must already be quantized (quantize()) with the same n.
+    void gemv(const QMat& w, float* y, int n, void* s) { native_mmvq(w.type, w.dev, q8_1, y, w.n_in, w.n_out, n, s); }
+    void quantize(const float* x, int n_in, int n, void* s) { native_quantize_q8_1(x, q8_1, n_in, n, s); }
+
+    // ---- the blocks.  Input is I.xn (the normalized residual) unless stated; the output goes to I.mix.
+    void gdn_block(const DenseConfig& c, Layer& L, int n, bool snapshot, void* s);
+    void attn_block(const DenseConfig& c, const QMat& wq, const QMat& wk, const QMat& wv, const QMat& wo,
+                    const float* qn, const float* kn, uint16_t* kc, uint16_t* vc, int n, int pos0, void* s);
+    void ffn_block(const DenseConfig& c, const QMat& g, const QMat& u, const QMat& d, const float* post_norm, int n, void* s);
+    bool mtp_block(const DenseConfig& c, int n, int pos0, bool want_logits, void* s);
+};
+
+void DenseModel::Impl::gdn_block(const DenseConfig& c, Layer& L, int n, bool snapshot, void* s) {
+    const int C = c.conv_channels(), V = c.value_dim(), E = c.n_embd;
+    const int S = c.ssm_state, KH = c.ssm_k_heads, VH = c.ssm_v_heads, qk = S * KH;
+    quantize(xn, E, n, s);
+    gemv(L.qkv, qkv, n, s);
+    gemv(L.z, z, n, s);
+    if (L.ab_quant) {                               // the scratch still holds xn: nothing quantized in between
+        gemv(L.alpha_q, alpha, n, s);
+        gemv(L.beta_q, beta, n, s);
+    } else {
+        for (int j = 0; j < n; ++j) {
+            dense_gemv_f32(L.alpha_w, xn + (size_t) j * E, alpha + (size_t) j * VH, E, VH, s);
+            dense_gemv_f32(L.beta_w, xn + (size_t) j * E, beta + (size_t) j * VH, E, VH, s);
+        }
+    }
+    GdnShapes gs{S, KH, VH};
+    for (int j = 0; j < n; ++j) {                   // the recurrence is order-dependent: one column at a time
+        float* hj = h + (size_t) j * C;
+        native_gdn_conv_silu(L.conv_state, qkv + (size_t) j * C, L.conv_w, conv_out + (size_t) j * C, hj, C, c.ssm_d_conv, s);
+        native_gdn_l2_norm(hj, KH, S, c.rms_eps, s);
+        native_gdn_l2_norm(hj + qk, KH, S, c.rms_eps, s);
+        native_gdn_beta_gate(beta + (size_t) j * VH, VH, s);
+        native_gdn_gate(alpha + (size_t) j * VH, L.dt, L.ssm_a, gate + (size_t) j * VH, VH, s);
+        native_gdn_step(L.state, hj, hj + qk, hj + 2 * qk, gate + (size_t) j * VH, beta + (size_t) j * VH,
+                        o + (size_t) j * V, gs, s);
+        dense_gdn_out_norm(o + (size_t) j * V, z + (size_t) j * V, L.ssm_norm, y + (size_t) j * V, VH, S, c.rms_eps, s);
+        if (snapshot && j < n - 1) {                // the state a rollback to "j accepted drafts" restores
+            cudaMemcpyAsync(L.st_slots[(size_t) j], L.state, (size_t) S * VH * S * 4, cudaMemcpyDeviceToDevice, (cudaStream_t) s);
+            cudaMemcpyAsync(L.cv_slots[(size_t) j], L.conv_state, (size_t) C * (c.ssm_d_conv - 1) * 4, cudaMemcpyDeviceToDevice,
+                            (cudaStream_t) s);
+        }
+    }
+    quantize(y, V, n, s);
+    gemv(L.ssm_out, mix, n, s);
+}
+
+void DenseModel::Impl::attn_block(const DenseConfig& c, const QMat& wq, const QMat& wk, const QMat& wv, const QMat& wo,
+                                  const float* qn, const float* kn, uint16_t* kc, uint16_t* vc, int n, int pos0, void* s) {
+    const int E = c.n_embd, H = c.n_head, HK = c.n_head_kv, D = c.head_dim;
+    const int mh = std::max(H, HK);
+    quantize(xn, E, n, s);
+    gemv(wq, q_full, n, s);
+    gemv(wk, kcur, n, s);
+    gemv(wv, vcur, n, s);
+    const float scale = 1.0f / std::sqrt((float) D);
+    for (int j = 0; j < n; ++j) {
+        float* qj = qcur + (size_t) j * H * D;
+        float* kj = kcur + (size_t) j * HK * D;
+        const float* qfj = q_full + (size_t) j * H * 2 * D;
+        // q is the FIRST head_dim of every head's 2*head_dim block; the second half is the output gate
+        cudaMemcpy2DAsync(qj, (size_t) D * 4, qfj, (size_t) D * 2 * 4, (size_t) D * 4, (size_t) H, cudaMemcpyDeviceToDevice,
+                          (cudaStream_t) s);
+        rms_norm_weighted(qj, qn, H, D, c.rms_eps, s);
+        rms_norm_weighted(kj, kn, HK, D, c.rms_eps, s);
+        dense_fill_i32(pos_dev, mh, (int32_t) (pos0 + j), s);
+        native_rope_apply(qj, qj, H, D, c.n_rot, rope, pos_dev, s);
+        native_rope_apply(kj, kj, HK, D, c.n_rot, rope, pos_dev, s);
+        dense_kv_append(kc, vc, kj, vcur + (size_t) j * HK * D, pos0 + j, HK, D, (int) max_context, s);
+        dense_attn_decode(qj, kc, vc, attn + (size_t) j * H * D, attn_scratch, H, HK, D, pos0 + j + 1, (int) max_context,
+                          scale, s);
+        native_qsa_gate_apply(attn + (size_t) j * H * D, qfj, attn32 + (size_t) j * H * D, H, D, s);
+    }
+    quantize(attn32, H * D, n, s);
+    gemv(wo, mix, n, s);
+}
+
+// x += ffn(rms_norm(x, post_norm)), for n columns
+void DenseModel::Impl::ffn_block(const DenseConfig& c, const QMat& g, const QMat& u, const QMat& d, const float* post_norm,
+                                 int n, void* s) {
+    const int E = c.n_embd;
+    dense_rms_norm(x, post_norm, xn, n, E, c.rms_eps, s);
+    quantize(xn, E, n, s);
+    gemv(g, ffn_g, n, s);
+    gemv(u, ffn_u, n, s);
+    dense_swiglu(ffn_g, ffn_u, ffn_h, (int64_t) n * c.n_ff, s);
+    quantize(ffn_h, c.n_ff, n, s);
+    gemv(d, mix, n, s);
+    add_inplace(x, mix, (int64_t) n * E, s);
+}
+
+// The MTP block over n columns whose [e_norm | h_norm] inputs are in `cat`.  Leaves the head's logits for the
+// last column in mtp_logits when asked.
+bool DenseModel::Impl::mtp_block(const DenseConfig& c, int n, int pos0, bool want_logits, void* s) {
+    const Mtp& M = mtp;
+    const int E = c.n_embd;
+    quantize(cat, 2 * E, n, s);
+    gemv(M.eh_proj, x, n, s);                       // x = the block's input and its attention residual
+    dense_rms_norm(x, M.attn_norm, xn, n, E, c.rms_eps, s);
+    attn_block(c, M.q, M.k, M.v, M.o, M.q_norm, M.k_norm, M.kc, M.vc, n, pos0, s);
+    add_inplace(x, mix, (int64_t) n * E, s);
+    ffn_block(c, M.ffn_gate, M.ffn_up, M.ffn_down, M.post_norm, n, s);
+    if (want_logits) {
+        dense_rms_norm(x + (size_t) (n - 1) * E, M.head_norm, xn, 1, E, c.rms_eps, s);
+        cudaMemcpyAsync(mtp_h, xn, (size_t) E * 4, cudaMemcpyDeviceToDevice, (cudaStream_t) s);
+        quantize(xn, E, 1, s);
+        gemv(M.head, mtp_logits, 1, s);
+    }
+    return true;
+}
+
 DenseModel::DenseModel() : impl_(new Impl) {}
 
 DenseModel::~DenseModel() {
@@ -334,11 +485,13 @@ DenseModel::~DenseModel() {
     if (impl_->stream) cudaStreamDestroy(impl_->stream);
 }
 
-float* DenseModel::logits() const { return impl_->logits; }
+float* DenseModel::logits_col(int j) const { return impl_->logits + (size_t) j * cfg_.n_vocab; }
 void* DenseModel::stream() const { return impl_->stream; }
 
-bool DenseModel::load(const std::string& path, int64_t max_context, std::string& err) {
+bool DenseModel::load(const std::string& path, int64_t max_context, std::string& err, const DenseOptions& opt) {
     Impl& I = *impl_;
+    bool with_mtp = opt.mtp;
+    const int draft_max = std::max(1, std::min(opt.draft_max, NC - 1));
     try {
         // ---- 1. the files and the tensor index
         for (const std::string& p : shard_paths(path)) I.files.emplace_back(new strata::GgufFile(p));
@@ -365,22 +518,29 @@ bool DenseModel::load(const std::string& path, int64_t max_context, std::string&
             dst = (int) v;
             return true;
         };
-        if (!need("block_count", cfg_.n_layer) || !need("embedding_length", cfg_.n_embd) ||
+        int block_count = 0;
+        if (!need("block_count", block_count) || !need("embedding_length", cfg_.n_embd) ||
             !need("feed_forward_length", cfg_.n_ff) || !need("attention.head_count", cfg_.n_head) ||
             !need("attention.head_count_kv", cfg_.n_head_kv) || !need("attention.key_length", cfg_.head_dim) ||
             !need("rope.dimension_count", cfg_.n_rot) || !need("ssm.conv_kernel", cfg_.ssm_d_conv) ||
             !need("ssm.state_size", cfg_.ssm_state) || !need("ssm.group_count", cfg_.ssm_k_heads) ||
             !need("ssm.time_step_rank", cfg_.ssm_v_heads))
             return false;
-        // block_count includes the MTP/nextn layer(s) stored at the end of the file: they are not part of the main
-        // forward pass (llama.cpp uses n_layer_all - n_layer_nextn), running them corrupts the hidden state.
-        if (meta_int(g0, a + "nextn_predict_layers", v) && v > 0 && v < cfg_.n_layer) {
-            std::fprintf(stderr, "strata-dense: skipping %lld nextn (MTP) layer(s): %d -> %d layers\n", (long long) v,
-                         cfg_.n_layer, cfg_.n_layer - (int) v);
-            cfg_.n_layer -= (int) v;
-        }
+        // block_count counts the MTP block(s) stored after the trunk; llama.cpp runs only the trunk
+        cfg_.n_nextn = meta_int(g0, a + "nextn_predict_layers", v) ? (int) v : 0;
+        cfg_.n_layer = block_count - cfg_.n_nextn;
+        if (cfg_.n_layer <= 0) { err = "dense model: no trunk layers"; return false; }
         if (const auto* e = g0.get(a + "attention.layer_norm_rms_epsilon")) cfg_.rms_eps = (float) e->num();
         if (const auto* e = g0.get(a + "rope.freq_base")) cfg_.rope_base = (float) e->num();
+        // The rope the analytic kernel applies: the process scaling (rope_scaling.hpp, `none` unless a caller
+        // has set one) re-based on what this file declares.  The base is the file's, never the caller's: the
+        // angles must match the weights.
+        I.rope = rope_scaling();
+        I.rope.freq_base = (double) cfg_.rope_base;
+        if (const char* why = rope_scaling_invalid(I.rope)) {
+            err = std::string("dense model: invalid rope scaling configuration: ") + why;
+            return false;
+        }
         if (const auto* e = g0.get("tokenizer.ggml.eos_token_id")) cfg_.eos_id = (int32_t) e->u;
         if (meta_int(g0, a + "ssm.inner_size", v) && v != cfg_.value_dim()) {
             err = "dense model: ssm.inner_size " + std::to_string(v) + " != state_size * time_step_rank";
@@ -407,63 +567,126 @@ bool DenseModel::load(const std::string& path, int64_t max_context, std::string&
         }
         cfg_.n_vocab = (int) tok->tensor->shape[1];
         max_context_ = max_context;
+        I.max_context = max_context;
         if (max_context < 16) { err = "dense model: context must be at least 16"; return false; }
+        const int E = cfg_.n_embd;
+        const int mtp_block_idx = cfg_.n_layer;           // the MTP block follows the trunk
+        const std::string mp = "blk." + std::to_string(mtp_block_idx) + ".";
+        if (with_mtp && (cfg_.n_nextn < 1 || !I.find(mp + "nextn.eh_proj.weight"))) {
+            err = "dense model: this GGUF has no MTP block (nextn_predict_layers = " + std::to_string(cfg_.n_nextn) +
+                  "); start without --mtp";
+            return false;
+        }
 
         cudaError_t cs = cudaStreamCreate(&I.stream);
         if (cs == cudaSuccess) cs = cudaEventCreateWithFlags(&I.embed_done, cudaEventDisableTiming);
-        if (cs == cudaSuccess) cs = cudaHostAlloc((void**) &I.embd_stage, (size_t) cfg_.n_embd * 4, cudaHostAllocDefault);
+        if (cs == cudaSuccess) cs = cudaHostAlloc((void**) &I.embd_stage, (size_t) NC * E * 4, cudaHostAllocDefault);
         if (cs != cudaSuccess) { err = std::string("dense model: CUDA setup: ") + cudaGetErrorString(cs); return false; }
-
         if (const char* e = std::getenv("STRATA_DENSE_DEBUG")) {
             long long a0 = 0, b0 = 0;
             if (std::sscanf(e, "%lld:%lld", &a0, &b0) == 2) { I.dbg_from = a0; I.dbg_to = b0; }
         }
 
-        // ---- 3. the embedding table stays in the (mapped) file; a row is dequantized per token
-        I.embd = *tok;
-        I.embd_type = tok->tensor->type;
-        int elems = 0, bytes = 0;
-        if (!strata::block_geometry(I.embd_type, elems, bytes) || cfg_.n_embd % elems) {
-            err = "dense model: token_embd.weight has an unsupported type " + upper_type(I.embd_type);
-            return false;
-        }
-        I.embd_row_bytes = (size_t) cfg_.n_embd / (size_t) elems * (size_t) bytes;
-        I.row_tmp.resize((size_t) cfg_.n_embd);
-        {   // a dry run on row 0 tells now whether the host dequantizer knows the type
-            if (!dequant_row(I.embd_type, I.embd.file->tensor_data(*I.embd.tensor), cfg_.n_embd, I.row_tmp.data())) {
-                err = "dense model: cannot dequantize token_embd.weight of type " + upper_type(I.embd_type);
-                return false;
-            }
-        }
+        // ---- 3. the embedding tables stay in the (mapped) file; a row is dequantized per token
+        if (!I.setup_embd(I.embd, tok, E, err)) return false;
+        I.embd_mtp = I.embd;
+        const Found* mtp_embd = with_mtp ? I.find(mp + "nextn.embed_tokens.weight") : nullptr;
+        if (mtp_embd && !I.setup_embd(I.embd_mtp, mtp_embd, E, err)) return false;
 
-        // ---- 4. the layers
+        // ---- 4. the VRAM budget for the weights
         uint64_t total = 0;
-        {   // How much of the weights VRAM can take: what is free, minus the KV caches, minus a margin for the CUDA
-            // context, the activations and the kernels.  The rest of the weights stays in pinned host memory.
-            int n_attn = 0;
-            for (int l = 0; l < cfg_.n_layer; ++l)
-                if (I.find("blk." + std::to_string(l) + ".attn_q.weight")) ++n_attn;
-            const uint64_t kv_need = (uint64_t) n_attn * 2 * (uint64_t) cfg_.n_head_kv * (uint64_t) max_context *
-                                     (uint64_t) cfg_.head_dim * 2;
+        const int C = cfg_.conv_channels(), V = cfg_.value_dim(), H = cfg_.n_head, HK = cfg_.n_head_kv, D = cfg_.head_dim;
+        {   // What is free, minus the KV caches, the rollback snapshots and a margin for the CUDA context, the
+            // activations and the kernels.  The rest of the weights stays in pinned host memory.
+            int n_attn = 0, n_gdn = 0;
+            for (int l = 0; l < cfg_.n_layer; ++l) {
+                if (I.find("blk." + std::to_string(l) + ".attn_q.weight")) ++n_attn; else ++n_gdn;
+            }
+            const uint64_t kv_per_layer = 2ull * (uint64_t) HK * (uint64_t) max_context * (uint64_t) D * 2;
+            const uint64_t snap_one = (uint64_t) cfg_.ssm_state * cfg_.ssm_v_heads * cfg_.ssm_state * 4 +
+                                      (uint64_t) C * (cfg_.ssm_d_conv - 1) * 4;     // one snapshot of one GDN layer
+            auto reserved_for = [&](bool mtp) {
+                return (uint64_t) (n_attn + (mtp ? 1 : 0)) * kv_per_layer + (mtp ? (uint64_t) n_gdn * snap_one * (uint64_t) draft_max : 0);
+            };
             size_t free_b = 0, total_b = 0;
             cudaMemGetInfo(&free_b, &total_b);
             const uint64_t margin = 1024ull << 20;
-            if (const char* e = std::getenv("STRATA_DENSE_GPU_MIB")) {       // explicit cap for the weights, in MiB
-                I.budget = (uint64_t) std::atoll(e) << 20;
-            } else if ((uint64_t) free_b > kv_need + margin) {
-                I.budget = (uint64_t) free_b - kv_need - margin;
+            auto budget_for = [&](bool mtp) -> int64_t { return (int64_t) free_b - (int64_t) reserved_for(mtp) - (int64_t) margin; };
+            // the bytes of every quantized matrix the trunk (and the MTP block) will upload
+            auto bytes_of_prefix = [&](const std::string& pre) {
+                uint64_t sum = 0;
+                for (auto it = I.index.lower_bound(pre); it != I.index.end() && it->first.compare(0, pre.size(), pre) == 0; ++it) {
+                    const strata::TensorInfo& t = *it->second.tensor;
+                    if (t.shape.size() != 2 || !native_mmvq_supported((int) t.type)) continue;
+                    try { sum += native_mmvq_weight_bytes((int) t.type, (int) t.shape[0], (int) t.shape[1]); } catch (const std::exception&) {}
+                }
+                return sum;
+            };
+            uint64_t trunk_bytes = 0, mtp_bytes = 0;
+            for (int l = 0; l < cfg_.n_layer; ++l) trunk_bytes += bytes_of_prefix("blk." + std::to_string(l) + ".");
+            if (I.find("output.weight")) trunk_bytes += bytes_of_prefix("output.weight");
+            else if (tok) trunk_bytes += native_mmvq_supported((int) tok->tensor->type)
+                    ? native_mmvq_weight_bytes((int) tok->tensor->type, E, cfg_.n_vocab) : 0;
+            mtp_bytes = bytes_of_prefix(mp);
+            const bool user_cap = std::getenv("STRATA_DENSE_GPU_MIB") != nullptr;
+            if (with_mtp && !user_cap && !opt.mtp_force && budget_for(true) < (int64_t) (trunk_bytes + mtp_bytes)) {
+                std::fprintf(stderr,
+                             "strata-dense: MTP is OFF: the weights (%.2f GiB with the MTP block) and the snapshots do not all fit "
+                             "in the %.2f GiB of VRAM left for them, so some would be read over PCIe on every token - slower, "
+                             "not faster. Use a shorter --context, a smaller quant or --draft-max 1; --mtp-force keeps it anyway.\n",
+                             (trunk_bytes + mtp_bytes) / 1073741824.0, std::max<int64_t>(0, budget_for(true)) / 1073741824.0);
+                with_mtp = false;
+            }
+            const uint64_t reserved = reserved_for(with_mtp);
+            const uint64_t kv_need = (uint64_t) (n_attn + (with_mtp ? 1 : 0)) * kv_per_layer;
+            if (user_cap) {                                                  // explicit cap for the weights, in MiB
+                I.budget = (uint64_t) std::atoll(std::getenv("STRATA_DENSE_GPU_MIB")) << 20;
+            } else if ((int64_t) free_b > (int64_t) (reserved + margin)) {
+                I.budget = (uint64_t) budget_for(with_mtp);
             } else {
                 err = "dense model: the KV cache for a context of " + std::to_string(max_context) + " needs " +
                       std::to_string(kv_need >> 20) + " MiB, but only " + std::to_string(free_b >> 20) +
                       " MiB of VRAM are free (1 GiB is kept as margin). Use a shorter --context.";
                 return false;
             }
-            std::fprintf(stderr, "strata-dense: VRAM %zu MiB free of %zu; KV cache %llu MiB (context %lld); "
-                         "%llu MiB of weights may go to the GPU, the rest stays in host memory\n",
+            std::fprintf(stderr, "strata-dense: VRAM %zu MiB free of %zu; KV cache %llu MiB (context %lld)%s; "
+                         "%llu MiB of weights may go to the GPU (the model needs %.0f MiB), the rest stays in host memory\n",
                          free_b >> 20, total_b >> 20, (unsigned long long) (kv_need >> 20), (long long) max_context,
-                         (unsigned long long) (I.budget >> 20));
+                         with_mtp ? " + MTP snapshots" : "", (unsigned long long) (I.budget >> 20),
+                         (double) (trunk_bytes + (with_mtp ? mtp_bytes : 0)) / 1048576.0);
         }
-        const int C = cfg_.conv_channels(), V = cfg_.value_dim(), H = cfg_.n_head, HK = cfg_.n_head_kv, D = cfg_.head_dim;
+
+        // ---- 5. the MTP block first: it is small, and a draft that has to cross PCIe is not worth making
+        if (with_mtp) {
+            Mtp& M = I.mtp;
+            auto mat = [&](const char* nm, int n_in, int n_out, QMat& out) {
+                return I.upload_mat(I.find(mp + nm), mp + nm, n_in, n_out, out, total, err);
+            };
+            auto flt = [&](const char* nm, uint64_t n, float** out) {
+                return I.upload_floats(I.find(mp + nm), mp + nm, n, out, err);
+            };
+            if (!mat("nextn.eh_proj.weight", 2 * E, E, M.eh_proj) || !flt("nextn.enorm.weight", E, &M.enorm) ||
+                !flt("nextn.hnorm.weight", E, &M.hnorm) || !flt("attn_norm.weight", E, &M.attn_norm) ||
+                !flt("post_attention_norm.weight", E, &M.post_norm) || !flt("attn_q_norm.weight", D, &M.q_norm) ||
+                !flt("attn_k_norm.weight", D, &M.k_norm) || !mat("attn_q.weight", E, H * 2 * D, M.q) ||
+                !mat("attn_k.weight", E, HK * D, M.k) || !mat("attn_v.weight", E, HK * D, M.v) ||
+                !mat("attn_output.weight", H * D, E, M.o) || !mat("ffn_gate.weight", E, cfg_.n_ff, M.ffn_gate) ||
+                !mat("ffn_up.weight", E, cfg_.n_ff, M.ffn_up) || !mat("ffn_down.weight", cfg_.n_ff, E, M.ffn_down))
+                return false;
+            if (I.find(mp + "nextn.shared_head_norm.weight")) {
+                if (!flt("nextn.shared_head_norm.weight", E, &M.head_norm)) return false;
+            } else if (!I.upload_floats(I.find("output_norm.weight"), "output_norm.weight", E, &M.head_norm, err)) {
+                return false;
+            }
+            if (I.find(mp + "nextn.shared_head_head.weight") &&
+                !mat("nextn.shared_head_head.weight", E, cfg_.n_vocab, M.head))
+                return false;                              // otherwise the trunk's head is shared (set below)
+            const uint64_t kv = (uint64_t) HK * (uint64_t) max_context * (uint64_t) D * 2;
+            if (!I.alloc(&M.kc, kv, err, "MTP K cache") || !I.alloc(&M.vc, kv, err, "MTP V cache")) return false;
+            kv_bytes_ += 2 * kv;
+        }
+
+        // ---- 6. the trunk layers
         I.layers.assign((size_t) cfg_.n_layer, Layer{});
         for (int l = 0; l < cfg_.n_layer; ++l) {
             Layer& L = I.layers[(size_t) l];
@@ -473,48 +696,57 @@ bool DenseModel::load(const std::string& path, int64_t max_context, std::string&
             const bool has_attn = I.find(p + "attn_q.weight") != nullptr;
             if (has_gdn == has_attn) { err = "dense model: " + at + "needs exactly one of attn_qkv.weight / attn_q.weight"; return false; }
             L.attn = has_attn;
-            if (!I.upload_floats(I.find(p + "attn_norm.weight"), p + "attn_norm.weight", cfg_.n_embd, &L.attn_norm, err)) return false;
+            if (!I.upload_floats(I.find(p + "attn_norm.weight"), p + "attn_norm.weight", E, &L.attn_norm, err)) return false;
             if (!I.upload_floats(I.find_any({"post_attention_norm.weight", "ffn_norm.weight"}, p), p + "post_attention_norm.weight",
-                                 cfg_.n_embd, &L.post_norm, err)) return false;
-            if (!I.upload_mat(I.find(p + "ffn_gate.weight"), p + "ffn_gate.weight", cfg_.n_embd, cfg_.n_ff, L.ffn_gate, total, err) ||
-                !I.upload_mat(I.find(p + "ffn_up.weight"), p + "ffn_up.weight", cfg_.n_embd, cfg_.n_ff, L.ffn_up, total, err) ||
-                !I.upload_mat(I.find(p + "ffn_down.weight"), p + "ffn_down.weight", cfg_.n_ff, cfg_.n_embd, L.ffn_down, total, err))
+                                 E, &L.post_norm, err)) return false;
+            if (!I.upload_mat(I.find(p + "ffn_gate.weight"), p + "ffn_gate.weight", E, cfg_.n_ff, L.ffn_gate, total, err) ||
+                !I.upload_mat(I.find(p + "ffn_up.weight"), p + "ffn_up.weight", E, cfg_.n_ff, L.ffn_up, total, err) ||
+                !I.upload_mat(I.find(p + "ffn_down.weight"), p + "ffn_down.weight", cfg_.n_ff, E, L.ffn_down, total, err))
                 return false;
             if (!L.attn) {
-                if (!I.upload_mat(I.find(p + "attn_qkv.weight"), p + "attn_qkv.weight", cfg_.n_embd, C, L.qkv, total, err) ||
-                    !I.upload_mat(I.find(p + "attn_gate.weight"), p + "attn_gate.weight", cfg_.n_embd, V, L.z, total, err) ||
-                    !I.upload_mat(I.find(p + "ssm_out.weight"), p + "ssm_out.weight", V, cfg_.n_embd, L.ssm_out, total, err))
+                if (!I.upload_mat(I.find(p + "attn_qkv.weight"), p + "attn_qkv.weight", E, C, L.qkv, total, err) ||
+                    !I.upload_mat(I.find(p + "attn_gate.weight"), p + "attn_gate.weight", E, V, L.z, total, err) ||
+                    !I.upload_mat(I.find(p + "ssm_out.weight"), p + "ssm_out.weight", V, E, L.ssm_out, total, err))
                     return false;
                 if (!I.upload_floats(I.find(p + "ssm_conv1d.weight"), p + "ssm_conv1d.weight", (uint64_t) C * cfg_.ssm_d_conv, &L.conv_w, err) ||
                     !I.upload_floats(I.find_any({"ssm_dt.bias", "ssm_dt"}, p), p + "ssm_dt.bias", cfg_.ssm_v_heads, &L.dt, err) ||
                     !I.upload_floats(I.find_any({"ssm_a", "ssm_a.weight"}, p), p + "ssm_a", cfg_.ssm_v_heads, &L.ssm_a, err) ||
                     !I.upload_floats(I.find(p + "ssm_norm.weight"), p + "ssm_norm.weight", cfg_.ssm_state, &L.ssm_norm, err))
                     return false;
-                {   // alpha / beta: a float matrix in some files, Q8_0 (or another block type) in the Unsloth ones
+                {   // ssm_alpha / ssm_beta: floats in some files, Q8_0 (or another quant) in others - both are served
                     const Found* fa = I.find(p + "ssm_alpha.weight");
                     const Found* fb = I.find(p + "ssm_beta.weight");
                     if (!fa || !fb) { err = "dense model: " + at + "missing ssm_alpha.weight / ssm_beta.weight"; return false; }
                     auto is_float = [](uint32_t t) { return t == kF32 || t == kF16 || t == kBF16; };
                     if (is_float(fa->tensor->type) != is_float(fb->tensor->type)) {
-                        err = "dense model: " + at + "ssm_alpha and ssm_beta have different kinds of type"; return false;
+                        err = "dense model: " + at + "ssm_alpha and ssm_beta are stored in different kinds of type";
+                        return false;
                     }
                     L.ab_quant = !is_float(fa->tensor->type);
                     if (L.ab_quant) {
-                        if (!I.upload_mat(fa, p + "ssm_alpha.weight", cfg_.n_embd, cfg_.ssm_v_heads, L.alpha_q, total, err) ||
-                            !I.upload_mat(fb, p + "ssm_beta.weight", cfg_.n_embd, cfg_.ssm_v_heads, L.beta_q, total, err))
+                        if (!I.upload_mat(fa, p + "ssm_alpha.weight", E, cfg_.ssm_v_heads, L.alpha_q, total, err) ||
+                            !I.upload_mat(fb, p + "ssm_beta.weight", E, cfg_.ssm_v_heads, L.beta_q, total, err))
                             return false;
-                    } else if (!I.upload_floats(fa, p + "ssm_alpha.weight", (uint64_t) cfg_.n_embd * cfg_.ssm_v_heads, &L.alpha_w, err) ||
-                               !I.upload_floats(fb, p + "ssm_beta.weight", (uint64_t) cfg_.n_embd * cfg_.ssm_v_heads, &L.beta_w, err))
+                    } else if (!I.upload_floats(fa, p + "ssm_alpha.weight", (uint64_t) E * cfg_.ssm_v_heads, &L.alpha_w, err) ||
+                               !I.upload_floats(fb, p + "ssm_beta.weight", (uint64_t) E * cfg_.ssm_v_heads, &L.beta_w, err))
                         return false;
                 }
                 const uint64_t sbytes = (uint64_t) cfg_.ssm_state * cfg_.ssm_v_heads * cfg_.ssm_state * 4;
                 const uint64_t cbytes = (uint64_t) C * (cfg_.ssm_d_conv - 1) * 4;
                 if (!I.alloc(&L.state, sbytes, err, "GDN state") || !I.alloc(&L.conv_state, cbytes, err, "conv state")) return false;
+                if (with_mtp) {
+                    L.st_slots.assign((size_t) draft_max, nullptr);
+                    L.cv_slots.assign((size_t) draft_max, nullptr);
+                    for (int j = 0; j < draft_max; ++j)
+                        if (!I.alloc(&L.st_slots[(size_t) j], sbytes, err, "GDN state snapshot") ||
+                            !I.alloc(&L.cv_slots[(size_t) j], cbytes, err, "conv snapshot"))
+                            return false;
+                }
             } else {
-                if (!I.upload_mat(I.find(p + "attn_q.weight"), p + "attn_q.weight", cfg_.n_embd, H * 2 * D, L.q, total, err) ||
-                    !I.upload_mat(I.find(p + "attn_k.weight"), p + "attn_k.weight", cfg_.n_embd, HK * D, L.k, total, err) ||
-                    !I.upload_mat(I.find(p + "attn_v.weight"), p + "attn_v.weight", cfg_.n_embd, HK * D, L.v, total, err) ||
-                    !I.upload_mat(I.find(p + "attn_output.weight"), p + "attn_output.weight", H * D, cfg_.n_embd, L.o, total, err))
+                if (!I.upload_mat(I.find(p + "attn_q.weight"), p + "attn_q.weight", E, H * 2 * D, L.q, total, err) ||
+                    !I.upload_mat(I.find(p + "attn_k.weight"), p + "attn_k.weight", E, HK * D, L.k, total, err) ||
+                    !I.upload_mat(I.find(p + "attn_v.weight"), p + "attn_v.weight", E, HK * D, L.v, total, err) ||
+                    !I.upload_mat(I.find(p + "attn_output.weight"), p + "attn_output.weight", H * D, E, L.o, total, err))
                     return false;
                 if (!I.upload_floats(I.find(p + "attn_q_norm.weight"), p + "attn_q_norm.weight", D, &L.q_norm, err) ||
                     !I.upload_floats(I.find(p + "attn_k_norm.weight"), p + "attn_k_norm.weight", D, &L.k_norm, err))
@@ -525,13 +757,14 @@ bool DenseModel::load(const std::string& path, int64_t max_context, std::string&
             }
         }
 
-        // ---- 5. the output side
-        if (!I.upload_floats(I.find("output_norm.weight"), "output_norm.weight", cfg_.n_embd, &I.output_norm, err)) return false;
+        // ---- 7. the output side
+        if (!I.upload_floats(I.find("output_norm.weight"), "output_norm.weight", E, &I.output_norm, err)) return false;
         const Found* head = I.find("output.weight");
         if (!head) head = tok;                                   // tied embeddings
-        if (!I.upload_mat(head, head == tok ? "token_embd.weight (tied head)" : "output.weight", cfg_.n_embd, cfg_.n_vocab,
+        if (!I.upload_mat(head, head == tok ? "token_embd.weight (tied head)" : "output.weight", E, cfg_.n_vocab,
                           I.head, total, err))
             return false;
+        if (with_mtp && !I.mtp.head.dev) I.mtp.head = I.head;    // the MTP block shares the trunk's head
         weight_bytes_ = total;
         host_bytes_ = I.host_bytes;
         if (I.host_tensors)
@@ -539,26 +772,34 @@ bool DenseModel::load(const std::string& path, int64_t max_context, std::string&
                          "on every token - a shorter --context or a smaller quant puts more on the GPU\n",
                          I.host_tensors, I.host_bytes / 1073741824.0, total / 1073741824.0);
 
-        // ---- 6. activations and scratch
-        const int max_in = std::max({cfg_.n_embd, cfg_.n_ff, V, H * D});
-        const uint64_t f = 4;
-        bool ok = I.alloc(&I.q8_1, native_q8_1_bytes(max_in), err, "q8_1 scratch") &&
-                  I.alloc(&I.x, cfg_.n_embd * f, err, "x") && I.alloc(&I.xn, cfg_.n_embd * f, err, "xn") &&
-                  I.alloc(&I.mix, cfg_.n_embd * f, err, "mix") && I.alloc(&I.qkv, C * f, err, "qkv") &&
-                  I.alloc(&I.conv_out, C * f, err, "conv_out") && I.alloc(&I.h, C * f, err, "h") &&
-                  I.alloc(&I.alpha, cfg_.ssm_v_heads * f, err, "alpha") && I.alloc(&I.beta, cfg_.ssm_v_heads * f, err, "beta") &&
-                  I.alloc(&I.gate, cfg_.ssm_v_heads * f, err, "gate") && I.alloc(&I.o, V * f, err, "o") &&
-                  I.alloc(&I.z, V * f, err, "z") && I.alloc(&I.y, V * f, err, "y") &&
-                  I.alloc(&I.q_full, (uint64_t) H * 2 * D * f, err, "q_full") && I.alloc(&I.qcur, (uint64_t) H * D * f, err, "qcur") &&
-                  I.alloc(&I.kcur, (uint64_t) HK * D * f, err, "kcur") && I.alloc(&I.vcur, (uint64_t) HK * D * f, err, "vcur") &&
-                  I.alloc(&I.attn, (uint64_t) H * D * f, err, "attn") && I.alloc(&I.attn32, (uint64_t) H * D * f, err, "attn32") &&
-                  I.alloc(&I.ffn_g, cfg_.n_ff * f, err, "ffn_g") && I.alloc(&I.ffn_u, cfg_.n_ff * f, err, "ffn_u") &&
-                  I.alloc(&I.ffn_h, cfg_.n_ff * f, err, "ffn_h") && I.alloc(&I.logits, (uint64_t) cfg_.n_vocab * f, err, "logits") &&
+        // ---- 8. activations and scratch (NC columns each)
+        const int max_in = std::max({2 * E, cfg_.n_ff, V, H * D});
+        const uint64_t f = 4, K = NC;
+        bool ok = I.alloc(&I.q8_1, native_q8_1_bytes(max_in, NC), err, "q8_1 scratch") &&
+                  I.alloc(&I.x, K * E * f, err, "x") && I.alloc(&I.xn, K * E * f, err, "xn") &&
+                  I.alloc(&I.mix, K * E * f, err, "mix") && I.alloc(&I.qkv, K * C * f, err, "qkv") &&
+                  I.alloc(&I.conv_out, K * C * f, err, "conv_out") && I.alloc(&I.h, K * C * f, err, "h") &&
+                  I.alloc(&I.alpha, K * cfg_.ssm_v_heads * f, err, "alpha") && I.alloc(&I.beta, K * cfg_.ssm_v_heads * f, err, "beta") &&
+                  I.alloc(&I.gate, K * cfg_.ssm_v_heads * f, err, "gate") && I.alloc(&I.o, K * V * f, err, "o") &&
+                  I.alloc(&I.z, K * V * f, err, "z") && I.alloc(&I.y, K * V * f, err, "y") &&
+                  I.alloc(&I.q_full, K * H * 2 * D * f, err, "q_full") && I.alloc(&I.qcur, K * H * D * f, err, "qcur") &&
+                  I.alloc(&I.kcur, K * HK * D * f, err, "kcur") && I.alloc(&I.vcur, K * HK * D * f, err, "vcur") &&
+                  I.alloc(&I.attn, K * H * D * f, err, "attn") && I.alloc(&I.attn32, K * H * D * f, err, "attn32") &&
+                  I.alloc(&I.ffn_g, K * cfg_.n_ff * f, err, "ffn_g") && I.alloc(&I.ffn_u, K * cfg_.n_ff * f, err, "ffn_u") &&
+                  I.alloc(&I.ffn_h, K * cfg_.n_ff * f, err, "ffn_h") && I.alloc(&I.logits, K * cfg_.n_vocab * f, err, "logits") &&
                   I.alloc(&I.attn_scratch, dense_attn_scratch_bytes(H, D, (int) max_context), err, "attention scratch") &&
-                  I.alloc(&I.pos_dev, (uint64_t) std::max(H, HK) * 4, err, "positions");
+                  I.alloc(&I.pos_dev, (uint64_t) std::max(H, HK) * 4, err, "positions") &&
+                  I.alloc(&I.hid, K * E * f, err, "hidden") && I.alloc(&I.h_last, (uint64_t) E * f, err, "last hidden") &&
+                  I.alloc(&I.d_tok, 16, err, "sampler output") && I.alloc(&I.d_prob, 16, err, "draft probability");
+        if (ok && with_mtp)
+            ok = I.alloc(&I.m_e, K * E * f, err, "MTP embeddings") && I.alloc(&I.hin, K * E * f, err, "MTP hidden input") &&
+                 I.alloc(&I.cat, K * 2 * E * f, err, "MTP concat") && I.alloc(&I.mtp_logits, (uint64_t) cfg_.n_vocab * f, err, "MTP logits") &&
+                 I.alloc(&I.mtp_h, (uint64_t) E * f, err, "MTP output hidden");
         if (!ok) return false;
 
         native_gdn_set_enabled(true);
+        has_mtp_ = with_mtp;
+        draft_max_ = with_mtp ? draft_max : 0;
         reset();
         std::string serr;
         if (!sync(serr)) { err = serr; return false; }
@@ -577,7 +818,9 @@ void DenseModel::reset() {
         if (L.state) cudaMemsetAsync(L.state, 0, sbytes, I.stream);
         if (L.conv_state) cudaMemsetAsync(L.conv_state, 0, cbytes, I.stream);
     }
+    if (I.h_last) cudaMemsetAsync(I.h_last, 0, (size_t) cfg_.n_embd * 4, I.stream);
     pos_ = 0;
+    snap_valid_ = false;
 }
 
 bool DenseModel::sync(std::string& err) {
@@ -586,97 +829,124 @@ bool DenseModel::sync(std::string& err) {
     return true;
 }
 
-bool DenseModel::step(int32_t token, bool want_logits, std::string& err) {
+void DenseModel::set_last_hidden(int col) {
+    cudaMemcpyAsync(impl_->h_last, impl_->hid + (size_t) col * cfg_.n_embd, (size_t) cfg_.n_embd * 4,
+                    cudaMemcpyDeviceToDevice, impl_->stream);
+}
+
+bool DenseModel::rollback(int keep_col, std::string& err) {
+    if (!snap_valid_) { err = "dense model: rollback without a snapshot"; return false; }
+    if (keep_col < 0 || keep_col >= snap_cols_ - 1) { err = "dense model: rollback column outside the snapshots"; return false; }
+    for (Layer& L : impl_->layers) {
+        if (L.attn) continue;
+        std::swap(L.state, L.st_slots[(size_t) keep_col]);
+        std::swap(L.conv_state, L.cv_slots[(size_t) keep_col]);
+    }
+    pos_ = snap_pos0_ + keep_col + 1;
+    snap_valid_ = false;
+    return true;
+}
+
+bool DenseModel::run(const int32_t* tokens, int n, Logits lg, bool keep_hidden, bool snapshot, std::string& err) {
     Impl& I = *impl_;
-    if (token < 0 || token >= cfg_.n_vocab) { err = "dense model: token id outside the vocabulary"; return false; }
-    if (pos_ >= max_context_) { err = "dense model: the context is full"; return false; }
+    if (n < 1 || n > NC) { err = "dense model: run() takes 1 to " + std::to_string(NC) + " tokens"; return false; }
+    if (pos_ + n > max_context_) { err = "dense model: the context is full"; return false; }
+    if (snapshot && (!has_mtp_ || n - 1 > draft_max_)) { err = "dense model: bad snapshot request (more columns than --draft-max + 1, or no MTP)"; return false; }
     void* s = I.stream;
-    const int C = cfg_.conv_channels(), V = cfg_.value_dim(), H = cfg_.n_head, HK = cfg_.n_head_kv, D = cfg_.head_dim;
-    const int S = cfg_.ssm_state, KH = cfg_.ssm_k_heads, VH = cfg_.ssm_v_heads, E = cfg_.n_embd;
-    const int qk = S * KH;
-    const float eps = cfg_.rms_eps;
-    const bool dbg = I.dbg_from >= 0 && pos_ >= I.dbg_from && pos_ < I.dbg_to;
+    const int E = cfg_.n_embd;
+    const int64_t pos0 = pos_;
+    const bool dbg = I.dbg_from >= 0 && pos0 < I.dbg_to && pos0 + n > I.dbg_from;
     try {
-        // ---- the embedding row: dequantized on the host into pinned memory, then one copy
-        if (cudaEventSynchronize(I.embed_done) != cudaSuccess) { err = "dense model: embedding event"; return false; }
-        const uint8_t* row = I.embd.file->tensor_data(*I.embd.tensor) + (size_t) token * I.embd_row_bytes;
-        if (!dequant_row(I.embd_type, row, E, I.embd_stage)) { err = "dense model: embedding dequantization"; return false; }
-        cudaMemcpyAsync(I.x, I.embd_stage, (size_t) E * 4, cudaMemcpyHostToDevice, I.stream);
-        cudaEventRecord(I.embed_done, I.stream);
-        dense_fill_i32(I.pos_dev, std::max(H, HK), (int32_t) pos_, s);
-        if (dbg) trace_vec("embed", pos_, -1, "", I.x, E, s);
+        if (!I.upload_embeddings(I.embd, tokens, n, E, cfg_.n_vocab, I.x, err)) return false;
+        if (dbg) trace_vec("embed", pos0, -1, "", I.x, n * E, s);
 
         for (int l = 0; l < cfg_.n_layer; ++l) {
             Layer& L = I.layers[(size_t) l];
-            dense_rms_norm(I.x, L.attn_norm, I.xn, 1, E, eps, s);
-            if (!L.attn) {
-                // ---- gated delta net (the sequence follows layer.cpp's native path, stage by stage)
-                I.quantize(I.xn, E, s);
-                I.gemv(L.qkv, I.qkv, s);
-                I.gemv(L.z, I.z, s);
-                native_gdn_conv_silu(L.conv_state, I.qkv, L.conv_w, I.conv_out, I.h, C, cfg_.ssm_d_conv, s);
-                native_gdn_l2_norm(I.h, KH, S, eps, s);
-                native_gdn_l2_norm(I.h + qk, KH, S, eps, s);
-                if (L.ab_quant) {           // xn is still quantized in the shared q8_1 scratch: nothing overwrote it
-                    I.gemv(L.alpha_q, I.alpha, s);
-                    I.gemv(L.beta_q, I.beta, s);
-                } else {
-                    dense_gemv_f32(L.alpha_w, I.xn, I.alpha, E, VH, s);
-                    dense_gemv_f32(L.beta_w, I.xn, I.beta, E, VH, s);
-                }
-                native_gdn_beta_gate(I.beta, VH, s);
-                native_gdn_gate(I.alpha, L.dt, L.ssm_a, I.gate, VH, s);
-                GdnShapes gs{S, KH, VH};
-                native_gdn_step(L.state, I.h, I.h + qk, I.h + 2 * qk, I.gate, I.beta, I.o, gs, s);
-                dense_gdn_out_norm_silu(I.o, I.z, L.ssm_norm, I.y, VH, S, eps, s);   // rms(o) * w * SiLU(z), as llama.cpp build_norm_gated (native_gdn_out_norm uses sigmoid: the MoE variant)
-                I.quantize(I.y, V, s);
-                I.gemv(L.ssm_out, I.mix, s);
-            } else {
-                // ---- gated attention over the KV cache
-                I.quantize(I.xn, E, s);
-                I.gemv(L.q, I.q_full, s);
-                I.gemv(L.k, I.kcur, s);
-                I.gemv(L.v, I.vcur, s);
-                // q is the FIRST head_dim of every head's 2*head_dim block; the second half is the output gate
-                cudaMemcpy2DAsync(I.qcur, (size_t) D * 4, I.q_full, (size_t) D * 2 * 4, (size_t) D * 4, (size_t) H,
-                                  cudaMemcpyDeviceToDevice, I.stream);
-                rms_norm_weighted(I.qcur, L.q_norm, H, D, eps, s);
-                rms_norm_weighted(I.kcur, L.k_norm, HK, D, eps, s);
-                // The dense path has no CLI rope knobs: the model's freq base is the whole configuration.
-                RopeScaling rs;
-                rs.freq_base = cfg_.rope_base;
-                native_rope_apply(I.qcur, I.qcur, H, D, cfg_.n_rot, rs, I.pos_dev, s);
-                native_rope_apply(I.kcur, I.kcur, HK, D, cfg_.n_rot, rs, I.pos_dev, s);
-                dense_kv_append(L.kc, L.vc, I.kcur, I.vcur, (int) pos_, HK, D, (int) max_context_, s);
-                dense_attn_decode(I.qcur, L.kc, L.vc, I.attn, I.attn_scratch, H, HK, D, (int) pos_ + 1,
-                                  (int) max_context_, 1.0f / std::sqrt((float) D), s);
-                native_qsa_gate_apply(I.attn, I.q_full, I.attn32, H, D, s);
-                I.quantize(I.attn32, H * D, s);
-                I.gemv(L.o, I.mix, s);
-            }
-            add_inplace(I.x, I.mix, E, s);
-
-            // ---- feed-forward
-            dense_rms_norm(I.x, L.post_norm, I.xn, 1, E, eps, s);
-            I.quantize(I.xn, E, s);
-            I.gemv(L.ffn_gate, I.ffn_g, s);
-            I.gemv(L.ffn_up, I.ffn_u, s);
-            dense_swiglu(I.ffn_g, I.ffn_u, I.ffn_h, cfg_.n_ff, s);
-            I.quantize(I.ffn_h, cfg_.n_ff, s);
-            I.gemv(L.ffn_down, I.mix, s);
-            add_inplace(I.x, I.mix, E, s);
-            if (dbg) trace_vec("x", pos_, l, L.attn ? "attn" : "gdn", I.x, E, s);
+            dense_rms_norm(I.x, L.attn_norm, I.xn, n, E, cfg_.rms_eps, s);
+            if (!L.attn) I.gdn_block(cfg_, L, n, snapshot, s);
+            else I.attn_block(cfg_, L.q, L.k, L.v, L.o, L.q_norm, L.k_norm, L.kc, L.vc, n, (int) pos0, s);
+            add_inplace(I.x, I.mix, (int64_t) n * E, s);
+            I.ffn_block(cfg_, L.ffn_gate, L.ffn_up, L.ffn_down, L.post_norm, n, s);
+            if (dbg) trace_vec("x", pos0, l, L.attn ? "attn" : "gdn", I.x, n * E, s);
         }
-        ++pos_;
-        if (want_logits) {
-            dense_rms_norm(I.x, I.output_norm, I.xn, 1, E, eps, s);
-            I.quantize(I.xn, E, s);
-            I.gemv(I.head, I.logits, s);
-            if (dbg) trace_logits(pos_ - 1, I.logits, cfg_.n_vocab, s);
+        pos_ += n;
+        snap_valid_ = snapshot && n > 1;
+        snap_pos0_ = pos0;
+        snap_cols_ = n;
+
+        if (lg != Logits::None || keep_hidden) {
+            dense_rms_norm(I.x, I.output_norm, I.hid, n, E, cfg_.rms_eps, s);     // h_nextn: the post-norm hidden
+            if (lg == Logits::Last) {
+                I.quantize(I.hid + (size_t) (n - 1) * E, E, 1, s);
+                I.gemv(I.head, I.logits, 1, s);
+            } else if (lg == Logits::All) {
+                I.quantize(I.hid, E, n, s);
+                I.gemv(I.head, I.logits, n, s);
+            }
+            if (dbg && lg != Logits::None) trace_logits(pos0 + n - 1, I.logits, cfg_.n_vocab, s);
         }
         return true;
     } catch (const std::exception& e) {
         err = std::string("dense model: ") + e.what();
+        return false;
+    }
+}
+
+bool DenseModel::mtp_ingest(const int32_t* tokens, int n, int pos0, int start, std::string& err) {
+    Impl& I = *impl_;
+    if (!has_mtp_) { err = "dense model: no MTP block loaded"; return false; }
+    const int m = n - start;
+    if (start < 0 || m < 1 || n > NC) { err = "dense model: bad MTP ingest range"; return false; }
+    if ((int64_t) pos0 + n > max_context_) { err = "dense model: the context is full"; return false; }
+    void* s = I.stream;
+    const int E = cfg_.n_embd;
+    try {
+        if (!I.upload_embeddings(I.embd_mtp, tokens + start, m, E, cfg_.n_vocab, I.m_e, err)) return false;
+        for (int j = start; j < n; ++j) {            // hidden[j-1]; column 0 pairs with the hidden before this run
+            const float* src = (j == 0) ? I.h_last : I.hid + (size_t) (j - 1) * E;
+            cudaMemcpyAsync(I.hin + (size_t) (j - start) * E, src, (size_t) E * 4, cudaMemcpyDeviceToDevice, (cudaStream_t) s);
+        }
+        for (int jj = 0; jj < m; ++jj) {
+            dense_rms_norm(I.m_e + (size_t) jj * E, I.mtp.enorm, I.cat + (size_t) jj * 2 * E, 1, E, cfg_.rms_eps, s);       // e first,
+            dense_rms_norm(I.hin + (size_t) jj * E, I.mtp.hnorm, I.cat + (size_t) jj * 2 * E + E, 1, E, cfg_.rms_eps, s);   // then h
+        }
+        I.mtp_block(cfg_, m, pos0 + start, false, s);
+        cudaMemcpyAsync(I.h_last, I.hid + (size_t) (n - 1) * E, (size_t) E * 4, cudaMemcpyDeviceToDevice, (cudaStream_t) s);
+        return true;
+    } catch (const std::exception& e) {
+        err = std::string("dense model: MTP: ") + e.what();
+        return false;
+    }
+}
+
+bool DenseModel::mtp_draft(int32_t token, int pos, int max_n, float p_min, int32_t* out, int* n_out, std::string& err) {
+    Impl& I = *impl_;
+    *n_out = 0;
+    if (!has_mtp_) { err = "dense model: no MTP block loaded"; return false; }
+    void* s = I.stream;
+    const int E = cfg_.n_embd;
+    try {
+        int32_t tok = token;
+        for (int i = 0; i < max_n; ++i) {
+            if ((int64_t) pos + i >= max_context_) break;
+            // step 0 pairs the token with the trunk's last hidden; later steps chain on the block's own output
+            if (!I.upload_embeddings(I.embd_mtp, &tok, 1, E, cfg_.n_vocab, I.m_e, err)) return false;
+            dense_rms_norm(I.m_e, I.mtp.enorm, I.cat, 1, E, cfg_.rms_eps, s);
+            dense_rms_norm(i == 0 ? I.h_last : I.mtp_h, I.mtp.hnorm, I.cat + E, 1, E, cfg_.rms_eps, s);
+            I.mtp_block(cfg_, 1, pos + i, true, s);
+            dense_argmax_prob(I.mtp_logits, cfg_.n_vocab, I.d_tok, I.d_prob, s);
+            int id = -1;
+            float prob = 0.0f;
+            cudaMemcpyAsync(&id, I.d_tok, sizeof(int), cudaMemcpyDeviceToHost, (cudaStream_t) s);
+            cudaMemcpyAsync(&prob, I.d_prob, sizeof(float), cudaMemcpyDeviceToHost, (cudaStream_t) s);
+            if (!sync(err)) return false;
+            if (prob < p_min) break;                    // not sure enough: this token is not offered
+            out[(*n_out)++] = id;
+            tok = id;
+        }
+        return true;
+    } catch (const std::exception& e) {
+        err = std::string("dense model: MTP: ") + e.what();
         return false;
     }
 }
