@@ -19,6 +19,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <chrono>
 #include <cstring>
 #include <exception>
 #include <map>
@@ -175,6 +176,69 @@ void trace_logits(int64_t pos, const float* dev, int n, void* stream) {
 
 }  // namespace
 
+// STRATA_DENSE_PROF=1: where the time of every run() pass goes (GPU events around the pieces, host enqueue time),
+// printed to stderr every 8 passes.  The pass is synchronized at its end, so this slows decoding slightly: it is a
+// measuring mode, not a way to run.
+struct Prof {
+    enum { GEMV_Q4K, GEMV_Q6K, GEMV_Q80, GEMV_OTHER, QUANT, GDN_LOOP, ATTN_LOOP, NB };
+    bool enabled = false, on = false;
+    std::vector<cudaEvent_t> ev;
+    size_t used = 0;
+    struct Seg { int bucket; size_t a, b; };
+    std::vector<Seg> segs;
+    size_t t0 = 0;
+    std::chrono::steady_clock::time_point host0;
+    double ms[NB] = {}, total_ms = 0, host_ms = 0;
+    long long passes = 0, cols = 0;
+    size_t get() {
+        if (used == ev.size()) { cudaEvent_t e = nullptr; cudaEventCreate(&e); ev.push_back(e); }
+        return used++;
+    }
+    void begin(void* s) {
+        on = true; used = 0; segs.clear();
+        t0 = get();
+        cudaEventRecord(ev[t0], (cudaStream_t) s);
+        host0 = std::chrono::steady_clock::now();
+    }
+    void finish(void* s, int n) {
+        host_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - host0).count();
+        const size_t t1 = get();
+        cudaEventRecord(ev[t1], (cudaStream_t) s);
+        cudaEventSynchronize(ev[t1]);
+        on = false;
+        float tot = 0;
+        cudaEventElapsedTime(&tot, ev[t0], ev[t1]);
+        total_ms += tot;
+        for (const Seg& g : segs) { float m = 0; cudaEventElapsedTime(&m, ev[g.a], ev[g.b]); ms[g.bucket] += m; }
+        ++passes; cols += n;
+        if (passes % 8 == 0) {
+            double known = 0;
+            for (int i = 0; i < NB; ++i) known += ms[i];
+            const double P = (double) passes;
+            std::fprintf(stderr,
+                         "strata-dense prof: %.1f cols/pass, GPU %.1f ms/pass = gemv Q4_K %.1f + Q6_K %.1f + Q8_0 %.1f + other %.1f"
+                         " | quantize %.1f | gdn token loop %.1f | attn token loop %.1f | rest %.1f ; host enqueue %.1f ms/pass\n",
+                         (double) cols / P, total_ms / P, ms[GEMV_Q4K] / P, ms[GEMV_Q6K] / P, ms[GEMV_Q80] / P, ms[GEMV_OTHER] / P,
+                         ms[QUANT] / P, ms[GDN_LOOP] / P, ms[ATTN_LOOP] / P, (total_ms - known) / P, host_ms / P);
+            for (double& m : ms) m = 0;
+            total_ms = host_ms = 0; passes = cols = 0;
+        }
+    }
+};
+
+struct PScope {
+    Prof* p; int bucket; size_t a = 0; void* s;
+    PScope(Prof* pp, int b, void* st) : p(pp), bucket(b), s(st) {
+        if (p->on) { a = p->get(); cudaEventRecord(p->ev[a], (cudaStream_t) s); }
+    }
+    ~PScope() {
+        if (!p->on) return;
+        const size_t e = p->get();
+        cudaEventRecord(p->ev[e], (cudaStream_t) s);
+        p->segs.push_back({bucket, a, e});
+    }
+};
+
 struct DenseModel::Impl {
     std::vector<std::unique_ptr<strata::GgufFile>> files;
     std::map<std::string, Found> index;
@@ -186,6 +250,7 @@ struct DenseModel::Impl {
     uint64_t dev_used = 0, host_bytes = 0;
     int host_tensors = 0;
     long long dbg_from = -1, dbg_to = -1;           // STRATA_DENSE_DEBUG=A:B traces the steps with A <= position < B
+    Prof prof;                                      // STRATA_DENSE_PROF=1
     cudaStream_t stream = nullptr;
     cudaEvent_t embed_done = nullptr;
 
@@ -362,8 +427,14 @@ struct DenseModel::Impl {
     }
 
     // y = W x for n columns; the activation must already be quantized (quantize()) with the same n.
-    void gemv(const QMat& w, float* y, int n, void* s) { native_mmvq(w.type, w.dev, q8_1, y, w.n_in, w.n_out, n, s); }
-    void quantize(const float* x, int n_in, int n, void* s) { native_quantize_q8_1(x, q8_1, n_in, n, s); }
+    void gemv(const QMat& w, float* y, int n, void* s) {
+        PScope ps(&prof, w.type == 12 ? Prof::GEMV_Q4K : w.type == 14 ? Prof::GEMV_Q6K : w.type == 8 ? Prof::GEMV_Q80 : Prof::GEMV_OTHER, s);
+        native_mmvq(w.type, w.dev, q8_1, y, w.n_in, w.n_out, n, s);
+    }
+    void quantize(const float* x, int n_in, int n, void* s) {
+        PScope ps(&prof, Prof::QUANT, s);
+        native_quantize_q8_1(x, q8_1, n_in, n, s);
+    }
 
     // ---- the blocks.  Input is I.xn (the normalized residual) unless stated; the output goes to I.mix.
     void gdn_block(const DenseConfig& c, Layer& L, int n, bool snapshot, void* s);
@@ -389,6 +460,8 @@ void DenseModel::Impl::gdn_block(const DenseConfig& c, Layer& L, int n, bool sna
         }
     }
     GdnShapes gs{S, KH, VH};
+    {
+    PScope ps_gdn(&prof, Prof::GDN_LOOP, s);
     for (int j = 0; j < n; ++j) {                   // the recurrence is order-dependent: one column at a time
         float* hj = h + (size_t) j * C;
         native_gdn_conv_silu(L.conv_state, qkv + (size_t) j * C, L.conv_w, conv_out + (size_t) j * C, hj, C, c.ssm_d_conv, s);
@@ -405,6 +478,7 @@ void DenseModel::Impl::gdn_block(const DenseConfig& c, Layer& L, int n, bool sna
                             (cudaStream_t) s);
         }
     }
+    }
     quantize(y, V, n, s);
     gemv(L.ssm_out, mix, n, s);
 }
@@ -418,6 +492,8 @@ void DenseModel::Impl::attn_block(const DenseConfig& c, const QMat& wq, const QM
     gemv(wk, kcur, n, s);
     gemv(wv, vcur, n, s);
     const float scale = 1.0f / std::sqrt((float) D);
+    {
+    PScope ps_attn(&prof, Prof::ATTN_LOOP, s);
     for (int j = 0; j < n; ++j) {
         float* qj = qcur + (size_t) j * H * D;
         float* kj = kcur + (size_t) j * HK * D;
@@ -434,6 +510,7 @@ void DenseModel::Impl::attn_block(const DenseConfig& c, const QMat& wq, const QM
         dense_attn_decode(qj, kc, vc, attn + (size_t) j * H * D, attn_scratch, H, HK, D, pos0 + j + 1, (int) max_context,
                           scale, s);
         native_qsa_gate_apply(attn + (size_t) j * H * D, qfj, attn32 + (size_t) j * H * D, H, D, s);
+    }
     }
     quantize(attn32, H * D, n, s);
     gemv(wo, mix, n, s);
@@ -582,6 +659,9 @@ bool DenseModel::load(const std::string& path, int64_t max_context, std::string&
         if (cs == cudaSuccess) cs = cudaEventCreateWithFlags(&I.embed_done, cudaEventDisableTiming);
         if (cs == cudaSuccess) cs = cudaHostAlloc((void**) &I.embd_stage, (size_t) NC * E * 4, cudaHostAllocDefault);
         if (cs != cudaSuccess) { err = std::string("dense model: CUDA setup: ") + cudaGetErrorString(cs); return false; }
+        if (const char* e = std::getenv("STRATA_DENSE_PROF")) I.prof.enabled = e[0] && e[0] != '0';
+        if (const char* e = std::getenv("STRATA_DENSE_MMVQ_FAST"))      // the multi-column layout that is faster but not bitwise equal to 1 column
+            if (e[0] && e[0] != '0') { native_mmvq_set_multi_exact(false); std::fprintf(stderr, "strata-dense: multi-column GEMV: upstream layout\n"); }
         if (const char* e = std::getenv("STRATA_DENSE_DEBUG")) {
             long long a0 = 0, b0 = 0;
             if (std::sscanf(e, "%lld:%lld", &a0, &b0) == 2) { I.dbg_from = a0; I.dbg_to = b0; }
@@ -630,11 +710,21 @@ bool DenseModel::load(const std::string& path, int64_t max_context, std::string&
             mtp_bytes = bytes_of_prefix(mp);
             const bool user_cap = std::getenv("STRATA_DENSE_GPU_MIB") != nullptr;
             if (with_mtp && !user_cap && !opt.mtp_force && budget_for(true) < (int64_t) (trunk_bytes + mtp_bytes)) {
+                // the longest context at which everything, MTP included, stays in VRAM
+                const int64_t per_token = (int64_t) (n_attn + 1) * 2 * HK * D * 2;          // KV bytes per token, MTP layer too
+                const int64_t room = (int64_t) free_b - (int64_t) margin - (int64_t) (trunk_bytes + mtp_bytes) -
+                                     (int64_t) ((uint64_t) n_gdn * snap_one * (uint64_t) draft_max);
+                const int64_t fit_ctx = room > 0 ? (room / per_token) / 1024 * 1024 : 0;
                 std::fprintf(stderr,
-                             "strata-dense: MTP is OFF: the weights (%.2f GiB with the MTP block) and the snapshots do not all fit "
-                             "in the %.2f GiB of VRAM left for them, so some would be read over PCIe on every token - slower, "
-                             "not faster. Use a shorter --context, a smaller quant or --draft-max 1; --mtp-force keeps it anyway.\n",
-                             (trunk_bytes + mtp_bytes) / 1073741824.0, std::max<int64_t>(0, budget_for(true)) / 1073741824.0);
+                             "strata-dense: MTP is OFF: the weights (%.2f GiB with the MTP block), the KV cache for %lld tokens and "
+                             "the %d rollback snapshot(s) do not all fit in VRAM, so some weights would be read over PCIe on every "
+                             "token - slower, not faster.%s\n",
+                             (trunk_bytes + mtp_bytes) / 1073741824.0, (long long) max_context, draft_max,
+                             fit_ctx >= 2048 ? "" : " Even a short context would not fit: use a smaller quant.");
+                if (fit_ctx >= 2048)
+                    std::fprintf(stderr, "strata-dense:   with MTP on, a --context up to about %lld tokens fits in this GPU "
+                                 "(or use --draft-max 1); --mtp-force keeps MTP at the current context anyway.\n",
+                                 (long long) fit_ctx);
                 with_mtp = false;
             }
             const uint64_t reserved = reserved_for(with_mtp);
@@ -857,7 +947,8 @@ bool DenseModel::run(const int32_t* tokens, int n, Logits lg, bool keep_hidden, 
     const int64_t pos0 = pos_;
     const bool dbg = I.dbg_from >= 0 && pos0 < I.dbg_to && pos0 + n > I.dbg_from;
     try {
-        if (!I.upload_embeddings(I.embd, tokens, n, E, cfg_.n_vocab, I.x, err)) return false;
+        if (I.prof.enabled) I.prof.begin(s);
+        if (!I.upload_embeddings(I.embd, tokens, n, E, cfg_.n_vocab, I.x, err)) { I.prof.on = false; return false; }
         if (dbg) trace_vec("embed", pos0, -1, "", I.x, n * E, s);
 
         for (int l = 0; l < cfg_.n_layer; ++l) {
@@ -885,8 +976,10 @@ bool DenseModel::run(const int32_t* tokens, int n, Logits lg, bool keep_hidden, 
             }
             if (dbg && lg != Logits::None) trace_logits(pos0 + n - 1, I.logits, cfg_.n_vocab, s);
         }
+        if (I.prof.on) I.prof.finish(s, n);
         return true;
     } catch (const std::exception& e) {
+        I.prof.on = false;
         err = std::string("dense model: ") + e.what();
         return false;
     }
