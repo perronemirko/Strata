@@ -12,8 +12,12 @@ namespace strata::prefill::mmq {
 
 /// This build has the MMQ path (the ggml sources were available to the build).
 bool built();
-/// MMQ covers this ggml type (the i-quants and Q2_0 the packs use, Q8_0, and in a CUDA build with STRATA_MMQ_KQUANTS
-/// the Q4_K / Q5_K / Q5_1 of Unsloth's UD-Q4_K_XL; IQ1_M is not covered).
+/// MMQ covers this ggml type IN THIS BUILD.  Always covered: the i-quants and Q2_0 the packs use, Q8_0, and the
+/// Q2_K / Q3_K / Q4_0 / Q4_1 / Q5_0 / Q5_1 / IQ1_S a UD pack mixes in layer by layer.  Q4_K / Q5_K / Q6_K are covered
+/// only when the build asked for them (STRATA_MMQ_KQUANTS or STRATA_DENSE_PREFILL on CUDA, always on HIP); IQ1_M never
+/// is.  The answer comes from the generated strata/prefill/mmq_types.inc, the same list that decides which
+/// mmq-instance-<type>.cu files were compiled, so a true here always has a kernel behind it.  Callers that get false
+/// fall back to run()/the FP16 expert path, which is correct but ~100x slower on a long prompt.
 bool supported(int ggml_type);
 /// #420: `supported`, and on every visible GPU llama.cpp's MMQ has a tile for this type and a weight matrix of
 /// `w_rows` rows that fits the card's shared memory - the same test its tile choice makes, which aborts the process

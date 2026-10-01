@@ -609,15 +609,32 @@ const MmqPlan& mmq_plan() {
         const int64_t layers = lay.native ? (int64_t) lay.fmt.size() : lay.n_layers;
         p.layer.assign((size_t) std::max<int64_t>(layers, 0), 0);
         p.fallback = !on || layers <= 0;
+        int64_t blocked = 0;
+        int blocked_gt = -1, blocked_dt = -1;
         for (int64_t l = 0; on && l < layers; ++l) {
             const int gt = lay.native ? lay.fmt[(size_t) l].gu_type : 42, dt = lay.native ? lay.fmt[(size_t) l].d_type : 42;
             // #420: a tile on every GPU for these shapes (gate+up: 1280 rows, down: N rows), else the FP16 path
             if (!mmq::fits(gt, 1280) || !mmq::fits(dt, N)) { p.fallback = true; continue; }
+            else if (!mmq::supported(gt) || !mmq::supported(dt)) {
+                p.fallback = true;
+                if (!blocked++) { blocked_gt = gt; blocked_dt = dt; }
+                continue;
+            }
             p.layer[(size_t) l] = 1;
             p.any = true;
             p.gu_max = std::max(p.gu_max, mmq::matrix_bytes(gt, 1280, N));
             p.d_max = std::max(p.d_max, mmq::matrix_bytes(dt, N, 640));
         }
+        // A type this build has no MMQ instance for drops the experts of every layer back on the FP16 path, which
+        // costs ~100x on the prompt (docs/UNSLOTH_Q4.md).  STRATA_MMQ_KQUANTS/STRATA_DENSE_PREFILL decide which types
+        // are compiled, so say out loud when one of them is what turned the path off - otherwise the only symptom is a
+        // prefill that is mysteriously slow.
+        if (blocked)
+            std::fprintf(stderr,
+                         "strata prefill: MMQ off for %lld of %lld expert layers - this build has no MMQ instance for "
+                         "GGML type %d/%d (gate/up, down); rebuild with STRATA_MMQ_KQUANTS=ON or STRATA_DENSE_PREFILL=ON "
+                         "for these weights\n",
+                         (long long) blocked, (long long) layers, blocked_gt, blocked_dt);
         return p;
     }();
     return plan;

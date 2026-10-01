@@ -36,8 +36,10 @@ option(STRATA_ENABLE_CUDA "Build the CUDA targets (Phase 2+)" OFF)
 option(STRATA_ENABLE_HIP "Build the HIP targets for wave32 AMD GPUs (gfx1100, gfx1201; gfx1030 unvalidated)" OFF)
 option(STRATA_PREFILL_MMQ "Build the optional GGML MMQ prefill path for HIP" OFF)
 # CUDA: MMQ prompt kernels for Q4_K / Q5_K / Q5_1 (Unsloth's UD-Q4_K_XL experts).  Off by default: the engine loads
-# every kernel when it starts (CUDA_MODULE_LOADING=EAGER), so these took ~5 MB of VRAM - 1-3 expert slots - from every
-# model, and the UD-Q4_K_XL prompt is SSD-bound with or without them (docs/UNSLOTH_Q4.md)
+# every kernel when it starts (CUDA_MODULE_LOADING=EAGER), and each MMQ instance pins ~2.7 MB of device code in VRAM,
+# so these three cost ~8 MB - 3 expert slots - on every model, and the UD-Q4_K_XL prompt is SSD-bound with or without
+# them (docs/UNSLOTH_Q4.md).  cmake/mmq_types.cmake makes the same list drive the compiled instances and
+# mmq::supported(), so turning this off really does drop the types instead of leaving them advertised but missing.
 option(STRATA_MMQ_KQUANTS "Build the CUDA MMQ prompt kernels for Q4_K / Q5_K / Q5_1 experts" OFF)
 option(STRATA_ORCA_Q4KS_MMQ "Build the GGML Q5_0 MMQ instance for OrcaRouter Q4_K_S" OFF)
 # The dense runner (`strata-dense`) feeds a prompt through MMQ instead of 8-token run() groups; it needs the same
@@ -896,11 +898,34 @@ if(STRATA_NATIVE_EXPERTS)
   endif()
   target_link_libraries(strata_kernels_cpu PUBLIC ggml-cpu ggml-base)
   target_compile_definitions(strata_kernels_cpu PUBLIC STRATA_NATIVE_EXPERTS=1)
-  set(_strata_mmq_types q2_0 iq2_xxs iq2_xs iq2_s iq3_xxs iq3_s iq4_nl iq4_xs q8_0)
+  # cmake/mmq_types.cmake: ONE list decides both the mmq-instance-<type>.cu files that get compiled and the
+  # supported()/dispatch table of src/prefill/moe_mmq.cu, so the two can never disagree.
+  include(cmake/mmq_types.cmake)
+  # q8_0: the drafter's matrices (E-9); q2_k q3_k q4_0 q4_1 q5_0 q5_1 iq1_s: the quants a UD pack mixes in layer by
+  # layer (an UD-Q4_K_M Qwen3.8 file stores seven ffn matrices as Q3_K), always built because one uncovered type
+  # switches the whole prompt path off, which costs 100x on prefill.
+  set(_strata_mmq_types q2_0 iq2_xxs iq2_xs iq2_s iq3_xxs iq3_s iq4_nl iq4_xs q8_0
+                       q2_k q3_k q4_0 q4_1 q5_0 q5_1 iq1_s)
   # #296: OrcaRouter Q4_K_S's Q5_0 experts (Q4_K and Q5_1 come with STRATA_MMQ_KQUANTS on CUDA, S5's branch)
   if(STRATA_ORCA_Q4KS_MMQ)
     list(APPEND _strata_mmq_types q5_0)
   endif()
+  # q4_k q5_k q6_k: Unsloth's UD-Q4_K_XL experts (docs/UNSLOTH_Q4.md) and the weight types of the dense model itself.
+  # Each MMQ instance costs ~2.7 MB of device code that CUDA_MODULE_LOADING=EAGER pins in VRAM at startup, so on CUDA
+  # they are only built when something needs them; a build that leaves them out reports it and stays on run().
+  if(STRATA_ENABLE_CUDA)
+    if(STRATA_MMQ_KQUANTS)
+      list(APPEND _strata_mmq_types q4_k q5_k q5_1)
+    endif()
+    if(STRATA_DENSE_PREFILL)
+      list(APPEND _strata_mmq_types q4_k q5_k q6_k)
+    endif()
+  else()
+    # HIP has no KQUANTS switch and its own tuning story (docs/AMD_HIP.md): keep the K-quants always available.
+    list(APPEND _strata_mmq_types q4_k q5_k q6_k)
+  endif()
+  list(REMOVE_DUPLICATES _strata_mmq_types)
+  strata_gen_mmq_types(${CMAKE_CURRENT_BINARY_DIR}/gen/strata/prefill/mmq_types.inc "${_strata_mmq_types}")
   if(STRATA_ENABLE_CUDA)
     # prompt-speed plan step 2b: llama.cpp's MMQ kernels (ggml-cuda, MIT) for the prompt path's experts, compiled
     # from the same checkout as ggml above - only mmq.cuh's instances for the packs' types and the quantizer, with
@@ -926,11 +951,12 @@ if(STRATA_NATIVE_EXPERTS)
       list(APPEND _strata_mmq_cuda_types q4_k q5_k q6_k)
     endif()
     list(REMOVE_DUPLICATES _strata_mmq_cuda_types)
-    foreach(_t IN LISTS _strata_mmq_cuda_types)
+    foreach(_t IN LISTS _strata_mmq_cuda_types)    
       target_sources(strata_mmq PRIVATE ${_strata_mmq}/template-instances/mmq-instance-${_t}.cu)
     endforeach()
+    # the generated mmq_types.inc lands in the build tree at generate time, before anything compiles
     target_include_directories(strata_mmq PRIVATE ${_strata_gg}/include ${_strata_gg}/src ${_strata_mmq}
-                               PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+                               PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_BINARY_DIR}/gen)
     target_compile_options(strata_mmq PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--extended-lambda -use_fast_math>)
     if(MSVC)
       target_compile_options(strata_mmq PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/bigobj>)
@@ -941,10 +967,6 @@ if(STRATA_NATIVE_EXPERTS)
     endif()
     if(STRATA_ORCA_Q4KS_MMQ)
       target_compile_definitions(strata_mmq PRIVATE STRATA_ORCA_Q4KS_MMQ=1)
-    endif()
-    if(STRATA_DENSE_PREFILL)
-      # the dense runner multiplies its OWN weights through these kernels: supported() and the dispatch must know
-      target_compile_definitions(strata_mmq PRIVATE STRATA_MMQ_DENSE_TYPES=1)
     endif()
     target_link_libraries(strata_prefill PUBLIC strata_mmq)
     target_compile_definitions(strata_prefill PUBLIC STRATA_PREFILL_MMQ=1 STRATA_PREFILL_FUSED=1)
@@ -1001,27 +1023,17 @@ if(STRATA_NATIVE_EXPERTS)
       src/prefill/moe_mmq.cu
       src/prefill/ggml_cuda_host.cu
       "${_strata_mmq}/quantize.cu")
-    # the HIP side mirrors the CUDA one: the pack types, the UD packs' mixed quants, plus q4_k q5_k q6_k
-    # for the dense runner
-    set(_strata_mmq_hip_types ${_strata_mmq_types} q2_k q3_k q4_0 q4_1 q5_0 q5_1 iq1_s)
-    if(STRATA_DENSE_PREFILL)
-      list(APPEND _strata_mmq_hip_types q4_k q5_k q6_k)
-    endif()
-    list(REMOVE_DUPLICATES _strata_mmq_hip_types)
-    foreach(_t IN LISTS _strata_mmq_hip_types)
+    foreach(_t IN LISTS _strata_mmq_types)
       list(APPEND _strata_mmq_sources "${_strata_mmq}/template-instances/mmq-instance-${_t}.cu")
     endforeach()
     set_source_files_properties(${_strata_mmq_sources} PROPERTIES LANGUAGE HIP)
     add_library(strata_mmq STATIC ${_strata_mmq_sources})
     target_include_directories(strata_mmq
       PRIVATE "${_strata_gg}/include" "${_strata_gg}/src" "${_strata_mmq}"
-      PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+      PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_BINARY_DIR}/gen)
     target_compile_definitions(strata_mmq PRIVATE GGML_USE_HIP=1)
     if(STRATA_ORCA_Q4KS_MMQ)
       target_compile_definitions(strata_mmq PRIVATE STRATA_ORCA_Q4KS_MMQ=1)
-    endif()
-    if(STRATA_DENSE_PREFILL)
-      target_compile_definitions(strata_mmq PRIVATE STRATA_MMQ_DENSE_TYPES=1)
     endif()
     target_link_libraries(strata_mmq PUBLIC ggml-base hip::host roc::hipblas)
     target_link_libraries(strata_prefill PUBLIC strata_mmq)
