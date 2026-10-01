@@ -56,4 +56,55 @@ uint64_t dense_attn_scratch_bytes(int n_head, int head_dim, int max_ctx);
 void dense_attn_decode(const float* q, const uint16_t* k_cache, const uint16_t* v_cache, float* out, float* scratch,
                        int n_head, int n_kv, int head_dim, int n_ctx, int max_ctx, float scale, void* stream);
 
+// ============================ the batched prompt path (T consecutive tokens at a time) ============================
+//
+// Same arithmetic as the per-token kernels above, with the token as the slow index: every buffer is [T, ...] and the
+// order-dependent steps (the GDN conv and delta-rule state, the KV append, the causal mask) walk the tokens inside
+// one launch.  Feeding a chunk therefore has to land on the same logits as feeding those tokens one at a time.
+
+/// q[r, :] = q_full[r, 0:head_dim] for r in [0, rows): the query half of every head's [q | gate] block.  q_full is
+/// [rows, 2*head_dim] and q is [rows, head_dim] (rows = T * n_head).
+void dense_split_q(const float* q_full, float* q, int rows, int head_dim, void* stream);
+
+/// out[i] = attn[i] * sigmoid(gate) with the gate the second half of every head's q_full block (rows = T * n_head).
+void dense_gate_apply(const float* attn, const float* q_full, float* out, int rows, int n_head, int head_dim,
+                      void* stream);
+
+/// dst[i] = pos0 + i / heads   (the position of every row of a [T, heads, head_dim] tensor)
+void dense_positions_i32(int32_t* dst, int rows, int heads, int32_t pos0, void* stream);
+
+/// K and V of T consecutive cells (k/v are [T, n_kv, head_dim] f32) into cells pos0..pos0+T-1 of every cache.
+void dense_kv_append_rows(uint16_t* k_cache, uint16_t* v_cache, const float* k, const float* v, int T, int pos0,
+                          int n_kv, int head_dim, int max_ctx, void* stream);
+
+/// Causal attention for T consecutive queries at positions pos0..pos0+T-1: one block per (head, token), the same
+/// warp-per-cell online softmax as dense_attn_decode, restricted to cells [0, pos0 + t].  q is [T, n_head, head_dim]
+/// f32 (normalised and rotated), out is the same shape.
+void dense_attn_chunk(const float* q, const uint16_t* k_cache, const uint16_t* v_cache, float* out, int T, int pos0,
+                      int n_head, int n_kv, int head_dim, int max_ctx, float scale, void* stream);
+
+/// y[r, :] = W x[r, :] for r in [0, rows): the batched form of dense_gemv_f32 (one warp per output row per input row).
+void dense_gemv_f32_rows(const float* W, const float* X, float* y, int n_in, int n_out, int rows, void* stream);
+
+/// The 4-tap causal conv + SiLU over a chunk: history is [channels, 3] (oldest first, updated in place to the
+/// chunk's last three inputs), qkv and h are [T, channels].  Only the SiLU output is written (the decode path keeps
+/// the raw conv output in its own buffer; the prompt path does not need it).
+void dense_gdn_conv_chunk(float* history, const float* qkv, const float* conv_w, float* h, int channels, int T,
+                          void* stream);
+
+/// In-place L2 norm of the q and k heads of every token of a chunk: row (t, r) of the norm lives at
+/// h + t*channels + base + r*cols, cols = 128 (the heads of one token are contiguous inside the token's C channels).
+/// The same scaling as native_gdn_l2_norm.
+void dense_gdn_l2_norm(float* h, int T, int channels, int base, int rows_per_token, int cols, float eps, void* stream);
+
+/// gate[t, h] = softplus(alpha[t, h] + dt[h]) * ssm_a[h];  beta[t, h] = sigmoid(beta[t, h])   (heads = 48)
+void dense_gdn_gates(const float* alpha, const float* dt, const float* ssm_a, float* gate, float* beta, int heads,
+                     int rows, void* stream);
+
+/// The delta-rule recurrence over a chunk, state in registers, block per (value head, 32 state columns), walking the
+/// T tokens in order, then the output norm y = rms_norm(o) * gamma * SiLU(z) - SiLU, not the MoE path's sigmoid.
+/// h is [T, 2*S*k_heads + S*v_heads], gate/beta [T, v_heads], z and y [T, v_heads * S], state [S, v_heads, S].
+void dense_gdn_rec_chunk(float* state, const float* h, const float* gate, const float* beta, const float* z,
+                         const float* gamma, float eps, float* y, int k_heads, int v_heads, int T, void* stream);
+
 }  // namespace strata::kernels

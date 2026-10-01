@@ -1,4 +1,4 @@
-# Strata Engine - top-level build (P1.S1).
+﻿# Strata Engine - top-level build (P1.S1).
 #
 # Targets (phase-1 Ă‚Â§P1.S1): `strata_artifact` (no CUDA dependency), `tests`.  `strata_plan` and the C++
 # `strata-pack` are added when their sources exist - a target with no sources would make the build graph
@@ -40,6 +40,9 @@ option(STRATA_PREFILL_MMQ "Build the optional GGML MMQ prefill path for HIP" OFF
 # model, and the UD-Q4_K_XL prompt is SSD-bound with or without them (docs/UNSLOTH_Q4.md)
 option(STRATA_MMQ_KQUANTS "Build the CUDA MMQ prompt kernels for Q4_K / Q5_K / Q5_1 experts" OFF)
 option(STRATA_ORCA_Q4KS_MMQ "Build the GGML Q5_0 MMQ instance for OrcaRouter Q4_K_S" OFF)
+# The dense runner (`strata-dense`) feeds a prompt through MMQ instead of 8-token run() groups; it needs the same
+# GGML MMQ instances strata_mmq compiles, so it is switched off with them.
+option(STRATA_DENSE_PREFILL "Batched MMQ prompt prefill for strata-dense (needs the strata_mmq MMQ kernels)" ON)
 if(STRATA_PREFILL_MMQ AND NOT STRATA_ENABLE_HIP)
   message(FATAL_ERROR "STRATA_PREFILL_MMQ requires STRATA_ENABLE_HIP=ON")
 endif()
@@ -919,6 +922,10 @@ if(STRATA_NATIVE_EXPERTS)
     if(STRATA_MMQ_KQUANTS)
       list(APPEND _strata_mmq_cuda_types q4_k q5_k q5_1)
     endif()
+    if(STRATA_DENSE_PREFILL)
+      list(APPEND _strata_mmq_cuda_types q4_k q5_k q6_k)
+    endif()
+    list(REMOVE_DUPLICATES _strata_mmq_cuda_types)
     foreach(_t IN LISTS _strata_mmq_cuda_types)
       target_sources(strata_mmq PRIVATE ${_strata_mmq}/template-instances/mmq-instance-${_t}.cu)
     endforeach()
@@ -934,6 +941,10 @@ if(STRATA_NATIVE_EXPERTS)
     endif()
     if(STRATA_ORCA_Q4KS_MMQ)
       target_compile_definitions(strata_mmq PRIVATE STRATA_ORCA_Q4KS_MMQ=1)
+    endif()
+    if(STRATA_DENSE_PREFILL)
+      # the dense runner multiplies its OWN weights through these kernels: supported() and the dispatch must know
+      target_compile_definitions(strata_mmq PRIVATE STRATA_MMQ_DENSE_TYPES=1)
     endif()
     target_link_libraries(strata_prefill PUBLIC strata_mmq)
     target_compile_definitions(strata_prefill PUBLIC STRATA_PREFILL_MMQ=1 STRATA_PREFILL_FUSED=1)
@@ -956,6 +967,16 @@ if(STRATA_NATIVE_EXPERTS)
       add_test(NAME prefill_mmq_kquant_test COMMAND prefill_mmq_kquant_test)
       set_tests_properties(prefill_mmq_kquant_test PROPERTIES TIMEOUT 120)
     endif()
+    # strata_engine holds src/core/dense_model.cpp, whose prompt path multiplies the model's OWN weights through
+    # these same MMQ kernels (prefill_setup()/prefill()).  strata_mmq does not depend on strata_engine, so this edge
+    # is safe - the reverse one (strata_engine -> strata_prefill) would be a cycle, since strata_prefill already
+    # links strata_engine.
+    if(STRATA_DENSE_PREFILL AND TARGET strata_mmq)
+      target_link_libraries(strata_engine PUBLIC strata_mmq)
+      target_compile_definitions(strata_engine PUBLIC STRATA_DENSE_MMQ=1)
+    elseif(STRATA_DENSE_PREFILL)
+      message(STATUS "strata-dense: no strata_mmq target - the dense prompt path stays on run()")
+    endif()
   elseif(STRATA_PREFILL_MMQ)
     # Compile only the pinned GGML MMQ and activation-quantizer sources used by prefill. This uses
     # common.cuh's native HIP path without enabling a second GGML HIP backend.
@@ -972,7 +993,13 @@ if(STRATA_NATIVE_EXPERTS)
       src/prefill/moe_mmq.cu
       src/prefill/ggml_cuda_host.cu
       "${_strata_mmq}/quantize.cu")
-    foreach(_t IN LISTS _strata_mmq_types)
+    # the HIP side mirrors the CUDA one: the pack types, plus q4_k q5_k q6_k for the dense runner
+    set(_strata_mmq_hip_types ${_strata_mmq_types})
+    if(STRATA_DENSE_PREFILL)
+      list(APPEND _strata_mmq_hip_types q4_k q5_k q6_k)
+    endif()
+    list(REMOVE_DUPLICATES _strata_mmq_hip_types)
+    foreach(_t IN LISTS _strata_mmq_hip_types)
       list(APPEND _strata_mmq_sources "${_strata_mmq}/template-instances/mmq-instance-${_t}.cu")
     endforeach()
     set_source_files_properties(${_strata_mmq_sources} PROPERTIES LANGUAGE HIP)
@@ -984,9 +1011,16 @@ if(STRATA_NATIVE_EXPERTS)
     if(STRATA_ORCA_Q4KS_MMQ)
       target_compile_definitions(strata_mmq PRIVATE STRATA_ORCA_Q4KS_MMQ=1)
     endif()
+    if(STRATA_DENSE_PREFILL)
+      target_compile_definitions(strata_mmq PRIVATE STRATA_MMQ_DENSE_TYPES=1)
+    endif()
     target_link_libraries(strata_mmq PUBLIC ggml-base hip::host roc::hipblas)
     target_link_libraries(strata_prefill PUBLIC strata_mmq)
     target_compile_definitions(strata_prefill PUBLIC STRATA_PREFILL_MMQ=1)
+    if(STRATA_DENSE_PREFILL AND TARGET strata_mmq)
+      target_link_libraries(strata_engine PUBLIC strata_mmq)
+      target_compile_definitions(strata_engine PUBLIC STRATA_DENSE_MMQ=1)
+    endif()
 
     # Numerical diagnostic: synthetic layouts by default, optional first-expert IQ3_XXS/IQ4_NL check with a pack.
     add_executable(hip_prefill_mmq_parity tests/hip/prefill_mmq_parity.cpp)

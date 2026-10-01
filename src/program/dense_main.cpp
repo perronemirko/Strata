@@ -1,5 +1,8 @@
 // src/program/dense_main.cpp - `strata-dense --serve --native <model.gguf> --context N`
 //
+// The prompt is read in chunks: through llama.cpp's MMQ int8 tensor-core kernels when the build has them
+// (--prompt-chunk N, the default path), otherwise NC tokens at a time through the FP32 GEMVs (--no-prefill).
+//
 // The dense-model twin of `strata --serve`.  It speaks the SAME line protocol on stdin/stdout, so serve/server.py
 // drives it through its unchanged StrataEngine (tokenizer, chat template, thinking levels, tools, OpenAI and
 // Anthropic endpoints, web app, Monitor):
@@ -88,9 +91,12 @@ bool parse_ids(const char* p, std::vector<int32_t>& ids) {
 void usage() {
     std::fprintf(stderr,
                  "usage: strata-dense --serve --native <model.gguf> [--context N] [--mtp [--draft-max N] [--draft-min N] [--draft-p-min P] [--mtp-force]]\n"
+                 "                  [--prompt-chunk N | --no-prefill]\n"
                  "       strata-dense --selftest | --check <model.gguf> [--mtp]\n"
                  "  a dense qwen35 GGUF (Qwen3.8-27B) behind Strata's server protocol; the server runs it with\n"
-                 "  `serve/server.py --engine strata --config <run config>` whose `exe` is this program.\n");
+                 "  `serve/server.py --engine strata --config <run config>` whose `exe` is this program.\n"
+                 "  --prompt-chunk N feeds the prompt N tokens at a time through MMQ instead of 8 at a time through\n"
+                 "  the GEMVs (0 is the default; --no-prefill forces the old path).\n");
 }
 
 // ---- `strata-dense --selftest`: the new CUDA kernels against a CPU reference, no model needed.
@@ -317,6 +323,16 @@ int check_model(const std::string& gguf, bool with_mtp) {
     }
     verdict("chunks of 3,2,5,1,8,4 vs one at a time", LA, read_logits(m, 0));
 
+    // F: the batched MMQ prompt path over the same tokens.  It multiplies the same weights through different
+    // kernels (int8 tensor cores over a whole chunk), so this is the parity gate for that path.
+    if (m.prefill_setup(16, err)) {
+        m.reset();
+        if (!m.prefill(T.data(), (int64_t) T.size(), Logits::Last, err)) { std::printf("%s\n", err.c_str()); return 1; }
+        verdict("MMQ prefill of 16 tokens at a time vs one at a time", LA, read_logits(m, 0));
+    } else {
+        std::printf("%-50s %s\n", "MMQ prefill vs one at a time", err.c_str());
+    }
+
     if (m.has_mtp()) {
         // C1: three columns with two junk drafts, rolled back to column 0, then the real continuation
         m.reset();
@@ -394,6 +410,8 @@ int main(int argc, char** argv) {
     bool serve = false, want_mtp = false, mtp_force = false;
     int draft_max = 2, draft_min = 1;
     float draft_p_min = 0.0f;
+    // 0: the default prompt chunk; >0: ask for that chunk; <0 (--no-prefill): feed the prompt through run()
+    long long prompt_chunk = 0;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         auto next = [&](const char* what) -> const char* {
@@ -408,6 +426,8 @@ int main(int argc, char** argv) {
         else if (a == "--draft-p-min" || a == "--spec-draft-p-min") draft_p_min = std::strtof(next("--draft-p-min"), nullptr);
         else if (a == "--native" || a == "--model" || a == "--gguf") gguf = next("--native");
         else if (a == "--context" || a == "-c") context = std::atoll(next("--context"));
+        else if (a == "--prompt-chunk" || a == "--pp-chunk") prompt_chunk = std::atoll(next("--prompt-chunk"));
+        else if (a == "--no-prefill") prompt_chunk = -1;
         else if (a == "--help" || a == "-h") { usage(); return 0; }
         // the flags setup passes to `strata` (--gpu-layers, --cache, ...) mean nothing here and are not an error
     }
@@ -438,6 +458,15 @@ int main(int argc, char** argv) {
     const int n_vocab = cfg.n_vocab;
     constexpr int NC = strata::core::DenseModel::kMaxCols;
     using strata::core::Logits;
+
+    // Batched prompt processing: the prompt goes through MMQ in chunks instead of NC-token run() groups.  If the
+    // build has no MMQ, or a weight's type is not one MMQ covers, or the scratch does not fit, this fails and the
+    // prompt loop below keeps using run() exactly as before.
+    if (prompt_chunk >= 0) {
+        std::string perr;
+        if (!model.prefill_setup(prompt_chunk, perr))
+            std::fprintf(stderr, "strata-dense: prompt prefill off - %s\n", perr.c_str());
+    }
 
     // the ids that end an answer, from the model's own vocabulary
     std::vector<int32_t> stop_ids;
@@ -539,23 +568,34 @@ int main(int argc, char** argv) {
             fed.clear();
         };
 
-        // ---- read the prompt, up to NC tokens per pass (the GEMVs read every weight once per pass)
+        // ---- read the prompt.  With the MMQ prefill available a pass is prefill_chunk() tokens wide and every
+        // weight is read once per pass; without it a pass is NC tokens (the GEMVs read every weight once per pass).
+        // Either way the PP progress lines and the STOP check run at the same granularity.
         bool cancelled = false, failed = false;
         const auto t_prompt = Clock::now();
         auto t_pp = Clock::now();
         int64_t since_pp = 0;
+        const bool use_pf = model.prefill_ready();
+        const int64_t pf_step = model.prefill_chunk();      // STOP is checked between steps
         for (int64_t i = (int64_t) resume; i < n && !failed;) {
-            const int chunk = (int) std::min<int64_t>(NC, n - i);
-            const bool last = (i + chunk == n);
-            if (!model.run(&ids[(size_t) i], chunk, last ? Logits::Last : Logits::None, model.has_mtp(), false, err) ||
-                (model.has_mtp() && !model.mtp_ingest(&ids[(size_t) i], chunk, (int) i, 0, err))) {
+            const int64_t step = std::min<int64_t>(use_pf ? pf_step : (int64_t) NC, n - i);
+            const bool last = (i + step == n);
+            bool ok = false;
+            if (use_pf) {
+                ok = model.prefill(&ids[(size_t) i], step, last ? Logits::Last : Logits::None, err);
+            } else {
+                const int chunk = (int) step;
+                ok = model.run(&ids[(size_t) i], chunk, last ? Logits::Last : Logits::None, model.has_mtp(), false, err) &&
+                     (!model.has_mtp() || model.mtp_ingest(&ids[(size_t) i], chunk, (int) i, 0, err));
+            }
+            if (!ok) {
                 fail(err);
                 failed = true;
                 break;
             }
-            fed.insert(fed.end(), ids.begin() + i, ids.begin() + i + chunk);
-            i += chunk;
-            since_pp += chunk;
+            fed.insert(fed.end(), ids.begin() + i, ids.begin() + i + step);
+            i += step;
+            since_pp += step;
             if (in.stop.load()) { cancelled = true; model.sync(err); break; }
             if (since_pp >= 32 || last) {
                 if (!model.sync(err)) { fail(err); failed = true; break; }

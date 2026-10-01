@@ -11,6 +11,9 @@
 #include "strata/kernels/native_qsa.hpp"
 #include "strata/kernels/native_rope.hpp"
 #include "strata/kernels/sampler.hpp"
+#ifdef STRATA_DENSE_MMQ
+#include "strata/prefill/moe_mmq.hpp"
+#endif
 
 #include <cuda_runtime.h>
 
@@ -268,6 +271,37 @@ struct DenseModel::Impl {
     void* q8_1 = nullptr;                           // shared activation scratch of the native GEMVs
     int64_t max_context = 0;
 
+    // ---- the batched prompt path (prefill_setup() / prefill()); see the block definitions below.
+#ifdef STRATA_DENSE_MMQ
+    struct Pf {
+        int64_t T = 0;
+        strata::prefill::mmq::Context ctx;      // MMQ keeps a small scratch pool for its stream-k fixup
+        float *x = nullptr, *xn = nullptr, *mix = nullptr;
+        float *qkv = nullptr, *h = nullptr, *alpha = nullptr, *beta = nullptr, *gate = nullptr;
+        float *z = nullptr, *y = nullptr;
+        float *q_full = nullptr, *qcur = nullptr, *kcur = nullptr, *vcur = nullptr;
+        float *attn = nullptr, *attn32 = nullptr;
+        float *ffn_g = nullptr, *ffn_u = nullptr, *ffn_h = nullptr;
+        float* stage = nullptr;                 // pinned embedding stage, T rows
+        int32_t* pos_dev = nullptr;             // the position of every row, for RoPE
+        void* xq = nullptr;                     // the q8_1 activations MMQ multiplies with
+        int32_t* ids = nullptr;                 // iota: MMQ writes each row back to its own index
+        int32_t* bounds = nullptr;              // {0, T}: one group, the whole chunk
+        // Pinned twins of bounds, cycled so a chunk never overwrites a copy the stream has not read yet.
+        static constexpr int kBoundsSlots = 8;
+        int32_t* bounds_host = nullptr;
+        int bounds_slot = 0;
+        std::vector<void*> allocs;              // this arena's cudaMalloc'ed buffers (freed by ~Pf)
+
+        ~Pf() {
+            for (void* p : allocs) cudaFree(p);
+            if (stage) cudaFreeHost(stage);
+            if (bounds_host) cudaFreeHost(bounds_host);
+        }
+    };
+    std::unique_ptr<Pf> pf;
+#endif
+
     // activations (device, f32), NC columns each
     float *x = nullptr, *xn = nullptr, *mix = nullptr;
     float *qkv = nullptr, *conv_out = nullptr, *h = nullptr, *alpha = nullptr, *beta = nullptr, *gate = nullptr;
@@ -414,14 +448,16 @@ struct DenseModel::Impl {
     }
 
     // n embedding rows -> device, one copy; the pinned stage is reused only after the previous copy finished
-    bool upload_embeddings(const EmbdSrc& src, const int32_t* toks, int n, int E, int n_vocab, float* dst, std::string& err) {
+    bool upload_embeddings(const EmbdSrc& src, const int32_t* toks, int n, int E, int n_vocab, float* dst,
+                           std::string& err, float* stage = nullptr) {
+        float* st = stage ? stage : embd_stage;
         if (cudaEventSynchronize(embed_done) != cudaSuccess) { err = "dense model: embedding event"; return false; }
         for (int j = 0; j < n; ++j) {
             if (toks[j] < 0 || toks[j] >= n_vocab) { err = "dense model: token id outside the vocabulary"; return false; }
             const uint8_t* row = src.f.file->tensor_data(*src.f.tensor) + (size_t) toks[j] * src.row_bytes;
-            if (!dequant_row(src.type, row, E, embd_stage + (size_t) j * E)) { err = "dense model: embedding dequantization"; return false; }
+            if (!dequant_row(src.type, row, E, st + (size_t) j * E)) { err = "dense model: embedding dequantization"; return false; }
         }
-        cudaMemcpyAsync(dst, embd_stage, (size_t) n * E * 4, cudaMemcpyHostToDevice, stream);
+        cudaMemcpyAsync(dst, st, (size_t) n * E * 4, cudaMemcpyHostToDevice, stream);
         cudaEventRecord(embed_done, stream);
         return true;
     }
@@ -442,6 +478,17 @@ struct DenseModel::Impl {
                     const float* qn, const float* kn, uint16_t* kc, uint16_t* vc, int n, int pos0, void* s);
     void ffn_block(const DenseConfig& c, const QMat& g, const QMat& u, const QMat& d, const float* post_norm, int n, void* s);
     bool mtp_block(const DenseConfig& c, int n, int pos0, bool want_logits, void* s);
+
+#ifdef STRATA_DENSE_MMQ
+    // ---- the same blocks over a chunk of T tokens, reading and writing Pf instead of the NC-column buffers.
+    void pf_quantize(const float* src, int wtype, int n_in, int64_t T, void* s);
+    void pf_gemv(const QMat& w, float* y, int64_t T, void* s);
+    void pf_gdn_block(const DenseConfig& c, Layer& L, int64_t T, void* s);
+    void pf_attn_block(const DenseConfig& c, const QMat& wq, const QMat& wk, const QMat& wv, const QMat& wo,
+                       const float* qn, const float* kn, uint16_t* kc, uint16_t* vc, int64_t T, int pos0, void* s);
+    void pf_ffn_block(const DenseConfig& c, const QMat& g, const QMat& u, const QMat& d, const float* post_norm,
+                      int64_t T, void* s);
+#endif
 };
 
 void DenseModel::Impl::gdn_block(const DenseConfig& c, Layer& L, int n, bool snapshot, void* s) {
@@ -530,6 +577,114 @@ void DenseModel::Impl::ffn_block(const DenseConfig& c, const QMat& g, const QMat
     add_inplace(x, mix, (int64_t) n * E, s);
 }
 
+#ifdef STRATA_DENSE_MMQ
+// ============================================================================ the batched prompt blocks
+// The same arithmetic as the blocks above over a chunk of T tokens.  The projections go through MMQ: the weights
+// stay in their GGUF blocks, the activations are rounded to q8_1 and the products run on int8 tensor cores, so a
+// weight is read once per CHUNK instead of once per eight tokens.
+
+/// q8_1 activations for the next pf_gemv().  The layout MMQ wants depends on the WEIGHT type, so every type change
+/// needs its own pass over the activations.
+void DenseModel::Impl::pf_quantize(const float* src, int wtype, int n_in, int64_t T, void* s) {
+    PScope ps(&prof, Prof::QUANT, s);
+    strata::prefill::mmq::quantize(src, nullptr, pf->xq, wtype, n_in, n_in, T, s);
+}
+
+/// y[t, :] = W x[t, :] for the T rows already quantized into pf->xq (one MMQ group: the whole chunk).
+void DenseModel::Impl::pf_gemv(const QMat& w, float* y, int64_t T, void* s) {
+    PScope ps(&prof, w.type == 12 ? Prof::GEMV_Q4K : w.type == 14 ? Prof::GEMV_Q6K
+                                : w.type == 8 ? Prof::GEMV_Q80 : Prof::GEMV_OTHER, s);
+    strata::prefill::mmq::Product p;
+    p.w = w.dev;
+    p.type = w.type;
+    p.w_rows = w.n_out;
+    p.w_cols = w.n_in;
+    p.expert_bytes = strata::prefill::mmq::matrix_bytes(w.type, w.n_out, w.n_in);   // one group: never stepped over
+    p.n = 1;
+    p.xq = pf->xq;
+    p.bounds = pf->bounds;                    // {0, T}
+    p.ids = pf->ids;                          // iota: each row goes back to its own index
+    p.total_rows = T;
+    p.max_rows = T;
+    p.dst = y;
+    p.ld_dst = w.n_out;
+    pf->ctx.run(p, s);
+}
+
+void DenseModel::Impl::pf_gdn_block(const DenseConfig& c, Layer& L, int64_t T, void* s) {
+    const int C = c.conv_channels(), V = c.value_dim(), E = c.n_embd;
+    const int S = c.ssm_state, KH = c.ssm_k_heads, VH = c.ssm_v_heads;
+    pf_quantize(pf->xn, L.qkv.type, E, T, s);
+    pf_gemv(L.qkv, pf->qkv, T, s);
+    if (L.z.type != L.qkv.type) pf_quantize(pf->xn, L.z.type, E, T, s);
+    pf_gemv(L.z, pf->z, T, s);
+    if (L.ab_quant) {                         // the two tiny projections, quantized in the file
+        if (L.alpha_q.type != L.z.type) pf_quantize(pf->xn, L.alpha_q.type, E, T, s);
+        pf_gemv(L.alpha_q, pf->alpha, T, s);
+        if (L.beta_q.type != L.alpha_q.type) pf_quantize(pf->xn, L.beta_q.type, E, T, s);
+        pf_gemv(L.beta_q, pf->beta, T, s);
+    } else {
+        dense_gemv_f32_rows(L.alpha_w, pf->xn, pf->alpha, E, VH, (int) T, s);
+        dense_gemv_f32_rows(L.beta_w, pf->xn, pf->beta, E, VH, (int) T, s);
+    }
+    {
+        PScope ps_gdn(&prof, Prof::GDN_LOOP, s);
+        // conv + SiLU over the chunk (the 3-value history carries over), the L2 norm of the q and k heads of every
+        // token, the per-head gates, then the delta-rule recurrence walking the chunk with the output norm folded in.
+        dense_gdn_conv_chunk(L.conv_state, pf->qkv, L.conv_w, pf->h, C, (int) T, s);
+        dense_gdn_l2_norm(pf->h, (int) T, C, 0, KH, S, c.rms_eps, s);
+        dense_gdn_l2_norm(pf->h, (int) T, C, S * KH, KH, S, c.rms_eps, s);
+        dense_gdn_gates(pf->alpha, L.dt, L.ssm_a, pf->gate, pf->beta, VH, (int) T, s);
+        dense_gdn_rec_chunk(L.state, pf->h, pf->gate, pf->beta, pf->z, L.ssm_norm, c.rms_eps, pf->y, KH, VH, (int) T, s);
+    }
+    pf_quantize(pf->y, L.ssm_out.type, V, T, s);
+    pf_gemv(L.ssm_out, pf->mix, T, s);
+}
+
+void DenseModel::Impl::pf_attn_block(const DenseConfig& c, const QMat& wq, const QMat& wk, const QMat& wv,
+                                     const QMat& wo, const float* qn, const float* kn, uint16_t* kc, uint16_t* vc,
+                                     int64_t T, int pos0, void* s) {
+    const int E = c.n_embd, H = c.n_head, HK = c.n_head_kv, D = c.head_dim;
+    pf_quantize(pf->xn, wq.type, E, T, s);
+    pf_gemv(wq, pf->q_full, T, s);
+    if (wk.type != wq.type) pf_quantize(pf->xn, wk.type, E, T, s);
+    pf_gemv(wk, pf->kcur, T, s);
+    if (wv.type != wk.type) pf_quantize(pf->xn, wv.type, E, T, s);
+    pf_gemv(wv, pf->vcur, T, s);
+    const float scale = 1.0f / std::sqrt((float) D);
+    {
+        PScope ps_attn(&prof, Prof::ATTN_LOOP, s);
+        // q is the first head_dim of every head's [q | gate] block; the norms and RoPE are per row, so they batch.
+        dense_split_q(pf->q_full, pf->qcur, (int) (T * H), D, s);
+        rms_norm_weighted(pf->qcur, qn, T * H, D, c.rms_eps, s);
+        rms_norm_weighted(pf->kcur, kn, T * HK, D, c.rms_eps, s);
+        dense_positions_i32(pf->pos_dev, (int) (T * H), H, (int32_t) pos0, s);
+        native_rope_apply(pf->qcur, pf->qcur, (int) (T * H), D, c.n_rot, rope, pf->pos_dev, s);
+        dense_positions_i32(pf->pos_dev, (int) (T * HK), HK, (int32_t) pos0, s);
+        native_rope_apply(pf->kcur, pf->kcur, (int) (T * HK), D, c.n_rot, rope, pf->pos_dev, s);
+        dense_kv_append_rows(kc, vc, pf->kcur, pf->vcur, (int) T, pos0, HK, D, (int) max_context, s);
+        dense_attn_chunk(pf->qcur, kc, vc, pf->attn, (int) T, pos0, H, HK, D, (int) max_context, scale, s);
+        dense_gate_apply(pf->attn, pf->q_full, pf->attn32, (int) (T * H), H, D, s);
+    }
+    pf_quantize(pf->attn32, wo.type, H * D, T, s);
+    pf_gemv(wo, pf->mix, T, s);
+}
+
+void DenseModel::Impl::pf_ffn_block(const DenseConfig& c, const QMat& g, const QMat& u, const QMat& d,
+                                    const float* post_norm, int64_t T, void* s) {
+    const int E = c.n_embd;
+    dense_rms_norm(pf->x, post_norm, pf->xn, (int) T, E, c.rms_eps, s);
+    pf_quantize(pf->xn, g.type, E, T, s);
+    pf_gemv(g, pf->ffn_g, T, s);
+    if (u.type != g.type) pf_quantize(pf->xn, u.type, E, T, s);
+    pf_gemv(u, pf->ffn_u, T, s);
+    dense_swiglu(pf->ffn_g, pf->ffn_u, pf->ffn_h, (int64_t) T * c.n_ff, s);
+    pf_quantize(pf->ffn_h, d.type, c.n_ff, T, s);
+    pf_gemv(d, pf->mix, T, s);
+    add_inplace(pf->x, pf->mix, (int64_t) T * E, s);
+}
+#endif  // STRATA_DENSE_MMQ
+
 // The MTP block over n columns whose [e_norm | h_norm] inputs are in `cat`.  Leaves the head's logits for the
 // last column in mtp_logits when asked.
 bool DenseModel::Impl::mtp_block(const DenseConfig& c, int n, int pos0, bool want_logits, void* s) {
@@ -557,6 +712,9 @@ DenseModel::~DenseModel() {
     if (impl_->stream) cudaStreamSynchronize(impl_->stream);
     for (void* p : impl_->allocations) cudaFree(p);
     for (void* p : impl_->host_allocs) cudaFreeHost(p);
+#ifdef STRATA_DENSE_MMQ
+    if (impl_->pf && impl_->pf->stage) cudaFreeHost(impl_->pf->stage);
+#endif
     if (impl_->embd_stage) cudaFreeHost(impl_->embd_stage);
     if (impl_->embed_done) cudaEventDestroy(impl_->embed_done);
     if (impl_->stream) cudaStreamDestroy(impl_->stream);
@@ -983,6 +1141,193 @@ bool DenseModel::run(const int32_t* tokens, int n, Logits lg, bool keep_hidden, 
         err = std::string("dense model: ") + e.what();
         return false;
     }
+}
+
+// ============================================================================ batched prompt processing
+//
+// run() serves at most kMaxCols columns, so a prompt reads every weight once per eight tokens.  prefill() walks the
+// prompt in chunks of prefill_chunk() tokens instead: the projections go through MMQ (the weights stay in their GGUF
+// blocks, the activations are rounded to q8_1, the products run on int8 tensor cores) and the order-dependent steps
+// walk the chunk's tokens inside one launch.  The recurrent state, the KV cache and the position advance exactly as
+// they do through run(), so the logits match.
+bool DenseModel::prefill_ready() const { return pf_ready_; }
+int64_t DenseModel::prefill_chunk() const { return pf_chunk_; }
+
+bool DenseModel::prefill_setup(int64_t chunk, std::string& err) {
+    pf_ready_ = false;
+    pf_chunk_ = 0;
+#ifdef STRATA_DENSE_MMQ
+    Impl& I = *impl_;
+    if (chunk <= 0) chunk = kPrefillDefaultCols;
+    chunk = std::max<int64_t>(NC, std::min<int64_t>(chunk, kPrefillMaxCols));
+    const int E = cfg_.n_embd, C = cfg_.conv_channels(), V = cfg_.value_dim();
+    const int H = cfg_.n_head, HK = cfg_.n_head_kv, D = cfg_.head_dim;
+
+    // Every projection the prompt path runs has to be a type MMQ covers; if one is not, the caller feeds the prompt
+    // through run() and loses nothing.
+    auto mat_ok = [&](const QMat& w, const char* what) {
+        if (w.dev && !strata::prefill::mmq::supported(w.type)) {
+            err = std::string("dense model: prefill cannot multiply ") + what + " of GGUF type " +
+                  std::to_string(w.type) + "; feed the prompt with run() instead";
+            return false;
+        }
+        return true;
+    };
+    for (size_t l = 0; l < I.layers.size(); ++l) {
+        const Layer& L = I.layers[l];
+        const std::string p = "layer " + std::to_string(l);
+        if (!L.attn) {
+            if (!mat_ok(L.qkv, (p + " attn_qkv").c_str()) || !mat_ok(L.z, (p + " attn_gate").c_str()) ||
+                !mat_ok(L.ssm_out, (p + " ssm_out").c_str()))
+                return false;
+            if (L.ab_quant && (!mat_ok(L.alpha_q, (p + " ssm_alpha").c_str()) ||
+                               !mat_ok(L.beta_q, (p + " ssm_beta").c_str())))
+                return false;
+        } else if (!mat_ok(L.q, (p + " attn_q").c_str()) || !mat_ok(L.k, (p + " attn_k").c_str()) ||
+                   !mat_ok(L.v, (p + " attn_v").c_str()) || !mat_ok(L.o, (p + " attn_output").c_str()))
+            return false;
+        if (!mat_ok(L.ffn_gate, (p + " ffn_gate").c_str()) || !mat_ok(L.ffn_up, (p + " ffn_up").c_str()) ||
+            !mat_ok(L.ffn_down, (p + " ffn_down").c_str()))
+            return false;
+    }
+
+    I.pf.reset(new Impl::Pf);
+    Impl::Pf& P = *I.pf;
+    P.T = chunk;
+    const uint64_t f = 4, T = (uint64_t) chunk;
+    const int max_in = std::max({E, V, cfg_.n_ff, H * D});
+    auto pf_alloc = [&](void** out, uint64_t bytes, const char* what) {
+        void* p = nullptr;
+        const cudaError_t s = cudaMalloc(&p, bytes ? bytes : 16);
+        if (s != cudaSuccess) {
+            err = std::string("dense model: cannot allocate the prefill scratch ") + what + " (" +
+                  std::to_string(bytes >> 20) + " MiB): " + cudaGetErrorString(s);
+            return false;
+        }
+        P.allocs.push_back(p);
+        *out = p;
+        return true;
+    };
+    bool ok = pf_alloc((void**) &P.x, T * E * f, "x") && pf_alloc((void**) &P.xn, T * E * f, "xn") &&
+              pf_alloc((void**) &P.mix, T * E * f, "mix") && pf_alloc((void**) &P.qkv, T * C * f, "qkv") &&
+              pf_alloc((void**) &P.h, T * C * f, "h") && pf_alloc((void**) &P.alpha, T * cfg_.ssm_v_heads * f, "alpha") &&
+              pf_alloc((void**) &P.beta, T * cfg_.ssm_v_heads * f, "beta") &&
+              pf_alloc((void**) &P.gate, T * cfg_.ssm_v_heads * f, "gate") && pf_alloc((void**) &P.z, T * V * f, "z") &&
+              pf_alloc((void**) &P.y, T * V * f, "y") && pf_alloc((void**) &P.q_full, T * H * 2 * D * f, "q_full") &&
+              pf_alloc((void**) &P.qcur, T * H * D * f, "qcur") && pf_alloc((void**) &P.kcur, T * HK * D * f, "kcur") &&
+              pf_alloc((void**) &P.vcur, T * HK * D * f, "vcur") && pf_alloc((void**) &P.attn, T * H * D * f, "attn") &&
+              pf_alloc((void**) &P.attn32, T * H * D * f, "attn32") &&
+              pf_alloc((void**) &P.ffn_g, T * cfg_.n_ff * f, "ffn_g") &&
+              pf_alloc((void**) &P.ffn_u, T * cfg_.n_ff * f, "ffn_u") &&
+              pf_alloc((void**) &P.ffn_h, T * cfg_.n_ff * f, "ffn_h") &&
+              pf_alloc((void**) &P.xq, strata::prefill::mmq::q8_bytes(chunk, max_in), "q8_1") &&
+              pf_alloc((void**) &P.ids, T * 4, "row ids") && pf_alloc((void**) &P.bounds, 2 * 4, "group bounds") &&
+              pf_alloc((void**) &P.pos_dev, T * (uint64_t) std::max(H, HK) * 4, "positions");
+    if (ok) {
+        cudaError_t s = cudaHostAlloc((void**) &P.stage, T * E * 4, cudaHostAllocDefault);
+        if (s != cudaSuccess)
+            err = std::string("dense model: cannot pin the prefill embedding stage: ") + cudaGetErrorString(s);
+        else s = cudaHostAlloc((void**) &P.bounds_host, Impl::Pf::kBoundsSlots * 2 * sizeof(int32_t),
+                               cudaHostAllocDefault);
+        if (s != cudaSuccess)
+            err = std::string("dense model: cannot pin the prefill group bounds: ") + cudaGetErrorString(s);
+        ok = s == cudaSuccess;
+    }
+    if (ok) {
+        strata::prefill::mmq::iota(P.ids, chunk, I.stream);
+        for (int k = 0; k < Impl::Pf::kBoundsSlots; ++k) {
+            P.bounds_host[2 * k] = 0;
+            P.bounds_host[2 * k + 1] = (int32_t) chunk;
+        }
+        const cudaError_t s = cudaMemcpyAsync(P.bounds, P.bounds_host, 2 * sizeof(int32_t), cudaMemcpyHostToDevice,
+                                              I.stream);
+        if (s != cudaSuccess) err = std::string("dense model: prefill tables: ") + cudaGetErrorString(s);
+        ok = s == cudaSuccess;
+    }
+    if (!ok) {
+        I.pf.reset();
+        return false;
+    }
+    pf_chunk_ = chunk;
+    pf_ready_ = true;
+    std::fprintf(stderr, "strata-dense: prompt prefill through MMQ, %lld tokens at a time\n", (long long) chunk);
+    return true;
+#else
+    (void) chunk;
+    err = "dense model: this build has no MMQ, so prefill() is unavailable; feed the prompt with run()";
+    return false;
+#endif
+}
+
+bool DenseModel::prefill(const int32_t* tokens, int64_t n, Logits lg, std::string& err) {
+#ifdef STRATA_DENSE_MMQ
+    Impl& I = *impl_;
+    if (!pf_ready_) { err = "dense model: prefill() without prefill_setup()"; return false; }
+    if (n < 1) { err = "dense model: prefill() takes at least one token"; return false; }
+    if (pos_ + n > max_context_) { err = "dense model: the context is full"; return false; }
+    Impl::Pf& P = *I.pf;
+    void* s = I.stream;
+    const int E = cfg_.n_embd;
+    int64_t last_rows = 0;
+    try {
+        if (I.prof.enabled) I.prof.begin(s);
+        for (int64_t i = 0; i < n;) {
+            const int64_t T = std::min(pf_chunk_, n - i);
+            const int64_t pos0 = pos_;
+            if (!I.upload_embeddings(I.embd, tokens + i, (int) T, E, cfg_.n_vocab, P.x, err, P.stage)) {
+                I.prof.on = false;
+                return false;
+            }
+            // One MMQ group: the whole chunk.  The bounds go into a fresh pinned slot every time, so the write can
+            // never race a copy the stream has not made yet, and a short final chunk cannot leave stale bounds
+            // behind for the next call.
+            int32_t* slot = P.bounds_host + 2 * (P.bounds_slot++ % Impl::Pf::kBoundsSlots);
+            slot[0] = 0;
+            slot[1] = (int32_t) T;
+            cudaMemcpyAsync(P.bounds, slot, 2 * sizeof(int32_t), cudaMemcpyHostToDevice, (cudaStream_t) s);
+            for (int l = 0; l < cfg_.n_layer; ++l) {
+                Layer& L = I.layers[(size_t) l];
+                dense_rms_norm(P.x, L.attn_norm, P.xn, (int) T, E, cfg_.rms_eps, s);
+                if (!L.attn) I.pf_gdn_block(cfg_, L, T, s);
+                else I.pf_attn_block(cfg_, L.q, L.k, L.v, L.o, L.q_norm, L.k_norm, L.kc, L.vc, T, (int) pos0, s);
+                add_inplace(P.x, P.mix, T * E, s);
+                I.pf_ffn_block(cfg_, L.ffn_gate, L.ffn_up, L.ffn_down, L.post_norm, T, s);
+            }
+            // The MTP block is fed in kMaxCols groups, exactly as the prompt loop does after a run(): each group's
+            // column 0 pairs with the previous group's last hidden (h_last, which mtp_ingest leaves behind).
+            if (has_mtp_) {
+                for (int64_t off = 0; off < T; off += NC) {
+                    const int m = (int) std::min<int64_t>(NC, T - off);
+                    dense_rms_norm(P.x + (size_t) off * E, I.output_norm, I.hid, m, E, cfg_.rms_eps, s);
+                    if (!mtp_ingest(tokens + i + off, m, (int) (pos0 + off), 0, err)) {
+                        I.prof.on = false;
+                        return false;
+                    }
+                }
+            }
+            last_rows = T;
+            pos_ += T;
+            i += T;
+        }
+        snap_valid_ = false;
+        snap_cols_ = 0;
+        if (lg == Logits::Last) {                       // the head runs once, over the last chunk's last row
+            dense_rms_norm(P.x + (size_t) (last_rows - 1) * E, I.output_norm, I.xn, 1, E, cfg_.rms_eps, s);
+            I.quantize(I.xn, E, 1, s);
+            I.gemv(I.head, I.logits, 1, s);
+        }
+        if (I.prof.on) I.prof.finish(s, (int) std::min<int64_t>(n, INT_MAX));
+        return true;
+    } catch (const std::exception& e) {
+        I.prof.on = false;
+        err = std::string("dense model: prefill: ") + e.what();
+        return false;
+    }
+#else
+    (void) tokens; (void) n; (void) lg;
+    err = "dense model: prefill() is not available in this build";
+    return false;
+#endif
 }
 
 bool DenseModel::mtp_ingest(const int32_t* tokens, int n, int pos0, int start, std::string& err) {

@@ -66,6 +66,11 @@ struct DenseOptions {
 class DenseModel {
 public:
     static constexpr int kMaxCols = 8;
+    /// Largest chunk prefill_setup() will size its scratch for.  The GEMVs of a chunk are read once for all of its
+    /// tokens, so a bigger chunk is nearly free until the chunk's activations stop fitting comfortably in VRAM.
+    static constexpr int64_t kPrefillMaxCols = 512;
+    /// The chunk prefill_setup() uses when asked for 0.
+    static constexpr int64_t kPrefillDefaultCols = 64;
 
     DenseModel();
     ~DenseModel();
@@ -113,6 +118,28 @@ public:
     float* logits_col(int j) const;    ///< device pointer to n_vocab logits, valid after a run() with logits
     void* stream() const;
 
+    // ---- batched prompt processing.
+    //
+    // run() can only serve kMaxCols columns, because every activation buffer is sized for that many and the GEMV
+    // kernels take at most 8 columns.  A prompt is therefore fed 8 tokens at a time and every weight is read again
+    // for each group of 8.  prefill() instead walks the prompt in chunks of prefill_chunk() tokens: the projections
+    // go through llama.cpp's MMQ int8 tensor-core kernels over the whole chunk (the weights stay in their GGUF
+    // blocks), and the order-dependent steps (the GDN conv and delta-rule state, the KV append, the causal mask)
+    // walk the chunk's tokens inside one launch, so the result matches feeding the same tokens through run().
+    /// Sizes the chunk scratch and turns the batched path on.  `chunk` is clamped to
+    /// [kMaxCols, kPrefillMaxCols]; 0 asks for kPrefillDefaultCols.  Returns false, and leaves prefill() unusable,
+    /// when a weight's GGUF type is not one MMQ covers or the scratch does not fit: the caller then uses run().
+    bool prefill_setup(int64_t chunk, std::string& err);
+    /// False until prefill_setup() has succeeded.
+    bool prefill_ready() const;
+    /// The chunk prefill_setup() settled on (0 when it has not run).
+    int64_t prefill_chunk() const;
+    /// Feeds `n` consecutive tokens at position() in chunks of prefill_chunk().  Same state changes as the same
+    /// tokens through run(): position(), the recurrent state, the KV cache, and the MTP block (fed in kMaxCols
+    /// groups, exactly as the prompt loop does today).  `logits` may be None or Last (logits_col(0)).  Requires
+    /// prefill_ready(); the caller falls back to run() otherwise.
+    bool prefill(const int32_t* tokens, int64_t n, Logits logits, std::string& err);
+
     // ---- the MTP head (with_mtp only)
     /// Feeds the MTP block the pairs (tokens[j], hidden[j-1]) for j in [start, n) at positions pos0 + j, where
     /// hidden[-1] is the last hidden state before this run.  Precondition: run(tokens, n, ..., keep_hidden=true)
@@ -130,6 +157,8 @@ private:
     struct Impl;
     DenseConfig cfg_;
     int64_t max_context_ = 0, pos_ = 0, snap_pos0_ = 0;
+    int64_t pf_chunk_ = 0;
+    bool pf_ready_ = false;
     int snap_cols_ = 0, draft_max_ = 0;
     bool snap_valid_ = false, has_mtp_ = false;
     uint64_t weight_bytes_ = 0, kv_bytes_ = 0, host_bytes_ = 0;
