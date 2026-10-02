@@ -16,9 +16,10 @@
 //   out   DONE <generated> <prompt> <prompt ms> <decode ms> <stop|length|cancel> 0 0 <reused>
 //   in    STOP | QUIT
 //
-// Conversation cache: the recurrent GDN state cannot be rolled back, so a request reuses the state only when
-// EVERYTHING the state has consumed is a prefix of the new prompt (a chat that only appends).  Otherwise the
-// state is reset and the prompt is read again.
+// Conversation cache: the recurrent GDN state cannot be rolled back, so a request reuses the whole state only when
+// everything it has consumed is a prefix of the new prompt (a chat that only appends).  Otherwise the prompt is
+// resumed from the deepest conversation checkpoint at or before the token where the two prompts start to differ
+// (--ckpt N, pinned host RAM); with no such checkpoint the state is reset and the prompt is read again.
 //
 // The prompt is read one token at a time (the same step as decoding).  Correct, and the simplest thing that can
 // be checked against llama.cpp; a batched prefill is the next optimisation, not a prerequisite.
@@ -100,7 +101,11 @@ void usage() {
                  "  --prompt-chunk N feeds the prompt N tokens at a time through MMQ instead of 8 at a time through\n"
                  "  the GEMVs (0 is the default; --no-prefill forces the old path).  The chunked path reads the KV\n"
                  "  cache in whatever format --kv picked.\n"
-                 "  --kv: the KV cache storage, the same option strata has (int8 about 53%% of fp16, q4_0 about 28%%, k8v4 about 40%%).\n");
+                 "  --kv: the KV cache storage, the same option strata has (int8 about 53%% of fp16, q4_0 about 28%%, k8v4 about 40%%).\n"
+                 "  --ckpt N: conversation checkpoints in pinned host RAM (~154 MiB each on Qwen3.8-27B, 0 = off, default 4).\n"
+                 "                  A prompt that diverges from the one already read resumes from the deepest checkpoint at or\n"
+                 "                  before the divergence; the slots sit at the end of the prompt and 64, 512, 4096 ... tokens\n"
+                 "                  before it, so N=6 also covers a divergence 32768 tokens back.\n");
 }
 
 // ---- `strata-dense --selftest`: the new CUDA kernels against a CPU reference, no model needed.
@@ -804,7 +809,7 @@ int main(int argc, char** argv) {
     float draft_p_min = 0.0f;
     // 0: the default prompt chunk; >0: ask for that chunk; <0 (--no-prefill): feed the prompt through run()
     long long prompt_chunk = 0;
-        int n_ckpt = 4;                                // conversation checkpoints (pinned host RAM, ~154 MiB each); 0 = off
+    int n_ckpt = 4;                                    // conversation checkpoints (pinned host RAM, ~154 MiB each); 0 = off
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         auto next = [&](const char* what) -> const char* {
@@ -972,9 +977,17 @@ int main(int argc, char** argv) {
                 const int64_t p = model.ckpt_pos(k);
                 if (p > 0 && (size_t) p <= common && (size_t) p < ids.size() && (best < 0 || p > model.ckpt_pos(best))) best = k;
             }
-            if (!fed.empty())
-                std::fprintf(stderr, "strata-dense: previous %zu tokens are not a prefix of the new %zu - they first differ at token %zu%s\n",
-                             fed.size(), ids.size(), common, best >= 0 ? " (restoring a checkpoint)" : " (no checkpoint: re-reading from 0)");
+            if (!fed.empty()) {
+                std::string held = "none";
+                for (int k = 0; k < model.ckpt_slots(); ++k)
+                    if (model.ckpt_pos(k) >= 0) {
+                        if (held != "none") held += ",";
+                        held += std::to_string(model.ckpt_pos(k));
+                    }
+                std::fprintf(stderr, "strata-dense: previous %zu tokens are not a prefix of the new %zu - they first differ at token %zu, checkpoints hold %s%s\n",
+                             fed.size(), ids.size(), common, held.c_str(),
+                             best >= 0 ? " (restoring one)" : " (none at or before that token: re-reading from 0)");
+            }
             if (best >= 0 && model.ckpt_restore(best, err)) {
                 resume = (size_t) model.position();
                 fed.resize(resume);
@@ -982,11 +995,15 @@ int main(int argc, char** argv) {
             } else {
                 model.reset();
                 fed.clear();
-                for (int k = 0; k < model.ckpt_slots(); ++k) model.ckpt_drop(k);
             }
         }
-        for (int k = 0; k < model.ckpt_slots(); ++k)           // a checkpoint past the kept prefix is stale
-            if (model.ckpt_pos(k) > (int64_t) resume) model.ckpt_drop(k);
+        // A checkpoint is stale when the new prompt does not go through it, i.e. when it sits past `common`.  One at
+        // or before `common` stays valid even after a reset: the KV cache is addressed by absolute position and K/V
+        // of a token depend only on that token and its position, so re-reading the shared prefix rewrites exactly the
+        // same rows.  Dropping everything on a re-read (as this did until here) threw away the deep checkpoints that
+        // the next request would have needed.
+        for (int k = 0; k < model.ckpt_slots(); ++k)
+            if (model.ckpt_pos(k) > (int64_t) common) model.ckpt_drop(k);
         const int64_t n = (int64_t) ids.size();
         const long long budget = std::min<long long>(max_new, model.max_context() - n);
         auto fail = [&](const std::string& why) {
@@ -1006,10 +1023,15 @@ int main(int argc, char** argv) {
         int64_t since_pp = 0;
         const bool use_pf = model.prefill_ready();
         const int64_t pf_step = model.prefill_chunk();      // STOP is checked between steps
-        // Where to save checkpoints: the end of the prompt and a few points before it (the template re-renders the
-        // tail of a turn, so the previous prompt's last tokens are the ones that change).
+        // Where to save checkpoints.  A prompt that diverges from the one already read diverges in its tail - the
+        // client re-renders or trims the last turns - but "the tail" is not the last 64 tokens: over the 24 diverges
+        // logged by a 72k-token chat (strata-qwen3.8-27b.log) the divergence sat 143, 171, 226, 466, 1515 and 2738
+        // tokens before the end of what had been read, and the old marks (n, n-1, n-8, n-64) were all past it, so
+        // every one of those requests re-read the whole prompt.  The slots are now spread geometrically back from
+        // the end (x8): the default 4 sit at n, n-64, n-512 and n-4096, so a divergence in the last 4096 tokens
+        // costs at most 4096 tokens of re-reading.  --ckpt 6 adds the n-32768 rung.
         std::vector<int64_t> marks;
-        for (int64_t d : {0, 1, 8, 64}) {
+        for (int64_t d : {0, 64, 512, 4096, 32768, 262144}) {
             const int64_t m = n - d;
             if (marks.size() < (size_t) model.ckpt_slots() && m > (int64_t) resume && m > 0) marks.push_back(m);
         }
