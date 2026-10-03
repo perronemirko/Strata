@@ -796,6 +796,18 @@ strata_hip_gfx906_sources()
 option(STRATA_BUILD_SPLIT "Build strata-split: sFNX's split-every-layer engine, host-memory exchange (Linux, CUDA or HIP gfx1201, 2-4 cards)" OFF)
 if(STRATA_BUILD_SPLIT)
   add_subdirectory(src/split)
+if(STRATA_HIP_GFX906)
+  file(GLOB_RECURSE _strata_cu CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/src/*.cu ${CMAKE_CURRENT_SOURCE_DIR}/bench/micro/*.cu
+       ${CMAKE_CURRENT_SOURCE_DIR}/tools/vision/*.cu)
+  if(_strata_mmq)
+    file(GLOB _strata_mmq_cu ${_strata_mmq}/*.cu ${_strata_mmq}/template-instances/*.cu)
+    list(APPEND _strata_cu ${_strata_mmq_cu})
+    target_compile_definitions(strata_mmq PRIVATE GGML_USE_HIP)
+  endif()
+  set_source_files_properties(${_strata_cu} PROPERTIES LANGUAGE HIP)
+# Qwen3.6-35B-A3B engine (strata-qwen36)
+if(TARGET strata_kernels)
+    add_subdirectory(src/qwen36)
 endif()
 
 # What this configure registered, so a missing capability is a stated skip (tools/check prints this line too).
