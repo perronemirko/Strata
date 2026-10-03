@@ -1,0 +1,7 @@
+stream {'keep': 48}                   1 tok      5.3 ms x5 |  128 tok   2109.2 ms x2 |  512 tok   2216.0 ms x2 | reads=512
+stream {'keep': 32}                   1 tok      5.4 ms x5 |  128 tok   2163.5 ms x2 |  512 tok   2216.0 ms x2 | reads=512
+block {'block': 8, 'keep': 2}         1 tok      5.6 ms x5 |  128 tok   3312.5 ms x2 |  512 tok   3448.5 ms x2 | reads=512 built=32
+block {'block': 16, 'keep': 2}        1 tok      5.3 ms x5 |  128 tok   3177.7 ms x2 |  512 tok   3185.1 ms x2 | reads=512 built=16
+block {'block': 8, 'keep': 4}         1 tok      5.3 ms x5 |  128 tok   3357.1 ms x2 |  512 tok   3397.5 ms x2 | reads=512 built=32
+scratch {'group': 16}                 1 tok      5.1 ms x5 |  128 tok   2762.5 ms x2 |  512 tok   2834.5 ms x2 | reads=512 fills=16
+scratch {'group': 32}                 1 tok      5.4 ms x5 |  128 tok   2822.7 ms x2 |  512 tok   2823.3 ms x2 | reads=512 fills=8
