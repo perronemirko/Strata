@@ -1085,3 +1085,8 @@ if(STRATA_BUILD_TESTS)
     add_subdirectory(tests)
   endif()
 endif()
+
+# Qwen3.6-35B-A3B engine (strata-qwen36)
+if(TARGET strata_kernels)
+    add_subdirectory(src/qwen36)
+endif()
