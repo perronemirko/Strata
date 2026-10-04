@@ -815,3 +815,8 @@ if(STRATA_BUILD_TESTS)
 else()
   message(STATUS "strata tests: OFF (STRATA_BUILD_TESTS=OFF)")
 endif()
+# ==============================================================================
+# Integration of DeepSeek v4 Flash Extension (Additive Module)
+# ==============================================================================
+# Poiché la cartella si trova dentro l'albero di Strata, la agganciamo qui.
+add_subdirectory(dsv4_ext)
