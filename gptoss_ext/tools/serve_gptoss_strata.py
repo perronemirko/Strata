@@ -72,7 +72,7 @@ def convert_tokenizer(model_dir: Path, out: Path, bos: int, eos: int, pad: int) 
     out.mkdir(parents=True, exist_ok=True)
     ordered = dict(sorted(vocab.items(), key=lambda kv: kv[1]))
     (out / "vocab.json").write_text(json.dumps(ordered, ensure_ascii=False), encoding="utf-8")
-    (out / "merges.txt").write_text("\n".join(merges) + "\n", encoding="utf-8")
+    (out / "merges.txt").write_text("\n".join(merges), encoding="utf-8")
     (out / "token_type.json").write_text(json.dumps(ttype), encoding="utf-8")
     cfg = {"model": "gpt2", "pre": "o200k_harmony", "vocab_size": n, "n_merges": len(merges),
            "special_ids": {"tokenizer.ggml.bos_token_id": bos, "tokenizer.ggml.eos_token_id": eos, "tokenizer.ggml.padding_token_id": pad},

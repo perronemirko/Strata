@@ -31,6 +31,7 @@ import jinja2.ext
 from jinja2.sandbox import ImmutableSandboxedEnvironment
 
 LOGGER = logging.getLogger(__name__)
+from datetime import datetime
 
 
 # ------------------------------------------------------------------------------------------------ template
@@ -62,6 +63,7 @@ class ChatTemplate:
                                             extensions=["jinja2.ext.loopcontrols", _GenerationExtension])
         env.filters["tojson"] = tojson
         env.globals["raise_exception"] = raise_exception
+        env.globals["strftime_now"] = (lambda fmt: datetime.now().strftime(fmt))
         self.source = Path(path).read_text(encoding="utf-8")
         self._is_hy4 = "<tool_calls{}>" in self.source or "<\uff5creasoning_mode" in self.source
         self._is_inkling2 = "<|content_invoke_tool_json|>" in self.source or "tool_declare<|content_xml|>" in self.source
@@ -1849,13 +1851,17 @@ class OutputParser:
         self._final = False          # #4701: the turn has ended: a call held for what might follow it is decided now
         self._held = ""              # #5276/#5409: the end of a misspelt opener or a prefixed name still arriving (see _prefixed)
         self._reset_scan()
-
+        # Harmony-text fallback for backends/tokenizers that decode GPT-OSS control tokens
+        # as printable strings instead of handling them as control tokens.
+        self._harmony_pending = ""
+        self._harmony_mode = "detect"
+    
     @property
     def clean(self) -> bool:
         """Nothing is held back: a clean point to stop the thinking at (a parser that rewrites the model's text also counts
         what it holds; #4686: so does a call body moved out of the buffer while it streams)."""
         return not self.buf and not self._held and not self._scan_parts
-
+    
     def _ok_at(self, p: int) -> bool:
         """self.buf[p] would open a call: at the start of a line, outside a code fence and inline code."""
         snap = self._snap()
@@ -2527,6 +2533,9 @@ class OutputParser:
     def feed(self, delta: str) -> list[Event]:
         if self._held:
             delta, self._held = self._held + delta, ""
+        delta = self._decode_harmony_text(delta)
+        if not delta:
+            return []
         self.buf += delta
         if self.schemas and delta:
             self._held = self._prefixed(len(delta))
@@ -3021,6 +3030,84 @@ class OutputParser:
         self.state, self.lead = "content", True
         return [Event("tool_call", call=call)]
 
+    def _decode_harmony_text(self, delta: str) -> str:
+        """Convert printable GPT-OSS Harmony into the parser's reasoning/content convention."""
+        self._harmony_pending += delta
+        s = self._harmony_pending
+
+        if self._harmony_mode == "detect":
+            markers = ("<|channel|>", "<|message|>", "<|start|>", "<|return|>")
+            if not any(m in s for m in markers):
+                keep = max(
+                    (n for m in markers for n in range(1, len(m))
+                    if s.endswith(m[:n])),
+                    default=0,
+                )
+                if keep:
+                    self._harmony_pending = s[-keep:]
+                    return s[:-keep]
+                self._harmony_pending = ""
+                return s
+            self._harmony_mode = "harmony"
+
+        if self._harmony_mode == "harmony":
+            first = "<|channel|>analysis<|message|>"
+            start = "<|start|>assistant"
+            pos = s.find(first)
+
+            if pos >= 0:
+                s = s[pos + len(first):]
+            else:
+                first2 = start + first
+                pos2 = s.find(first2)
+                if pos2 >= 0:
+                    s = s[pos2 + len(first2):]
+                else:
+                    keep_tags = (first, first2)
+                    keep = max(
+                        (n for tag in keep_tags for n in range(1, len(tag))
+                        if s.endswith(tag[:n])),
+                        default=0,
+                    )
+                    self._harmony_pending = s[-keep:] if keep else ""
+                    return ""
+
+            self._harmony_mode = "analysis"
+            self._harmony_pending = ""
+            return s
+
+        if self._harmony_mode == "analysis":
+            transition = (
+                "<|end|><|start|>assistant"
+                "<|channel|>final<|message|>"
+            )
+            pos = s.find(transition)
+
+            if pos >= 0:
+                before = s[:pos]
+                self._harmony_mode = "final"
+                self.state, self.lead = "content", True
+                self.buf = ""
+                self.fence, self.line, self.ticks = "", "", 0
+                self._harmony_pending = ""
+                return before
+
+            keep = max(
+                (n for n in range(1, len(transition))
+                if s.endswith(transition[:n])),
+                default=0,
+            )
+            self._harmony_pending = s[-keep:] if keep else ""
+            return s[:-keep] if keep else s
+
+        if self._harmony_mode == "final":
+            s = s.replace("<|return|>", "").replace("<|end|>", "")
+            self._harmony_pending = ""
+            return s
+
+        self._harmony_pending = ""
+        return s
+
 
 class JsonOutputParser(OutputParser):
     """The parser for a model whose chat template tells it to write each call as JSON inside the wrapper:
@@ -3113,4 +3200,4 @@ def parser_for_template(source: str | None):
         return Hy4OutputParser
     if kind == "inkling2":
         return InklingOutputParser
-    return JsonOutputParser if kind == "json" else OutputParser
+    return JsonOutputParser if toolformat.tool_format(source or "") == "json" else OutputParser
