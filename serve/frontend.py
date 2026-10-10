@@ -29,6 +29,7 @@ import jinja2
 from jinja2.sandbox import ImmutableSandboxedEnvironment
 
 LOGGER = logging.getLogger(__name__)
+from datetime import datetime
 
 
 # ------------------------------------------------------------------------------------------------ template
@@ -50,6 +51,7 @@ class ChatTemplate:
         env = ImmutableSandboxedEnvironment(trim_blocks=True, lstrip_blocks=True, extensions=["jinja2.ext.loopcontrols"])
         env.filters["tojson"] = tojson
         env.globals["raise_exception"] = raise_exception
+        env.globals["strftime_now"] = (lambda fmt: datetime.now().strftime(fmt))
         self.source = Path(path).read_text(encoding="utf-8")
         self.template = env.from_string(self.source)
         self.caps = self._detect_caps()
@@ -904,7 +906,10 @@ class OutputParser:
         self.bare = False            # the call being read opened with <function= alone (no <tool_call> around it)
         self.batch = False           # the call being finished is followed by another in the same wrapper
         self._reset_scan()
-
+        # Harmony-text fallback for backends/tokenizers that decode GPT-OSS control tokens
+        # as printable strings instead of handling them as control tokens.
+        self._harmony_pending = ""
+        self._harmony_mode = "detect"
     def _ok_at(self, p: int) -> bool:
         """self.buf[p] would open a call: at the start of a line, outside a code fence and inline code."""
         snap = (self.fence, self.line, self.ticks)
@@ -1188,6 +1193,9 @@ class OutputParser:
         return best
 
     def feed(self, delta: str) -> list[Event]:
+        delta = self._decode_harmony_text(delta)
+        if not delta:
+            return []
         self.buf += delta
         out: list[Event] = []
         while True:
@@ -1460,3 +1468,82 @@ class OutputParser:
         self._reset_scan()
         self.state, self.lead = "content", True
         return [Event("tool_call", call=call)]
+
+
+    def _decode_harmony_text(self, delta: str) -> str:
+        """Convert printable GPT-OSS Harmony into the parser's reasoning/content convention."""
+        self._harmony_pending += delta
+        s = self._harmony_pending
+
+        if self._harmony_mode == "detect":
+            markers = ("<|channel|>", "<|message|>", "<|start|>", "<|return|>")
+            if not any(m in s for m in markers):
+                keep = max(
+                    (n for m in markers for n in range(1, len(m))
+                    if s.endswith(m[:n])),
+                    default=0,
+                )
+                if keep:
+                    self._harmony_pending = s[-keep:]
+                    return s[:-keep]
+                self._harmony_pending = ""
+                return s
+            self._harmony_mode = "harmony"
+
+        if self._harmony_mode == "harmony":
+            first = "<|channel|>analysis<|message|>"
+            start = "<|start|>assistant"
+            pos = s.find(first)
+
+            if pos >= 0:
+                s = s[pos + len(first):]
+            else:
+                first2 = start + first
+                pos2 = s.find(first2)
+                if pos2 >= 0:
+                    s = s[pos2 + len(first2):]
+                else:
+                    keep_tags = (first, first2)
+                    keep = max(
+                        (n for tag in keep_tags for n in range(1, len(tag))
+                        if s.endswith(tag[:n])),
+                        default=0,
+                    )
+                    self._harmony_pending = s[-keep:] if keep else ""
+                    return ""
+
+            self._harmony_mode = "analysis"
+            self._harmony_pending = ""
+            return s
+
+        if self._harmony_mode == "analysis":
+            transition = (
+                "<|end|><|start|>assistant"
+                "<|channel|>final<|message|>"
+            )
+            pos = s.find(transition)
+
+            if pos >= 0:
+                before = s[:pos]
+                self._harmony_mode = "final"
+                self.state, self.lead = "content", True
+                self.buf = ""
+                self.fence, self.line, self.ticks = "", "", 0
+                self._harmony_pending = ""
+                return before
+
+            keep = max(
+                (n for n in range(1, len(transition))
+                if s.endswith(transition[:n])),
+                default=0,
+            )
+            self._harmony_pending = s[-keep:] if keep else ""
+            return s[:-keep] if keep else s
+
+        if self._harmony_mode == "final":
+            s = s.replace("<|return|>", "").replace("<|end|>", "")
+            self._harmony_pending = ""
+            return s
+
+        self._harmony_pending = ""
+        return s
