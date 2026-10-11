@@ -18,7 +18,7 @@ static void usage() {
         "gptoss_run --model DIR [--ctx N] [--threads N]\n"
         "       [--prompt-ids 1,2,3 --n-predict N [--temperature T --top-k K --top-p P --seed S]] | [--serve [--eos-ids 200002,200012]]\n"
         "       [--selfcheck] [--prefill-chunk N] [--kv-rollback N] [--kv-checkpoint FILE] [--kv-unified]\n"
-        "       [--cuda [--cuda-device N] [--vram-pct P] [--vram-total-mib N] [--vram-reserve-mib N] [--gpu-slots N]]   (needs the --cuda build)\n"
+        "       [--cuda [--cuda-device N] [--vram-pct P] [--vram-total-mib N] [--vram-reserve-mib N] [--gpu-slots N] [--expert-profile FILE] [--expert-profile-save FILE] [--expert-profile-save-every SEC] [--pin-pct P]]   (--cuda needs the --cuda build; the profile works on the CPU build too)\n"
         "  facts the model card does not settle (docs/gptoss_porting.md):  --glu-halves  --rope-pairs  --no-concentration\n");
 }
 
@@ -47,6 +47,10 @@ int main(int argc, char** argv) {
         else if (a == "--gpu-emu") { o.cuda = true; allow_emu = true; }     // tests only: the "device" is host memory
         else if (a == "--cuda-device") o.cuda_device = std::atoi(val());
         else if (a == "--gpu-slots") o.gpu_slots = std::atoi(val());
+        else if (a == "--expert-profile") o.expert_profile = val();
+        else if (a == "--expert-profile-save") o.expert_profile_save = val();
+        else if (a == "--expert-profile-save-every") o.expert_profile_save_every = std::atof(val());
+        else if (a == "--pin-pct") o.pin_pct = std::atof(val());
         else if (a == "--vram-pct") o.vram_pct = std::atof(val());
         else if (a == "--vram-total-mib") o.vram_total_mib = std::atoll(val());
         else if (a == "--vram-reserve-mib") o.vram_reserve_mib = std::atoll(val());
@@ -84,6 +88,14 @@ int main(int argc, char** argv) {
         hist.push_back(tok);
         if (tok == m.config().eos) break;
         m.forward(tok, pos++, &lg);
+    }
+    {   // one-shot mode: write the profile at exit
+        const std::string pp = !o.expert_profile_save.empty() ? o.expert_profile_save : o.expert_profile;
+        if (!pp.empty()) {
+            std::string perr;
+            if (m.save_profile(pp, perr)) std::fprintf(stderr, "gptoss_run: expert profile saved to %s (exit)\n", pp.c_str());
+            else std::fprintf(stderr, "gptoss_run: profile save FAILED: %s\n", perr.c_str());
+        }
     }
     return 0;
 }

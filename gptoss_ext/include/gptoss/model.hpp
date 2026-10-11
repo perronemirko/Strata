@@ -24,6 +24,8 @@ struct RunOpts {
     bool cuda = false;
     int cuda_device = 0;
     std::string expert_profile;        // expert-usage counts: loaded at start, rewritten after EVERY request; decides which experts get PINNED in VRAM
+    std::string expert_profile_save;   // where the profile is written (default: the --expert-profile path)
+    double expert_profile_save_every = 0;   // seconds between periodic saves while generating (0 = only after each request and at exit)
     double pin_pct = 80;               // % of the expert slots reserved for the most-used experts of the profile (the rest is LRU for the others)
     int gpu_slots = -1;                // cap on the expert slots in VRAM (-1 = as many as the budget allows)
     // --- VRAM budget: --vram-pct of the card (or of --vram-total-mib when given) minus the reserve. With cuda=false it is only a plan.
