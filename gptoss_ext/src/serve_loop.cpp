@@ -151,6 +151,16 @@ int serve_loop(Model& m, const RunOpts& o, const std::vector<int>& eos_ids) {
     std::fflush(stderr);
 
     LineReader in;
+    const std::string prof_path = !o.expert_profile_save.empty() ? o.expert_profile_save : o.expert_profile;
+    auto last_prof = std::chrono::steady_clock::now();
+    auto save_prof = [&](const char* why) {              // every path that writes the profile goes through here
+        if (prof_path.empty()) return;
+        std::string perr;
+        if (m.save_profile(prof_path, perr)) std::fprintf(stderr, "%s: expert profile saved to %s (%s)\n", "gptoss_run", prof_path.c_str(), why);
+        else std::fprintf(stderr, "%s: profile save FAILED: %s\n", "gptoss_run", perr.c_str());
+        std::fflush(stderr);
+        last_prof = std::chrono::steady_clock::now();
+    };
     std::string line;
     std::vector<std::string> pending;          // commands that arrived while a request was running (anything but STOP is kept, not dropped)
     auto next_cmd = [&](std::string& out) {
@@ -262,6 +272,8 @@ int serve_loop(Model& m, const RunOpts& o, const std::vector<int>& eos_ids) {
             if (i + 1 >= max_new) break;
             m.forward(tok, pos, &logits);
             ++pos;
+            if (o.expert_profile_save_every > 0 && std::chrono::duration<double>(std::chrono::steady_clock::now() - last_prof).count() >= o.expert_profile_save_every)
+                save_prof("periodic");
         }
         const double decode_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tg).count();
         std::fprintf(stderr, "gptoss_run: finish=%s generated=%d max_new=%d\n", finish.c_str(), generated, max_new);
@@ -274,6 +286,8 @@ int serve_loop(Model& m, const RunOpts& o, const std::vector<int>& eos_ids) {
         std::fprintf(stderr, "gptoss_run: %zu prompt -> %d tokens, %s (%.0f ms prefill, %.0f ms decode)\n",
                      ids.size(), generated, finish.c_str(), prefill_ms, decode_ms);
         std::fflush(stderr);
+        { const std::string st = m.stats(); if (!st.empty()) { std::fprintf(stderr, "gptoss_run: %s\n", st.c_str()); std::fflush(stderr); } }
+        save_prof("request");
         if (!o.kv_checkpoint.empty()) {            // after EVERY request, not only at QUIT: a kill must not lose the context
             std::string kerr;
             const auto ts = std::chrono::steady_clock::now();
@@ -283,6 +297,7 @@ int serve_loop(Model& m, const RunOpts& o, const std::vector<int>& eos_ids) {
             std::fflush(stderr);
         }
     }
+    save_prof("exit");
     return 0;
 }
 
