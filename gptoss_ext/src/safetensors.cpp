@@ -2,6 +2,8 @@
 #include "gptoss/json.hpp"
 
 #include <algorithm>
+#include <cerrno>
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
@@ -96,6 +98,27 @@ bool discover_shards(const std::string& path, std::vector<std::string>& out, std
     std::sort(out.begin(), out.end());
     if (out.empty()) { err = "no model-*.safetensors in " + path; return false; }
     return true;
+}
+
+bool ram_preload(const void* p, size_t n, bool lock, std::string& err) {
+    if (n == 0) return true;
+    const size_t ps = (size_t) sysconf(_SC_PAGESIZE);
+    const uintptr_t a = (uintptr_t) p & ~(ps - 1), b = ((uintptr_t) p + n + ps - 1) & ~(ps - 1);
+    madvise((void*) a, (size_t) (b - a), MADV_WILLNEED);
+    unsigned long long sink = 0;
+#pragma omp parallel for reduction(+ : sink) schedule(static)
+    for (long long off = 0; off < (long long) (b - a); off += (long long) ps) sink += *(volatile const uint8_t*) (a + (uintptr_t) off);
+    if (sink == 0xFFFFFFFFFFFFFFFFull) err.clear();                       // keeps the touching loop from being optimised away
+    if (lock && mlock((void*) a, (size_t) (b - a)) != 0) { err = std::string("mlock failed: ") + std::strerror(errno) + " (raise it with `ulimit -l unlimited`)"; return false; }
+    return true;
+}
+
+void ram_release(const void* p, size_t n) {
+    const size_t ps = (size_t) sysconf(_SC_PAGESIZE);
+    const uintptr_t a = ((uintptr_t) p + ps - 1) & ~(ps - 1), b = ((uintptr_t) p + n) & ~(ps - 1);
+    if (b <= a) return;
+    munlock((void*) a, (size_t) (b - a));
+    madvise((void*) a, (size_t) (b - a), MADV_DONTNEED);
 }
 
 }  // namespace gptoss

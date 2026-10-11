@@ -47,4 +47,10 @@ private:
 /// A directory (model-*.safetensors preferred, then *.safetensors that are not "consolidated-*") or a single file.
 bool discover_shards(const std::string& path, std::vector<std::string>& out, std::string& err);
 
+/// RAM-tier helpers over mapped bytes (page-aligned internally).
+/// ram_preload: touches every page in parallel so no first-token page fault goes to the disk; lock = mlock them (needs RLIMIT_MEMLOCK, `ulimit -l unlimited`).
+bool ram_preload(const void* p, size_t n, bool lock, std::string& err);
+/// munlock + MADV_DONTNEED on the pages fully inside [p, p+n): the memory is given back, the data stays in the file.
+void ram_release(const void* p, size_t n);
+
 }  // namespace gptoss
