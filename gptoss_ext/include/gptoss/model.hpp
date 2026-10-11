@@ -23,6 +23,8 @@ struct RunOpts {
     // --- CUDA. Needs the binary built with `sh build.sh --cuda` (the plain binary carries the EMULATED device and refuses --cuda).
     bool cuda = false;
     int cuda_device = 0;
+    std::string expert_profile;        // expert-usage counts: loaded at start, rewritten after EVERY request; decides which experts get PINNED in VRAM
+    double pin_pct = 80;               // % of the expert slots reserved for the most-used experts of the profile (the rest is LRU for the others)
     int gpu_slots = -1;                // cap on the expert slots in VRAM (-1 = as many as the budget allows)
     // --- VRAM budget: --vram-pct of the card (or of --vram-total-mib when given) minus the reserve. With cuda=false it is only a plan.
     double vram_pct = -1;
@@ -47,6 +49,10 @@ public:
     int cached_len() const;
     bool save_kv(const std::string& path, std::string& err) const;
     bool load_kv(const std::string& path, std::string& err);
+    /// Expert usage profile (how many times each (layer, expert) was routed to). Binary: "GPPRF001", u32 layers, u32 experts, u64[layers*experts].
+    bool save_profile(const std::string& path, std::string& err) const;
+    bool load_profile(const std::string& path, std::string& err);
+    std::string stats() const;          // slots / pinned / hits / misses ("" without a device pool)
     const GptConfig& config() const;
     uint64_t weight_bytes() const;
 

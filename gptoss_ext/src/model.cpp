@@ -34,6 +34,7 @@ struct Slot {                                          // one expert in VRAM: [g
     uint8_t *gu_b = nullptr, *gu_s = nullptr, *dn_b = nullptr, *dn_s = nullptr;
     int layer = -1, exp = -1;
     uint64_t tick = 0;
+    bool pinned = false;                               // chosen by the usage profile: never evicted
 };
 inline bool in_parallel_region() {
 #ifdef _OPENMP
@@ -59,7 +60,8 @@ struct Model::Impl {
     void* d_head = nullptr;                            // lm_head on the device
     std::vector<Slot> pool;                            // expert slots
     std::unordered_map<long long, int> where;          // layer*E+expert -> slot
-    uint64_t tick = 0, hits = 0, misses = 0;
+    uint64_t tick = 0, hits = 0, misses = 0, pin_hits = 0;
+    std::vector<uint64_t> usage;                       // [layer*E + expert]: times routed to (the profile)
     std::mutex gmu;                                    // every device call is serialised
 
     void init_work(Work& w) const;
@@ -72,6 +74,8 @@ struct Model::Impl {
     void plan_vram() const;
     bool gpu_setup(std::string& err);
     void gpu_fail(const std::string& what);
+    bool upload_expert(Slot& sl, int li, int e);
+    void count_use(int li, const int32_t* idx);
     Slot* resident(int layer, int e);                  // expert -> slot (upload on miss, LRU eviction); nullptr when there is no pool
     void mv(const WView& w, const void* dW, const float* x, float* y);
     void mm(const WView& w, const void* dW, const float* x, int N, float* y);
@@ -174,6 +178,15 @@ bool Model::load(const std::string& dir, const RunOpts& opts, std::string& err) 
     if (opts.verbose) {
         double kv = 0; for (auto& y : s.L) kv += 2.0 * (double) y.cap * KD * 4.0;
         std::fprintf(stderr, "gptoss: KV cache %.2f GiB (fp32; banded layers hold %d positions, dense layers %d)\n", kv / 1073741824.0, ring, opts.ctx);
+    }
+    s.usage.assign((size_t) c.layers * (size_t) c.n_exp, 0);
+    if (!opts.expert_profile.empty()) {
+        if (FILE* fp = std::fopen(opts.expert_profile.c_str(), "rb")) {
+            std::fclose(fp);
+            std::string perr;
+            if (load_profile(opts.expert_profile, perr)) std::fprintf(stderr, "gptoss: expert profile loaded from %s\n", opts.expert_profile.c_str());
+            else std::fprintf(stderr, "gptoss: expert profile ignored (%s)\n", perr.c_str());
+        } else std::fprintf(stderr, "gptoss: no expert profile at %s yet (it is created after the first request)\n", opts.expert_profile.c_str());
     }
     if (opts.cuda) {
         std::string gerr;
@@ -295,6 +308,7 @@ void Model::Impl::route_tok(Layer& y, Work& w, const float* x, int32_t* idx, flo
     mv(y.router, y.drt, w.h.data(), w.glog.data());
     for (int e = 0; e < c.n_exp; ++e) w.glog[(size_t) e] += y.rbias[(size_t) e];
     route(w.glog.data(), c.n_exp, c.topk, idx, wt);
+    count_use((int) (&y - L.data()), idx);
 }
 
 void Model::Impl::gpu_fail(const std::string& what) {
@@ -337,6 +351,25 @@ bool Model::Impl::gpu_setup(std::string& err) {
         sl.base = b; sl.gu_b = p; sl.gu_s = p + o2; sl.dn_b = p + o3; sl.dn_s = p + o4;
         pool.push_back(sl);
     }
+    if (!pool.empty() && o.pin_pct > 0) {              // pin the hottest experts of the profile, globally ranked
+        std::vector<std::pair<uint64_t, int>> rank;
+        for (size_t i = 0; i < usage.size(); ++i) if (usage[i] > 0) rank.push_back({usage[i], (int) i});
+        std::sort(rank.begin(), rank.end(), [](const std::pair<uint64_t, int>& a, const std::pair<uint64_t, int>& b) { return a.first != b.first ? a.first > b.first : a.second < b.second; });
+        const size_t npin = std::min(rank.size(), (size_t) ((double) pool.size() * std::min(o.pin_pct, 100.0) / 100.0));
+        uint64_t total = 0, covered = 0;
+        for (auto v : usage) total += v;
+        size_t done = 0;
+        for (size_t i = 0; i < npin; ++i) {
+            const int li = rank[i].second / c.n_exp, e = rank[i].second % c.n_exp;
+            Slot& sl = pool[done];
+            if (!upload_expert(sl, li, e)) break;
+            sl.layer = li; sl.exp = e; sl.pinned = true; sl.tick = 0;
+            where[(long long) li * c.n_exp + e] = (int) done;
+            covered += rank[i].first; ++done;
+        }
+        std::fprintf(stderr, "gptoss: pinned %zu hot experts (%.1f%% of the routed activations in the profile); %zu slots stay LRU\n",
+                     done, total ? 100.0 * (double) covered / (double) total : 0.0, pool.size() - done);
+    }
     gpu_on = true;
     std::fprintf(stderr, "gptoss: CUDA device '%s' (%s): dense weights %.2f GiB on device%s, %zu expert slots of %.2f MiB (%.0f%% of the %d experts)\n",
                  gpu::device_name(), gpu::is_emulated() ? "EMULATED" : "real", dense_used / 1073741824.0, d_head ? "" : " (lm_head stays on the host: no room)",
@@ -344,28 +377,37 @@ bool Model::Impl::gpu_setup(std::string& err) {
     return true;
 }
 
+bool Model::Impl::upload_expert(Slot& sl, int li, int e) {
+    const Layer& y = L[(size_t) li];
+    const size_t H = (size_t) c.hidden, I = (size_t) c.moe_ff, G1 = H / 32, G2 = I / 32;
+    return gpu::h2d(sl.gu_b, y.gu.blocks + (size_t) e * 2 * I * G1 * 16, 2 * I * G1 * 16) &&
+           gpu::h2d(sl.gu_s, y.gu.scales + (size_t) e * 2 * I * G1, 2 * I * G1) &&
+           gpu::h2d(sl.dn_b, y.dn.blocks + (size_t) e * H * G2 * 16, H * G2 * 16) &&
+           gpu::h2d(sl.dn_s, y.dn.scales + (size_t) e * H * G2, H * G2);
+}
+
+void Model::Impl::count_use(int li, const int32_t* idx) {
+    for (int k = 0; k < c.topk; ++k) __atomic_fetch_add(&usage[(size_t) li * (size_t) c.n_exp + (size_t) idx[k]], (uint64_t) 1, __ATOMIC_RELAXED);
+}
+
 Slot* Model::Impl::resident(int li, int e) {
     if (pool.empty()) return nullptr;
     const long long key = (long long) li * c.n_exp + e;
     ++tick;
     auto it = where.find(key);
-    if (it != where.end()) { ++hits; pool[(size_t) it->second].tick = tick; return &pool[(size_t) it->second]; }
+    if (it != where.end()) { ++hits; if (pool[(size_t) it->second].pinned) ++pin_hits; pool[(size_t) it->second].tick = tick; return &pool[(size_t) it->second]; }
     ++misses;
     int v = -1;
     for (size_t i = 0; i < pool.size() && v < 0; ++i) if (pool[i].layer < 0) v = (int) i;
     if (v < 0) {                                       // LRU
         uint64_t best = ~(uint64_t) 0;
-        for (size_t i = 0; i < pool.size(); ++i) if (pool[i].tick < best) { best = pool[i].tick; v = (int) i; }
+        for (size_t i = 0; i < pool.size(); ++i) if (!pool[i].pinned && pool[i].tick < best) { best = pool[i].tick; v = (int) i; }
     }
+    if (v < 0) return nullptr;                         // every slot is pinned: this expert runs from the host
     Slot& sl = pool[(size_t) v];
     if (sl.layer >= 0) where.erase((long long) sl.layer * c.n_exp + sl.exp);
     sl.layer = -1;
-    const Layer& y = L[(size_t) li];
-    const size_t H = (size_t) c.hidden, I = (size_t) c.moe_ff, G1 = H / 32, G2 = I / 32;
-    const bool ok = gpu::h2d(sl.gu_b, y.gu.blocks + (size_t) e * 2 * I * G1 * 16, 2 * I * G1 * 16) &&
-                    gpu::h2d(sl.gu_s, y.gu.scales + (size_t) e * 2 * I * G1, 2 * I * G1) &&
-                    gpu::h2d(sl.dn_b, y.dn.blocks + (size_t) e * H * G2 * 16, H * G2 * 16) &&
-                    gpu::h2d(sl.dn_s, y.dn.scales + (size_t) e * H * G2, H * G2);
+    const bool ok = upload_expert(sl, li, e);
     if (!ok) { gpu_fail(gpu::last_error()); return nullptr; }
     sl.layer = li; sl.exp = e; sl.tick = tick;
     where[key] = v;
@@ -477,6 +519,7 @@ void Model::Impl::prefill_gpu(const int* tokens, int n, int start_pos, std::vect
                 float* g = &Gl[(size_t) t * E];
                 for (int e = 0; e < E; ++e) g[e] += y.rbias[(size_t) e];
                 route(g, E, K, &IDX[(size_t) t * K], &WT[(size_t) t * K]);
+                count_use(l, &IDX[(size_t) t * K]);
             }
             std::fill(Y.begin(), Y.end(), 0.0f);
             std::vector<std::vector<int>> by_exp((size_t) E);
@@ -682,6 +725,47 @@ bool Model::load_kv(const std::string& path, std::string& err) {
     if (!ok) { s.cached.clear(); err = "truncated checkpoint"; return false; }
     s.cached = std::move(toks);
     return true;
+}
+
+bool Model::save_profile(const std::string& path, std::string& err) const {
+    const Impl& s = *p_;
+    const std::string tmp = path + ".tmp";
+    FILE* f = std::fopen(tmp.c_str(), "wb");
+    if (!f) { err = "cannot write " + tmp; return false; }
+    const uint32_t L = (uint32_t) s.c.layers, E = (uint32_t) s.c.n_exp;
+    bool ok = std::fwrite("GPPRF001", 1, 8, f) == 8 && std::fwrite(&L, 4, 1, f) == 1 && std::fwrite(&E, 4, 1, f) == 1 &&
+              std::fwrite(s.usage.data(), sizeof(uint64_t), s.usage.size(), f) == s.usage.size();
+    ok = (std::fclose(f) == 0) && ok;
+    if (!ok) { err = "write error on " + tmp; std::remove(tmp.c_str()); return false; }
+    if (std::rename(tmp.c_str(), path.c_str()) != 0) { err = "rename failed"; return false; }
+    return true;
+}
+
+bool Model::load_profile(const std::string& path, std::string& err) {
+    Impl& s = *p_;
+    FILE* f = std::fopen(path.c_str(), "rb");
+    if (!f) { err = "cannot open " + path; return false; }
+    char magic[8]; uint32_t L = 0, E = 0;
+    bool ok = std::fread(magic, 1, 8, f) == 8 && std::memcmp(magic, "GPPRF001", 8) == 0 && std::fread(&L, 4, 1, f) == 1 && std::fread(&E, 4, 1, f) == 1;
+    if (!ok || L != (uint32_t) s.c.layers || E != (uint32_t) s.c.n_exp) { std::fclose(f); err = "not a profile of this model"; return false; }
+    std::vector<uint64_t> u((size_t) L * E);
+    ok = std::fread(u.data(), sizeof(uint64_t), u.size(), f) == u.size();
+    std::fclose(f);
+    if (!ok) { err = "truncated profile"; return false; }
+    s.usage = std::move(u);
+    return true;
+}
+
+std::string Model::stats() const {
+    const Impl& s = *p_;
+    if (s.pool.empty()) return "";
+    size_t pinned = 0;
+    for (const auto& sl : s.pool) pinned += sl.pinned ? 1 : 0;
+    const double tot = (double) (s.hits + s.misses);
+    char b[320];
+    std::snprintf(b, sizeof b, "experts: %zu slots (%zu pinned), hits %llu (of which pinned %llu), misses %llu, hit rate %.1f%%", s.pool.size(), pinned,
+                  (unsigned long long) s.hits, (unsigned long long) s.pin_hits, (unsigned long long) s.misses, tot > 0 ? 100.0 * (double) s.hits / tot : 0.0);
+    return b;
 }
 
 }  // namespace gptoss
