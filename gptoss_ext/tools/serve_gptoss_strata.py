@@ -102,6 +102,8 @@ def main() -> int:
     ap.add_argument("--cuda", action="store_true", help="run on the GPU (needs --exe build-out/gptoss_run_cuda from `sh build.sh --cuda`)")
     ap.add_argument("--cuda-device", type=int, default=None)
     ap.add_argument("--gpu-slots", type=int, default=None, help="cap on expert slots in VRAM")
+    ap.add_argument("--expert-profile", default=None, help="expert-usage profile: pins the hottest experts in VRAM, rewritten after every request")
+    ap.add_argument("--pin-pct", type=float, default=None, help="%% of the slots reserved for pinned experts (default 80)")
     ap.add_argument("--kv-rollback", type=int, default=None)
     ap.add_argument("--eos-ids", default="200002,200012", help="stop ids: <|return|>=200002 (config) and <|call|>=200012 (NOT verified)")
     ap.add_argument("--glu-halves", action="store_true")
@@ -139,9 +141,11 @@ def main() -> int:
 
     args = ["--model", str(model), "--ctx", str(a.ctx), "--kv-unified"]
     for flag, val in (("--threads", a.threads), ("--prefill-chunk", a.prefill_chunk), ("--vram-pct", a.vram_pct),
-                      ("--vram-total-mib", a.vram_total_mib), ("--kv-rollback", a.kv_rollback), ("--cuda-device", a.cuda_device), ("--gpu-slots", a.gpu_slots), ("--eos-ids", a.eos_ids)):
+                      ("--vram-total-mib", a.vram_total_mib), ("--kv-rollback", a.kv_rollback), ("--cuda-device", a.cuda_device), ("--gpu-slots", a.gpu_slots), ("--pin-pct", a.pin_pct), ("--eos-ids", a.eos_ids)):
         if val is not None:
             args += [flag, str(val)]
+    if a.expert_profile:
+        args += ["--expert-profile", str(Path(a.expert_profile).resolve())]
     if a.kv_checkpoint:
         args += ["--kv-checkpoint", str(Path(a.kv_checkpoint).resolve())]
     for flag, on in (("--cuda", a.cuda), ("--glu-halves", a.glu_halves), ("--rope-pairs", a.rope_pairs), ("--no-concentration", a.no_concentration)):
