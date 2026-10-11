@@ -71,3 +71,12 @@ Primo passo sul modello vero: `python3 tools/dump_safetensors_shapes.py --hf ope
 | 7 protocollo | `gptoss_run --serve` (stesso protocollo dei motori dev4), provato con richieste ravvicinate e riavvio |
 | 8 prestazioni | prefill a batch; nessuna misura sul modello vero |
 | 9 operativita' | checkpoint per richiesta; profilo expert non fatto |
+
+## Profilo degli expert: quali stanno in VRAM
+
+- Il motore conta quante volte ogni (layer, expert) viene scelto dal router (anche sul binario CPU: il routing non dipende dal device) e riscrive il profilo **dopo ogni richiesta** (`--expert-profile FILE`, tmp + rename).
+- All'avvio con `--cuda`, il `--pin-pct` % (default 80) degli slot viene riempito con gli expert piu' usati del profilo (classifica globale) e **non viene mai evitto**; il resto degli slot e' LRU per tutti gli altri.
+- Senza profilo (primo avvio) tutti gli slot sono LRU. Il profilo si accumula tra le sessioni; il pinning si aggiorna al riavvio.
+- Dopo ogni richiesta il motore scrive su stderr: `experts: N slots (M pinned), hits ... (of which pinned ...), misses ..., hit rate ...%`. **Quella riga dice se il bus e' il limite.**
+- `tools/calibrate_profile.py` riempie il profilo con prompt rappresentativi; `tools/profile_report.py` stampa, per N slot, la quota di attivazioni coperta dai N expert piu' usati (hit rate di un pinning statico ideale) contro la linea uniforme. Se la curva e' piatta, il pinning non aiuta.
+- Limiti: il pinning dipende dalla somiglianza fra prompt di calibrazione e uso reale; la classifica e' globale (un layer poco usato puo' restare con pochi expert fissi); **codice mai compilato ne' eseguito**.
