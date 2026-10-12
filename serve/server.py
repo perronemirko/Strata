@@ -3960,7 +3960,39 @@ class Service:
         # `cancel` (#1999): set when the client hangs up; the downloads, the wait for the turn and the encodes stop
         # between pictures and raise ClientGone
         fetched = self._note_unreadable_tool_images(messages, cancel)
-        ids = encoded_ids = self.encode_prompt(messages, tools, kwargs)
+        # --- FIX LATO SERVER: Normalizza la struttura dei tools ---
+        normalized_tools = []
+        if tools:
+            for tool in tools:
+                # Se il tool non ha la chiave 'function', la creiamo noi per il template
+                if isinstance(tool, dict) and "function" not in tool:
+                    # Se il tool ha già 'name', lo avvolgiamo dentro 'function'
+                    if "name" in tool:
+                        normalized_tools.append({"type": "function", "function": tool})
+                    else:
+                        normalized_tools.append(tool)
+                else:
+                    normalized_tools.append(tool)
+            tools = normalized_tools
+
+        # Se necessario, fai lo stesso controllo dentro i 'messages' per le 'tool_calls'
+        for msg in messages:
+            if isinstance(msg, dict) and "tool_calls" in msg and msg["tool_calls"]:
+                # Se tool_calls è una lista (standard) o un singolo dizionario
+                calls = msg["tool_calls"] if isinstance(msg["tool_calls"], list) else [msg["tool_calls"]]
+                normalized_calls = []
+                for call in calls:
+                    if isinstance(call, dict) and "function" not in call:
+                        normalized_calls.append({
+                            "id": call.get("id", "call_unknown"),
+                            "type": "function",
+                            "function": call
+                        })
+                    else:
+                        normalized_calls.append(call)
+                msg["tool_calls"] = normalized_calls
+        # --------------------------------------------------------
+        ids = self.encode_prompt(messages, tools, kwargs)
         if force and kwargs.get("enable_thinking", True) is False:
             ids = ids + self.tok.encode(force, parse_special=True)
         self.embeddings.path = None
