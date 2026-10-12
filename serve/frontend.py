@@ -1176,6 +1176,10 @@ class OutputParser:
                  recover: bool = False, declared_only: bool = False, deferred: bool = False):
         self.state = "reasoning" if thinking else "content"
         self.buf = ""
+        # Harmony-text fallback for backends/tokenizers that decode GPT-OSS control tokens
+        # as printable strings instead of handling them as control tokens.
+        self._harmony_pending = ""
+        self._harmony_mode = "detect"
         self.lead = False
         self.schemas = {t.get("name"): t for t in tools or []}
         # #4663: the request defers tools (Anthropic's tool search, see anthropic_tools): the client holds back more tools
@@ -1994,6 +1998,88 @@ class OutputParser:
                 if batch and out[-1].kind == "tool_call":
                     self.state, self.lead = "call", False
 
+    def _flush_harmony(self) -> list[Event]:
+        """Text the adapter was holding back when the stream ended: outside a Harmony header
+        it is the model's own text, so send it through the parser rather than lose it."""
+        held, self._harmony_pending = self._harmony_pending, ""
+        if not held:
+            return []
+        self._harmony_mode = "flush"          # the adapter's last branch passes text through
+        return self.feed(held)
+
+    def _decode_harmony_text(self, delta: str) -> str:
+        """Convert a printable GPT-OSS Harmony transcript to the parser's <think> convention.
+
+        Handles markers split across streaming deltas. In particular, do not expose the
+        analysis header or the final <|return|> marker as user-visible text.
+        """
+        self._harmony_pending += delta
+        s = self._harmony_pending
+        out: list[str] = []
+        # Headers as whole strings: a normal answer never contains one, so the adapter
+        # only turns on for a real Harmony transcript. One delta can carry several
+        # transitions (a non-streaming server sends the whole turn at once), so the
+        # conversion loops; the parser's own state machine sees the `</think>` we emit.
+        ANALYSIS = ("<|channel|>analysis<|message|>", "<|start|>assistant<|channel|>analysis<|message|>")
+        FINAL = ("<|end|><|start|>assistant<|channel|>final<|message|>", "<|channel|>final<|message|>",
+                 "<|start|>assistant<|channel|>final<|message|>")
+        while True:
+            if self._harmony_mode == "detect":
+                markers = ANALYSIS + FINAL + ("<|return|>",)
+                if not any(m in s for m in markers):
+                    # Retain a suffix that could be the start of a split marker.
+                    keep = max((n for m in markers for n in range(1, len(m)) if s.endswith(m[:n])), default=0)
+                    self._harmony_pending = s[-keep:] if keep else ""
+                    return "".join(out) + (s[:len(s) - keep] if keep else s)
+                self._harmony_mode = "harmony"
+                continue
+
+            if self._harmony_mode == "harmony":
+                hits = [(s.find(t), -len(t), t) for t in ANALYSIS + FINAL if s.find(t) >= 0]
+                if not hits:
+                    # Hold back only a header still arriving; the preamble before it is transport.
+                    keep = max((n for t in ANALYSIS + FINAL for n in range(1, len(t)) if s.endswith(t[:n])), default=0)
+                    self._harmony_pending = s[-keep:] if keep else ""
+                    return "".join(out)
+                pos, _, tag = min(hits)
+                s = s[pos + len(tag):]
+                if tag in ANALYSIS:
+                    self._harmony_mode = "analysis"
+                else:
+                    if self.state == "reasoning":
+                        out.append("</think>")   # close the analysis the parser has been holding
+                    self._harmony_mode = "final"
+                self._harmony_pending = ""
+                continue
+
+            if self._harmony_mode == "analysis":
+                hits = [(s.find(t), -len(t), t) for t in FINAL if s.find(t) >= 0]
+                if hits:
+                    pos, _, tag = min(hits)
+                    out.append(s[:pos])
+                    out.append("</think>")
+                    s = s[pos + len(tag):]
+                    self._harmony_mode = "final"
+                    self._harmony_pending = ""
+                    continue
+                # Keep a possible partial header in the pending buffer.
+                keep = max((n for t in FINAL for n in range(1, len(t)) if s.endswith(t[:n])), default=0)
+                self._harmony_pending = s[-keep:] if keep else ""
+                out.append(s[:-keep] if keep else s)
+                return "".join(out)
+
+            if self._harmony_mode == "final":
+                # The final body is ordinary answer text; Harmony terminators are transport
+                # markers and must not be sent to the existing content parser.
+                ends = ("<|return|>", "<|end|>")
+                s = s.replace(ends[0], "").replace(ends[1], "")
+                keep = max((n for m in ends for n in range(1, len(m)) if s.endswith(m[:n])), default=0)
+                self._harmony_pending = s[-keep:] if keep else ""
+                return "".join(out) + (s[:len(s) - keep] if keep else s)
+
+            self._harmony_pending = ""
+            return "".join(out) + s
+
     def finish(self, reason: str | None = None) -> list[Event]:
         """End of generation: flush whatever is held (an unterminated tool call is returned as content; one that was
         already announced stays unfinished: its JSON is not closed and no "tool_call" follows it, #211).  `reason` is
@@ -2020,6 +2106,9 @@ class OutputParser:
                     self.buf, self.state = "", "reasoning"
                 except ValueError:
                     pass
+        if self._harmony_pending and self._harmony_mode in ("detect", "final"):
+            out += self._flush_harmony()      # the stream ended mid-marker: that text is the model's
+        self._harmony_pending = ""            # inside a header the held fragment is transport: drop it
         if self.pending:
             out += self._release(reason in (None, "stop") and self.state == "reasoning" and not self.buf)
         if self.state == "call" and self.bare and function_end(self.buf) >= 0:
