@@ -57,7 +57,7 @@ Primo passo sul modello vero: `python3 tools/dump_safetensors_shapes.py --hf ope
   Resta sul host: embedding, norme, RoPE, attenzione e KV cache, swiglu, bias, router top-k. Ogni chiamata copia x su e y giu' (semplice, non veloce). Prefill a batch: ogni proiezione e ogni expert e' **un solo passaggio sui pesi per tutto il chunk** (kernel a warp per riga, 8 token per volta in registri).
   An allocation that does not fit is now recoverable (that one call runs on the host, the chunk is halved, the device stays on); any other CUDA error still turns the device off and the session continues on the CPU. **The CUDA code compiles clean (`nvcc` sm_89, `g++ -Wall -Wextra`); it has never been executed on a real GPU** — only the Model path is covered by the emulated device.
   The BF16 bias rows of an expert live inside its slot (`gu_bias`, `dn_bias` device copies, `(2I + H) * 2` bytes ~ 14 KiB on a 13.2 MiB slot), uploaded with the expert; the kernels of the expert add them, so the decode path needs no host add step.
-  Decode of one token: the top-k experts run **at the same time**, one per device context (`kExpertCtxBatch = 4`): `expert_run_async` enqueues the whole expert without waiting, `expert_collect` waits per context and accumulates. The scratch of the 4 contexts is reserved in `gpu_setup` before the pool, so no allocation happens during decode once VRAM is full. Any expert without a slot, or any failed enqueue, falls back to the host `expert_add`.
+  Decode of one token (`experts_decode`): the top-k experts run **at the same time**, one per device context (`kExpertCtxBatch = 4`): `expert_run_async` enqueues the whole expert without waiting, `expert_collect` waits per context and accumulates. Each expert's result goes into its own `part[k]` slice, so an expert without a slot (all slots pinned or in flight, upload or enqueue failed) runs on the host **while the device experts are still computing**, and a failed collect re-runs just that expert on the host; the sum into `acc` stays in k order. A slot in flight carries `busy = true` and cannot be chosen as the LRU victim. The scratch of the 4 contexts is reserved in `gpu_setup` before the pool, so no allocation happens during decode once VRAM is full.
   Proof of the async path (emulated device, never on CUDA): `test_gptoss_core` with `slots = 5`, `slots = 0` and `slots = -1` gives the same logits as the CPU path (max |diff| 3.3e-05 on decode, 6.9e-06 on the last token of a full prefill), identical to the run without the batched path.
 
 ### The dense scratch and the VRAM budget (measured failure, 2026-10-12)
@@ -84,6 +84,21 @@ Fixed in this session (compiles clean with `nvcc` sm_89 and with `g++ -Wall -Wex
 
 To measure the GPU path once the card is free: `python3 tools/serve_gptoss_strata.py --model <gpt-oss-120b> --cuda --exe build-out/gptoss_run_cuda --ctx 131072 --prefill-chunk 512 --vram-pct 90 --vram-reserve-mib 2048 --expert-profile /var/tmp/gptoss-expert.bin --kv-checkpoint /var/tmp/gptoss.kv` and read the `PP`/`T` lines plus `experts: ... hit rate ...%, oom fallbacks ...`.
 
+## End of a turn: which id stops
+
+The engine stops on `--eos-ids` (`serve_loop.cpp:196`), prints the token as one `T` line and breaks (`serve_loop.cpp:350`). The server reads that `T` line and must know it is the end, or it reports the request as cut by max tokens.
+
+`Service.stop_ids` (`serve/server.py:2862`) used to be the ids of `<|im_end|>` and `<|endoftext|>` in whatever vocabulary was loaded. In this vocabulary `<|im_end|>` does not exist: its spelling encodes to six ordinary text ids (`27, 91, 321, 13707, 91, 29`), which an answer can contain. The real end of a turn is 200002, and the pack says so in `tokenizer.json` (`tokenizer.ggml.eos_token_id`). So: a literal counts only when it is one control token in this vocabulary, and the vocabulary's own eos id is always a stop.
+
+What it looked like before, on the real run (the engine's log against the server window):
+
+```
+gptoss_run: finish=stop generated=190 max_new=130814
+[strata] done: 190 tokens in 24 s (7.9 tok/s) (length, cancel=False)
+```
+
+The model said "stop", the client heard "length": the answer was cut and its reasoning channel leaked as visible text. Checked now with a fake engine that writes the model's own Harmony text and ends on 200002: `finish == "stop"`, the analysis channel comes out as reasoning, the final channel as content, nothing lost at the end. The Qwen path is unchanged: with a vocabulary that has both markers the set is still `{248044, 248046}`.
+
 ## Stato per fase della guida
 
 | Fase | Stato |
@@ -104,6 +119,8 @@ To measure the GPU path once the card is free: `python3 tools/serve_gptoss_strat
 - Il motore conta quante volte ogni (layer, expert) viene scelto dal router (anche sul binario CPU: il routing non dipende dal device) e riscrive il profilo **dopo ogni richiesta** (`--expert-profile FILE`, tmp + rename).
 - All'avvio con `--cuda`, il `--pin-pct` % (default 80) degli slot viene riempito con gli expert piu' usati del profilo (classifica globale) e **non viene mai evitto**; il resto degli slot e' LRU per tutti gli altri.
 - Senza profilo (primo avvio) tutti gli slot sono LRU. Il profilo si accumula tra le sessioni; il pinning si aggiorna al riavvio.
-- Dopo ogni richiesta il motore scrive su stderr: `experts: N slots (M pinned), hits ... (of which pinned ...), misses ..., hit rate ...%`. **Quella riga dice se il bus e' il limite.**
+- Dopo ogni richiesta il motore scrive su stderr: `experts: N slots (M pinned), hits ... (of which pinned ...), lookups ..., hit rate ...%; P of the R routed experts read over PCIe, H on the host, oom fallbacks ...`. **Quella riga dice se il bus e' il limite.** Gli counters e' per request e e' del decode: `Model::begin_request_stats` / `request_stats` (model.cpp:838), si' `Model::forward` si conta (`counting`), prefill e' ne' conta (si' dilute la hit rate).
+- The `DONE` line now carries the same field layout as Strata's engine (`serve/server.py:915` `_parse_done`), so the server window prints the same engineering lines for gpt-oss as for Qwen: `[strata] thinking: N of max M tokens, X tok/s` and `[strata] done: N tokens in T s (X tok/s) (stop, cancel=False), expert cache H% hit (+P% of the routed experts over PCIe)`. Fields 10-11 are the request's `hits lookups`, field 14 the prompt tokens actually read, field 15 the experts uploaded over PCIe; drafts (fields 7-9) are 0/0 because there is no speculative decoding here, and the RAM/file tiers (fields 12-14) are 0 because this engine has only VRAM + host.
+- Provato su device emulato (tests/tiny, `--gpu-emu --cuda`, ctx 64, 1 request 4 prompt / 8 generated): `DONE 8 4 5.1 10.8 length 0 0 0 47 47 0 0 0.0 4 9` = 7 forward decode x 4 layer x top-2 = 56 routed = 47 hit VRAM + 9 over PCIe (16.1% of the routed). Mai ne'执行 on a real CUDA card (the Qwen engine holds it).
 - `tools/calibrate_profile.py` riempie il profilo con prompt rappresentativi; `tools/profile_report.py` stampa, per N slot, la quota di attivazioni coperta dai N expert piu' usati (hit rate di un pinning statico ideale) contro la linea uniforme. Se la curva e' piatta, il pinning non aiuta.
 - Limiti: il pinning dipende dalla somiglianza fra prompt di calibrazione e uso reale; la classifica e' globale (un layer poco usato puo' restare con pochi expert fissi); **codice mai compilato ne' eseguito**.
