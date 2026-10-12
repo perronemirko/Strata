@@ -220,7 +220,10 @@ namespace gptoss
                 return;
             std::string perr;
             if (m.save_profile(prof_path, perr))
+            {
                 std::fprintf(stderr, "%s: expert profile saved to %s (%s)\n", "gptoss_run", prof_path.c_str(), why);
+                m.decay_profile();   // --profile-decay: no-op when the bound is 0
+            }
             else
                 std::fprintf(stderr, "%s: profile save FAILED: %s\n", "gptoss_run", perr.c_str());
             std::fflush(stderr);
