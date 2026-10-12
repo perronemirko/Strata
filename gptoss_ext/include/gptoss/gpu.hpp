@@ -1,9 +1,9 @@
 // gptoss/gpu.hpp - device layer, TWO interchangeable backends behind one API (same design as dsv4_ext):
-//   src/gpu.cpp       CPU-emulated device (malloc "VRAM", memcpy "H2D"). Always buildable; what the tests run against.
-//   src/gpu_cuda.cu   real CUDA device (sh build.sh --cuda).
+//   src/gpu.cpp       CPU-emulated device (malloc "VRAM", everything executes immediately). Always buildable; what the tests run against.
+//   src/gpu_cuda.cu   real CUDA device (sh build.sh --cuda): non-blocking streams, events, pinned staging, CUDA graphs, tensor-core GEMM (sm_80+).
 // Both define the same gptoss::gpu symbols; a binary links ONE of them, never both.
-// Host-pointer interface on purpose: x/y are host arrays, the backend stages them. Weights live on the device (dalloc + h2d).
-// NOT thread-safe: the caller (Model) serialises every call.
+// Threading: the Model serialises every call EXCEPT the copy-side functions (h2d_copy_async, event_record_copy, event_sync), which are internally locked
+// so a prefetch thread can run them while the main thread uses the compute side.
 #pragma once
 #include <cstddef>
 #include <cstdint>
@@ -18,12 +18,38 @@ const char* device_name();
 void mem_info(size_t* free_bytes, size_t* total_bytes);
 void* alloc(size_t n);                       // nullptr on failure (also clears a non-sticky OOM)
 void release(void* p);                       // release(nullptr) is a no-op
-bool h2d(void* dev, const void* host, size_t n);
+bool h2d(void* dev, const void* host, size_t n);        // synchronous: complete when it returns
+void set_options(bool use_graphs);           // CUDA graphs for the decode expert pipeline (default on)
 
-/// y[n][rows] = W x[n][cols], n < N.  W: BF16 row-major [rows][cols] on the device.  One pass over W for all N tokens.
+/// Allocates the scratch buffers UP FRONT (device + pinned host) for batches of up to `dense_x_floats` / `dense_y_floats` floats of dense-matmat input / output and
+/// `expert_batch_n` tokens per expert call, so no cudaMalloc happens later when the expert slots have taken the VRAM.
+bool reserve_scratch(size_t dense_x_floats, size_t dense_y_floats, int expert_batch_n, int H, int I);
+
+/// y[n][rows] = W x[n][cols], n < N, host x/y. W: BF16 [rows][cols] on the device. N >= 32 uses the tensor-core GEMM (sm_80+), smaller N a warp-per-row kernel.
 bool matmat_bf16(const void* dW, int rows, int cols, const float* hx, int N, float* hy);
-/// Same for an MXFP4 matrix: blocks [rows][cols/32][16] bytes, scales [rows][cols/32] bytes (both on the device); cols % 32 == 0.
+/// Same for MXFP4 (blocks [rows][cols/32][16], scales [rows][cols/32]); cols % 32 == 0.
 bool matmat_mx(const void* dBlocks, const void* dScales, int rows, int cols, const float* hx, int N, float* hy);
+
+/// One whole expert on the device: y[n] = wt[n] * ( down( swiglu( gate_up(x[n]) + b1 ) ) + b2 ). All pointers are device pointers.
+struct ExpertDesc {
+    const void *gu_b = nullptr, *gu_s = nullptr, *gu_bias = nullptr;   // gate_up: MXFP4 blocks [2I][H/32][16], scales [2I][H/32], bf16 bias [2I]
+    const void *dn_b = nullptr, *dn_s = nullptr, *dn_bias = nullptr;   // down:    MXFP4 blocks [H][I/32][16],  scales [H][I/32],  bf16 bias [H]
+    int H = 0, I = 0;
+    int halves = 0;                          // gate/up layout of the 2I rows: 0 interleaved (gate = even), 1 first half / second half
+    float limit = 7.0f, alpha = 1.702f;
+};
+constexpr int kExpertCtxBatch = 4;           // contexts 0..3: decode (N == 1, graph-able, each on its own stream); 4: batch (prefill)
+/// Enqueues the whole expert (H2D of x and wt, 4 kernels, D2H of y) on the context's stream and returns WITHOUT waiting. Contexts are independent:
+/// enqueue up to 4 decode experts back to back, then collect them.
+bool expert_run_async(int ctx, const ExpertDesc& d, const float* hx, const float* wt, int N);
+bool expert_collect(int ctx, float* hy);     // waits for that context's work and copies y[N][H] out
+
+// ---- copy side (prefetch): its own stream
+int event_create();
+bool event_sync(int ev);                     // host waits for the event
+bool h2d_copy_async(void* dev, const void* host, size_t n);   // on the copy stream; direct DMA if the host range was registered, else through pinned staging
+bool event_record_copy(int ev);              // records `ev` after every copy issued so far on the copy stream
+bool host_register(const void* p, size_t n); // page-locks a host range (read-only) so copies from it are true DMA; pages inside only
 
 std::string last_error();
 
