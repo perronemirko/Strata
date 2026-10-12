@@ -28,7 +28,7 @@ struct Layer {
     void *dq = nullptr, *dk = nullptr, *dv = nullptr, *dobj = nullptr, *drt = nullptr;   // device copies of the BF16 projections (null = host)
     size_t slot(int pos) const { return sliding ? (size_t) pos % (size_t) cap : (size_t) pos; }
 };
-struct Work { std::vector<float> h, q, k, v, att, tmp, glog, y, gu, act, eb, sc; };
+struct Work { std::vector<float> h, q, k, v, att, tmp, glog, y, gu, act, eb, sc, part; };   // part: [topk][H] per-expert contributions of one decode layer
 struct Slot {                                          // one expert in VRAM: [gate_up blocks | gate_up scales | down blocks | down scales | gate_up bias | down bias]
     void* base = nullptr;
     uint8_t *gu_b = nullptr, *gu_s = nullptr, *dn_b = nullptr, *dn_s = nullptr;
@@ -36,6 +36,7 @@ struct Slot {                                          // one expert in VRAM: [g
     int layer = -1, exp = -1;
     uint64_t tick = 0;
     bool pinned = false;                               // chosen by the usage profile: never evicted
+    bool busy = false;                                 // an async expert kernel is reading this slot: never evicted until it is collected
 };
 inline bool in_parallel_region() {
 #ifdef _OPENMP
@@ -62,7 +63,9 @@ struct Model::Impl {
     void* d_head = nullptr;                            // lm_head on the device
     std::vector<Slot> pool;                            // expert slots
     std::unordered_map<long long, int> where;          // layer*E+expert -> slot
-    uint64_t tick = 0, hits = 0, misses = 0, pin_hits = 0;
+    uint64_t tick = 0, hits = 0, host_served = 0, pcie_served = 0, pin_hits = 0;
+    bool counting = false;                             // true only inside Model::forward (decode): prefill lookups are not counted
+    uint64_t base_hits = 0, base_lookups = 0, base_pcie = 0;   // counters at the start of the request, for the per-request line
     std::vector<uint64_t> usage;                       // [layer*E + expert]: times routed to (the profile)
     std::mutex gmu;                                    // every device call is serialised
 
@@ -72,14 +75,16 @@ struct Model::Impl {
     void attn_out(Layer& y, Work& w, float* x, int pos);
     void route_tok(Layer& y, Work& w, const float* x, int32_t* idx, float* wt);
     void expert_add(Layer& y, Work& w, const float* h, int e, float wt, float* acc);
-    bool expert_add_batched(Layer& y, Work& w, const float* h, const int32_t* idx, const float* wt, float* acc);
+    void experts_decode(Layer& y, Work& w, const float* h, const int32_t* idx, const float* wt, float* acc);   // the token's top-k experts, in flight together
     std::string fingerprint() const;
     void plan_vram() const;
     bool gpu_setup(std::string& err);
     void gpu_fail(const std::string& what);
     bool upload_expert(Slot& sl, int li, int e);
     void count_use(int li, const int32_t* idx);
-    Slot* resident(int layer, int e);                  // expert -> slot (upload on miss, LRU eviction); nullptr when there is no pool
+    Slot* resident(int layer, int e);                  // expert -> slot (upload on miss = PCIe, LRU eviction); nullptr when there is no pool or the expert runs on the host
+    void begin_request_stats();
+    void request_stats(unsigned long long*, unsigned long long*, unsigned long long*) const;
     void mv(const WView& w, const void* dW, const float* x, float* y);
     void mm(const WView& w, const void* dW, const float* x, int N, float* y);
     void attn_heads(Layer& y, Work& w, int pos);
@@ -90,7 +95,8 @@ Model::Model() : p_(new Impl) {}
 Model::~Model() {
     if (!p_) return;
     Impl& s = *p_;
-    if (s.hits + s.misses) std::fprintf(stderr, "gptoss: expert slots (%zu): %llu hits, %llu misses\n", s.pool.size(), (unsigned long long) s.hits, (unsigned long long) s.misses);
+    if (s.hits + s.host_served + s.pcie_served) std::fprintf(stderr, "gptoss: expert slots (%zu): %llu hits, %llu over PCIe, %llu on the host\n", s.pool.size(),
+                   (unsigned long long) s.hits, (unsigned long long) s.pcie_served, (unsigned long long) s.host_served);
     for (auto& sl : s.pool) gpu::release(sl.base);
     for (auto& y : s.L) { gpu::release(y.dq); gpu::release(y.dk); gpu::release(y.dv); gpu::release(y.dobj); gpu::release(y.drt); }
     gpu::release(s.d_head);
@@ -209,7 +215,7 @@ bool Model::load(const std::string& dir, const RunOpts& opts, std::string& err) 
 void Model::Impl::init_work(Work& w) const {
     w.h.assign(c.hidden, 0); w.q.assign(c.q_dim(), 0); w.k.assign(c.kv_dim(), 0); w.v.assign(c.kv_dim(), 0); w.att.assign(c.q_dim(), 0);
     w.tmp.assign(c.hidden, 0); w.glog.assign(c.n_exp, 0); w.y.assign(c.hidden, 0); w.gu.assign((size_t) 2 * c.moe_ff, 0);
-    w.act.assign(c.moe_ff, 0); w.eb.assign(c.hidden, 0); w.sc.assign((size_t) o.ctx + 1, 0);
+    w.act.assign(c.moe_ff, 0); w.eb.assign(c.hidden, 0); w.sc.assign((size_t) o.ctx + 1, 0); w.part.assign((size_t) c.topk * c.hidden, 0);
 }
 
 Work& Model::Impl::my_work() {
@@ -430,24 +436,28 @@ void Model::Impl::count_use(int li, const int32_t* idx) {
 }
 
 Slot* Model::Impl::resident(int li, int e) {
-    if (pool.empty()) return nullptr;
+    // The counters are the decode's, per request: only Model::forward sets `counting`, so a prefill that walks
+    // every expert of a chunk does not dilute the hit rate the DONE line reports.
+    const bool count = counting;
+    if (pool.empty()) { if (count) ++host_served; return nullptr; }
     const long long key = (long long) li * c.n_exp + e;
     ++tick;
     auto it = where.find(key);
-    if (it != where.end()) { ++hits; if (pool[(size_t) it->second].pinned) ++pin_hits; pool[(size_t) it->second].tick = tick; return &pool[(size_t) it->second]; }
-    ++misses;
+    if (it != where.end()) { if (count) { ++hits; if (pool[(size_t) it->second].pinned) ++pin_hits; } pool[(size_t) it->second].tick = tick; return &pool[(size_t) it->second]; }
+    // A miss: the bytes go to the card over PCIe if a slot can take them; otherwise this expert runs on the host.
     int v = -1;
     for (size_t i = 0; i < pool.size() && v < 0; ++i) if (pool[i].layer < 0) v = (int) i;
     if (v < 0) {                                       // LRU
         uint64_t best = ~(uint64_t) 0;
-        for (size_t i = 0; i < pool.size(); ++i) if (!pool[i].pinned && pool[i].tick < best) { best = pool[i].tick; v = (int) i; }
+        for (size_t i = 0; i < pool.size(); ++i) if (!pool[i].pinned && !pool[i].busy && pool[i].tick < best) { best = pool[i].tick; v = (int) i; }
     }
-    if (v < 0) return nullptr;                         // every slot is pinned: this expert runs from the host
+    if (v < 0) { if (count) ++host_served; return nullptr; }                         // every slot is pinned or in flight: this expert runs from the host
     Slot& sl = pool[(size_t) v];
     if (sl.layer >= 0) where.erase((long long) sl.layer * c.n_exp + sl.exp);
     sl.layer = -1;
     const bool ok = upload_expert(sl, li, e);
-    if (!ok) { gpu_fail(gpu::last_error()); return nullptr; }
+    if (!ok) { if (count) ++host_served; gpu_fail(gpu::last_error()); return nullptr; }
+    if (count) ++pcie_served;                            // the upload really crossed the link: the device computes this expert
     sl.layer = li; sl.exp = e; sl.tick = tick;
     where[key] = v;
     return &sl;
@@ -506,37 +516,42 @@ void Model::Impl::expert_add(Layer& y, Work& w, const float* h, int e, float wt,
     for (int i = 0; i < H; ++i) acc[i] += wt * (w.eb[(size_t) i] + bf16_to_f32(db[i]));
 }
 
-// Decode with the device: the top-k experts of ONE token run AT THE SAME TIME, each on its own expert context.
-// expert_run_async returns WITHOUT waiting, so nothing is waited between the enqueues: the 4 pipelines overlap, and for N == 1 each is one CUDA graph.
-// The bias travels inside the slot, so the whole expert is one enqueue with no host step; the results are collected afterwards and summed.
-// Returns false if any expert had no slot or any call failed: acc is re-zeroed and the caller runs every expert on the host instead.
-bool Model::Impl::expert_add_batched(Layer& y, Work& w, const float* h, const int32_t* idx, const float* wt, float* acc) {
-    const int H = c.hidden, I = c.moe_ff, K = c.topk;
-    if (K > gpu::kExpertCtxBatch || in_parallel_region()) return false;
-    Slot* sl[gpu::kExpertCtxBatch];
-    bool run[gpu::kExpertCtxBatch] = {};
-    bool ok = true;
-    {
-        std::lock_guard<std::mutex> g(gmu);                      // the device calls stay serialised with the dense path
-        for (int k = 0; k < K; ++k) sl[k] = resident((int) (&y - L.data()), idx[k]);
-        for (int k = 0; k < K && ok; ++k) {
-            if (!sl[k]) continue;
+// Decode, one token: the top-k experts of the layer are all enqueued on their own context/stream (x and wt up, 4 kernels or one CUDA graph, y down) and
+// only then collected, instead of k times [matmat gate_up, host SwiGLU, matmat down] with a full sync each. A miss uploads over PCIe while the experts
+// already enqueued are computing. Whatever has no slot (all pinned/in flight, upload or enqueue failed, k > contexts) runs on the CPU
+// while the device works. The sum into acc stays in k order.
+void Model::Impl::experts_decode(Layer& y, Work& w, const float* h, const int32_t* idx, const float* wt, float* acc) {
+    const int H = c.hidden, I = c.moe_ff, K = c.topk, li = (int) (&y - L.data());
+    Slot* fly[gpu::kExpertCtxBatch] = {};
+    if (gpu_on && !pool.empty() && !in_parallel_region()) {
+        std::lock_guard<std::mutex> g(gmu);
+        for (int k = 0; k < K && k < gpu::kExpertCtxBatch && gpu_on; ++k) {
+            Slot* sl = resident(li, idx[k]);
+            if (!sl) continue;
             gpu::ExpertDesc d;
-            d.gu_b = sl[k]->gu_b; d.gu_s = sl[k]->gu_s; d.gu_bias = sl[k]->gu_bias;
-            d.dn_b = sl[k]->dn_b; d.dn_s = sl[k]->dn_s; d.dn_bias = sl[k]->dn_bias;
+            d.gu_b = sl->gu_b; d.gu_s = sl->gu_s; d.gu_bias = sl->gu_bias;
+            d.dn_b = sl->dn_b; d.dn_s = sl->dn_s; d.dn_bias = sl->dn_bias;
             d.H = H; d.I = I; d.halves = o.glu_halves ? 1 : 0; d.limit = c.swiglu_limit; d.alpha = c.swiglu_alpha;
-            if (!gpu::expert_run_async(k, d, h, wt + k, 1)) { gpu_fail(gpu::last_error()); ok = false; break; }
-            run[k] = true;
-        }
-        for (int k = 0; k < K && ok; ++k) {
-            if (!run[k]) continue;
-            if (!gpu::expert_collect(k, w.y.data())) { gpu_fail(gpu::last_error()); ok = false; break; }
-            for (int i = 0; i < H; ++i) acc[i] += w.y[(size_t) i];   // the kernel already multiplied by wt and added the bias
+            sl->busy = true;                                   // set before the enqueue: the next resident() of this loop must not pick it as the victim
+            if (gpu::expert_run_async(k, d, h, &wt[k], 1)) fly[k] = sl;
+            else { sl->busy = false; gpu_fail(gpu::last_error()); }
         }
     }
-    if (!ok) { for (int i = 0; i < H; ++i) acc[i] = 0.0f; return false; }
-    for (int k = 0; k < K; ++k) if (!run[k]) expert_add(y, w, h, idx[k], wt[k], acc);   // an expert without a slot runs on the host
-    return true;
+    float* part = w.part.data();
+    for (int k = 0; k < K; ++k) {                              // CPU share: runs while the device computes the experts above
+        if (k < gpu::kExpertCtxBatch && fly[k]) continue;
+        float* pk = part + (size_t) k * H;
+        std::fill(pk, pk + H, 0.0f);
+        expert_add(y, w, h, idx[k], wt[k], pk);
+    }
+    for (int k = 0; k < K && k < gpu::kExpertCtxBatch; ++k) {  // collect: the device already applied wt[k] and the down bias
+        if (!fly[k]) continue;
+        float* pk = part + (size_t) k * H;
+        bool ok;
+        { std::lock_guard<std::mutex> g(gmu); ok = gpu::expert_collect(k, pk); fly[k]->busy = false; if (!ok) gpu_fail(gpu::last_error()); }
+        if (!ok) { std::fill(pk, pk + H, 0.0f); expert_add(y, w, h, idx[k], wt[k], pk); }
+    }
+    for (int k = 0; k < K; ++k) { const float* pk = part + (size_t) k * H; for (int i = 0; i < H; ++i) acc[i] += pk[i]; }
 }
 
 // Batched prefill with the device: every projection and every expert is ONE pass over the weights for the whole chunk.
@@ -653,6 +668,7 @@ void Model::forward(int token, int pos, std::vector<float>* logits_out) {
     const GptConfig& c = s.c;
     const int H = c.hidden;
     if (pos < 0 || pos >= s.o.ctx || token < 0 || token >= c.vocab) { if (logits_out) logits_out->assign((size_t) c.vocab, 0.0f); return; }
+    s.counting = true;                                   // this token's expert lookups are counted (the per-request line)
     std::vector<float> x((size_t) H), acc((size_t) H);
     for (int i = 0; i < H; ++i) x[(size_t) i] = bf16_to_f32(((const uint16_t*) s.embed.p)[(size_t) token * H + i]);
     Work& w = s.works[0];
@@ -664,11 +680,7 @@ void Model::forward(int token, int pos, std::vector<float>* logits_out) {
         s.route_tok(L, w, x.data(), idx, wt);
         const std::vector<float> h = w.h;
         std::fill(acc.begin(), acc.end(), 0.0f);
-        bool batched = false;
-        if (s.gpu_on && !s.pool.empty() && c.topk <= gpu::kExpertCtxBatch)
-            batched = s.expert_add_batched(L, w, h.data(), idx, wt, acc.data());   // the 4 experts overlap on their own contexts
-        if (!batched)
-            for (int k = 0; k < c.topk; ++k) s.expert_add(L, w, h.data(), idx[k], wt[k], acc.data());
+        s.experts_decode(L, w, h.data(), idx, wt, acc.data());   // device experts in flight together; whatever has no slot runs on the host
         for (int i = 0; i < H; ++i) x[(size_t) i] += acc[(size_t) i];
     }
     if ((int) s.cached.size() > pos) s.cached.resize((size_t) pos);
@@ -678,6 +690,7 @@ void Model::forward(int token, int pos, std::vector<float>* logits_out) {
         logits_out->resize((size_t) c.vocab);
         s.mv(s.lm_head, s.d_head, s.lastn.data(), logits_out->data());
     }
+    s.counting = false;
 }
 
 void Model::prefill(const int* tokens, int n, int start_pos, std::vector<float>* logits_last) {
@@ -832,16 +845,31 @@ bool Model::load_profile(const std::string& path, std::string& err) {
     return true;
 }
 
+void Model::begin_request_stats() {
+    Impl& s = *p_;
+    s.base_hits = s.hits; s.base_lookups = s.hits + s.host_served; s.base_pcie = s.pcie_served;
+}
+
+void Model::request_stats(unsigned long long* hits, unsigned long long* lookups, unsigned long long* pcie) const {
+    const Impl& s = *p_;
+    *hits = (unsigned long long) (s.hits - s.base_hits);
+    *lookups = (unsigned long long) ((s.hits + s.host_served) - s.base_lookups);
+    *pcie = (unsigned long long) (s.pcie_served - s.base_pcie);
+}
+
 std::string Model::stats() const {
     const Impl& s = *p_;
     if (s.pool.empty()) return "";
     size_t pinned = 0;
     for (const auto& sl : s.pool) pinned += sl.pinned ? 1 : 0;
-    const double tot = (double) (s.hits + s.misses);
+    const unsigned long long lookups = (unsigned long long) (s.hits + s.host_served);
+    const double tot = (double) lookups;
     char b[320];
-    std::snprintf(b, sizeof b, "experts: %zu slots (%zu pinned), hits %llu (of which pinned %llu), misses %llu, hit rate %.1f%%, oom fallbacks %llu", s.pool.size(), pinned,
-                  (unsigned long long) s.hits, (unsigned long long) s.pin_hits, (unsigned long long) s.misses, tot > 0 ? 100.0 * (double) s.hits / tot : 0.0,
-                  (unsigned long long) s.oom_fallbacks);
+    std::snprintf(b, sizeof b, "experts: %zu slots (%zu pinned), hits %llu (of which pinned %llu), lookups %llu, hit rate %.1f%%; %llu of the %llu routed experts read over PCIe, %llu on the host, oom fallbacks %llu",
+                  s.pool.size(), pinned, (unsigned long long) s.hits, (unsigned long long) s.pin_hits, lookups,
+                  tot > 0 ? 100.0 * (double) s.hits / tot : 0.0,
+                  (unsigned long long) s.pcie_served, (unsigned long long) (lookups + s.pcie_served),
+                  (unsigned long long) s.host_served, (unsigned long long) s.oom_fallbacks);
     return b;
 }
 
