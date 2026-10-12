@@ -26,6 +26,7 @@ bool h2d(void* d, const void* h, size_t n) { std::memcpy(d, h, n); return true; 
 void set_options(bool) {}
 bool reserve_scratch(size_t, size_t, int, int, int) { return true; }
 std::string last_error() { return ""; }
+bool last_oom() { return false; }
 
 bool matmat_bf16(const void* dW, int rows, int cols, const float* hx, int N, float* hy) {
     WView w; w.p = (const uint8_t*) dW; w.rows = rows; w.cols = cols; w.dt = DType::BF16;
