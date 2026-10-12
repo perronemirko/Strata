@@ -54,7 +54,13 @@ public:
     /// Expert usage profile (how many times each (layer, expert) was routed to). Binary: "GPPRF001", u32 layers, u32 experts, u64[layers*experts].
     bool save_profile(const std::string& path, std::string& err) const;
     bool load_profile(const std::string& path, std::string& err);
-    std::string stats() const;          // slots / pinned / hits / misses ("" without a device pool)
+    std::string stats() const;          // slots / pinned / hits / misses / PCIe ("" without a device pool)
+    /// Per-request decode counters, same fields as Strata's DONE line (hits, lookups, offloaded over PCIe).
+    /// Call begin_request_stats() before the request; request_stats() after it returns the request's own counts.
+    /// A routed expert is either a VRAM hit, uploaded over PCIe, or computed on the host: lookups = hits + host-served,
+    /// offloaded = PCIe-served, so lookups + offloaded = every expert the decode routed. Prefill lookups are not counted.
+    void begin_request_stats();
+    void request_stats(unsigned long long* hits, unsigned long long* lookups, unsigned long long* pcie) const;
     const GptConfig& config() const;
     uint64_t weight_bytes() const;
 
