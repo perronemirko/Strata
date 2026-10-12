@@ -29,9 +29,10 @@ struct Layer {
     size_t slot(int pos) const { return sliding ? (size_t) pos % (size_t) cap : (size_t) pos; }
 };
 struct Work { std::vector<float> h, q, k, v, att, tmp, glog, y, gu, act, eb, sc; };
-struct Slot {                                          // one expert in VRAM: [gate_up blocks | gate_up scales | down blocks | down scales]
+struct Slot {                                          // one expert in VRAM: [gate_up blocks | gate_up scales | down blocks | down scales | gate_up bias | down bias]
     void* base = nullptr;
     uint8_t *gu_b = nullptr, *gu_s = nullptr, *dn_b = nullptr, *dn_s = nullptr;
+    uint16_t *gu_bias = nullptr, *dn_bias = nullptr;         // device copies of the BF16 bias rows: the expert kernels add them, so the async pipeline needs no host step
     int layer = -1, exp = -1;
     uint64_t tick = 0;
     bool pinned = false;                               // chosen by the usage profile: never evicted
@@ -55,6 +56,7 @@ struct Model::Impl {
     std::vector<Work> works;
     std::vector<int> cached;
     int chunk_max = 1;
+    uint64_t oom_fallbacks = 0;                        // device calls that found the scratch/slot allocation did not fit: host fallback, device stays on
     // --- device state (empty/false unless RunOpts::cuda)
     bool gpu_on = false;
     void* d_head = nullptr;                            // lm_head on the device
@@ -70,6 +72,7 @@ struct Model::Impl {
     void attn_out(Layer& y, Work& w, float* x, int pos);
     void route_tok(Layer& y, Work& w, const float* x, int32_t* idx, float* wt);
     void expert_add(Layer& y, Work& w, const float* h, int e, float wt, float* acc);
+    bool expert_add_batched(Layer& y, Work& w, const float* h, const int32_t* idx, const float* wt, float* acc);
     std::string fingerprint() const;
     void plan_vram() const;
     bool gpu_setup(std::string& err);
@@ -312,6 +315,15 @@ void Model::Impl::route_tok(Layer& y, Work& w, const float* x, int32_t* idx, flo
 }
 
 void Model::Impl::gpu_fail(const std::string& what) {
+    if (gpu::last_oom()) {                             // an allocation that did not fit is NOT a poisoned context: run this call on the host,
+        ++oom_fallbacks;                               // shrink the chunk so the next one fits, and keep the device for the rest of the session
+        if (chunk_max > 1) {
+            chunk_max = std::max(1, chunk_max / 2);
+            std::fprintf(stderr, "gptoss: CUDA call failed (%s): prefill chunk halved to %d, the device stays on\n", what.c_str(), chunk_max);
+        } else
+            std::fprintf(stderr, "gptoss: CUDA call failed (%s): this call runs on the host, the device stays on\n", what.c_str());
+        return;
+    }
     std::fprintf(stderr, "gptoss: CUDA call failed (%s): continuing on the CPU for the rest of the session\n", what.c_str());
     gpu_on = false;                                    // sticky errors poison every later call: stop using the device
 }
@@ -338,9 +350,33 @@ bool Model::Impl::gpu_setup(std::string& err) {
     const double dense_used = budget0 - budget;
 
     const size_t H = (size_t) c.hidden, I = (size_t) c.moe_ff;
+    // The dense scratch must fit the WHOLE prefill chunk, not one token: prefill_gpu calls mm(..., T = chunk_max) on q/k/v/o/router, so run_matmat
+    // grows it to T * cols / T * rows floats. Sized for N == 1 it OOMs at the first prefill call and the session falls back to the CPU.
+    // Reserve it BEFORE the slots take the VRAM (no cudaMalloc mid-generation), and halve the chunk until the scratch fits what is left.
+    size_t max_rows = (size_t) c.n_exp;                // rows of the projections that run batched: q, k, v, o, router
+    for (const Layer& y : L) { max_rows = std::max(max_rows, std::max((size_t) y.q.rows, std::max((size_t) y.k.rows, std::max((size_t) y.v.rows, std::max((size_t) y.o.rows, (size_t) y.router.rows))))); }
+    const double ctx_floats = 3.0 * (double) H + 3.0 * (double) I + 1.0;   // one expert context at N == 1 (d_x, d_wt, d_gu, d_act, d_eb, d_y)
+    const int want_chunk = std::max(1, chunk_max);
+    int chunk = want_chunk;
+    size_t nx = 0, ny = 0;
+    for (;;) {
+        nx = (size_t) chunk * H;
+        ny = std::max((size_t) chunk * max_rows, (size_t) c.vocab);        // the lm_head/router mv() calls run at N == 1 over vocab rows
+        const double need = 4.0 * ((double) (nx + ny) + (double) (gpu::kExpertCtxBatch + 1) * ctx_floats);
+        if (need <= budget) break;
+        if (chunk == 1) { std::fprintf(stderr, "gptoss:   the dense scratch does not fit the VRAM left: the device path stays off\n"); err = "dense scratch does not fit"; return false; }
+        chunk /= 2;
+    }
+    if (!gpu::reserve_scratch(nx, ny, 1, (int) H, (int) I)) { err = gpu::last_error(); return false; }
+    budget -= 4.0 * ((double) (nx + ny) + (double) (gpu::kExpertCtxBatch + 1) * ctx_floats);
+    if (chunk < want_chunk) {
+        chunk_max = chunk;
+        std::fprintf(stderr, "gptoss: prefill chunk %d -> %d so the dense scratch fits the VRAM left\n", want_chunk, chunk);
+    }
     auto al = [](size_t v) { return (v + 255) & ~(size_t) 255; };
     const size_t s_gub = 2 * I * (H / 32) * 16, s_gus = 2 * I * (H / 32), s_dnb = H * (I / 32) * 16, s_dns = H * (I / 32);
-    const size_t o2 = al(s_gub), o3 = o2 + al(s_gus), o4 = o3 + al(s_dnb), slot_bytes = o4 + al(s_dns);
+    const size_t s_gubias = 2 * I * 2, s_dnbias = H * 2;   // the BF16 bias rows travel with the expert: the async pipeline has no host step to add them
+    const size_t o2 = al(s_gub), o3 = o2 + al(s_gus), o4 = o3 + al(s_dnb), o5 = o4 + al(s_dns), o6 = o5 + al(s_gubias), slot_bytes = o6 + al(s_dnbias);
     long long want = std::min<long long>((long long) c.layers * c.n_exp, budget > 0 ? (long long) (budget / (double) slot_bytes) : 0);
     if (o.gpu_slots >= 0) want = std::min<long long>(want, o.gpu_slots);
     for (long long i = 0; i < want; ++i) {
@@ -349,6 +385,7 @@ bool Model::Impl::gpu_setup(std::string& err) {
         Slot sl;
         uint8_t* p = (uint8_t*) b;
         sl.base = b; sl.gu_b = p; sl.gu_s = p + o2; sl.dn_b = p + o3; sl.dn_s = p + o4;
+        sl.gu_bias = (uint16_t*) (p + o5); sl.dn_bias = (uint16_t*) (p + o6);
         pool.push_back(sl);
     }
     if (!pool.empty() && o.pin_pct > 0) {              // pin the hottest experts of the profile, globally ranked
@@ -383,7 +420,9 @@ bool Model::Impl::upload_expert(Slot& sl, int li, int e) {
     return gpu::h2d(sl.gu_b, y.gu.blocks + (size_t) e * 2 * I * G1 * 16, 2 * I * G1 * 16) &&
            gpu::h2d(sl.gu_s, y.gu.scales + (size_t) e * 2 * I * G1, 2 * I * G1) &&
            gpu::h2d(sl.dn_b, y.dn.blocks + (size_t) e * H * G2 * 16, H * G2 * 16) &&
-           gpu::h2d(sl.dn_s, y.dn.scales + (size_t) e * H * G2, H * G2);
+           gpu::h2d(sl.dn_s, y.dn.scales + (size_t) e * H * G2, H * G2) &&
+           gpu::h2d(sl.gu_bias, y.gu_bias + (size_t) e * 2 * I, 2 * I * 2) &&
+           gpu::h2d(sl.dn_bias, y.dn_bias + (size_t) e * H, H * 2);
 }
 
 void Model::Impl::count_use(int li, const int32_t* idx) {
@@ -465,6 +504,39 @@ void Model::Impl::expert_add(Layer& y, Work& w, const float* h, int e, float wt,
     }
     const uint16_t* db = y.dn_bias + (size_t) e * H;
     for (int i = 0; i < H; ++i) acc[i] += wt * (w.eb[(size_t) i] + bf16_to_f32(db[i]));
+}
+
+// Decode with the device: the top-k experts of ONE token run AT THE SAME TIME, each on its own expert context.
+// expert_run_async returns WITHOUT waiting, so nothing is waited between the enqueues: the 4 pipelines overlap, and for N == 1 each is one CUDA graph.
+// The bias travels inside the slot, so the whole expert is one enqueue with no host step; the results are collected afterwards and summed.
+// Returns false if any expert had no slot or any call failed: acc is re-zeroed and the caller runs every expert on the host instead.
+bool Model::Impl::expert_add_batched(Layer& y, Work& w, const float* h, const int32_t* idx, const float* wt, float* acc) {
+    const int H = c.hidden, I = c.moe_ff, K = c.topk;
+    if (K > gpu::kExpertCtxBatch || in_parallel_region()) return false;
+    Slot* sl[gpu::kExpertCtxBatch];
+    bool run[gpu::kExpertCtxBatch] = {};
+    bool ok = true;
+    {
+        std::lock_guard<std::mutex> g(gmu);                      // the device calls stay serialised with the dense path
+        for (int k = 0; k < K; ++k) sl[k] = resident((int) (&y - L.data()), idx[k]);
+        for (int k = 0; k < K && ok; ++k) {
+            if (!sl[k]) continue;
+            gpu::ExpertDesc d;
+            d.gu_b = sl[k]->gu_b; d.gu_s = sl[k]->gu_s; d.gu_bias = sl[k]->gu_bias;
+            d.dn_b = sl[k]->dn_b; d.dn_s = sl[k]->dn_s; d.dn_bias = sl[k]->dn_bias;
+            d.H = H; d.I = I; d.halves = o.glu_halves ? 1 : 0; d.limit = c.swiglu_limit; d.alpha = c.swiglu_alpha;
+            if (!gpu::expert_run_async(k, d, h, wt + k, 1)) { gpu_fail(gpu::last_error()); ok = false; break; }
+            run[k] = true;
+        }
+        for (int k = 0; k < K && ok; ++k) {
+            if (!run[k]) continue;
+            if (!gpu::expert_collect(k, w.y.data())) { gpu_fail(gpu::last_error()); ok = false; break; }
+            for (int i = 0; i < H; ++i) acc[i] += w.y[(size_t) i];   // the kernel already multiplied by wt and added the bias
+        }
+    }
+    if (!ok) { for (int i = 0; i < H; ++i) acc[i] = 0.0f; return false; }
+    for (int k = 0; k < K; ++k) if (!run[k]) expert_add(y, w, h, idx[k], wt[k], acc);   // an expert without a slot runs on the host
+    return true;
 }
 
 // Batched prefill with the device: every projection and every expert is ONE pass over the weights for the whole chunk.
@@ -592,7 +664,11 @@ void Model::forward(int token, int pos, std::vector<float>* logits_out) {
         s.route_tok(L, w, x.data(), idx, wt);
         const std::vector<float> h = w.h;
         std::fill(acc.begin(), acc.end(), 0.0f);
-        for (int k = 0; k < c.topk; ++k) s.expert_add(L, w, h.data(), idx[k], wt[k], acc.data());
+        bool batched = false;
+        if (s.gpu_on && !s.pool.empty() && c.topk <= gpu::kExpertCtxBatch)
+            batched = s.expert_add_batched(L, w, h.data(), idx, wt, acc.data());   // the 4 experts overlap on their own contexts
+        if (!batched)
+            for (int k = 0; k < c.topk; ++k) s.expert_add(L, w, h.data(), idx[k], wt[k], acc.data());
         for (int i = 0; i < H; ++i) x[(size_t) i] += acc[(size_t) i];
     }
     if ((int) s.cached.size() > pos) s.cached.resize((size_t) pos);
@@ -763,8 +839,9 @@ std::string Model::stats() const {
     for (const auto& sl : s.pool) pinned += sl.pinned ? 1 : 0;
     const double tot = (double) (s.hits + s.misses);
     char b[320];
-    std::snprintf(b, sizeof b, "experts: %zu slots (%zu pinned), hits %llu (of which pinned %llu), misses %llu, hit rate %.1f%%", s.pool.size(), pinned,
-                  (unsigned long long) s.hits, (unsigned long long) s.pin_hits, (unsigned long long) s.misses, tot > 0 ? 100.0 * (double) s.hits / tot : 0.0);
+    std::snprintf(b, sizeof b, "experts: %zu slots (%zu pinned), hits %llu (of which pinned %llu), misses %llu, hit rate %.1f%%, oom fallbacks %llu", s.pool.size(), pinned,
+                  (unsigned long long) s.hits, (unsigned long long) s.pin_hits, (unsigned long long) s.misses, tot > 0 ? 100.0 * (double) s.hits / tot : 0.0,
+                  (unsigned long long) s.oom_fallbacks);
     return b;
 }
 

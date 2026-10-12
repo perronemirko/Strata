@@ -52,6 +52,7 @@ bool event_record_copy(int ev);              // records `ev` after every copy is
 bool host_register(const void* p, size_t n); // page-locks a host range (read-only) so copies from it are true DMA; pages inside only
 
 std::string last_error();
+bool last_oom();                       // true if the last failure was an allocation that did not fit (not a poisoned context: the host can shrink and retry)
 
 }  // namespace gpu
 }  // namespace gptoss
