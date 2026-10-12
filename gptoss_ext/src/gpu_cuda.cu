@@ -30,6 +30,7 @@ constexpr int WARPS = 4;                // output rows per block (warp-per-row k
 constexpr int NCTX = 5;                 // expert contexts: 0..3 decode, 4 batch
 
 std::string g_err;
+bool g_oom = false;                   // last ck() failure was cudaErrorMemoryAllocation: not sticky, the caller can shrink and retry
 std::mutex g_err_mu, g_copy_mu;
 cudaStream_t g_comp = nullptr, g_copy = nullptr;
 int g_cc = 0;                           // compute capability, major*10 + minor
@@ -39,6 +40,7 @@ __constant__ float c_fp4[16];
 bool ck(cudaError_t e, const char* what) {
     if (e == cudaSuccess) return true;
     std::lock_guard<std::mutex> lk(g_err_mu);
+    g_oom = (e == cudaErrorMemoryAllocation);
     g_err = std::string(what) + ": " + cudaGetErrorString(e);
     return false;
 }
@@ -375,6 +377,7 @@ bool is_registered(const void* p, size_t n) {
 
 bool is_emulated() { return false; }
 std::string last_error() { std::lock_guard<std::mutex> lk(g_err_mu); return g_err; }
+bool last_oom() { std::lock_guard<std::mutex> lk(g_err_mu); return g_oom; }
 void set_options(bool use_graphs) { g_graphs = use_graphs; }
 
 bool init(int device, std::string& err) {

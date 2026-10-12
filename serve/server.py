@@ -6019,6 +6019,7 @@ class Service:
                         normalized_calls.append(call)
                 msg["tool_calls"] = normalized_calls
         # --------------------------------------------------------
+        
         ids = self.encode_prompt(messages, tools, kwargs)
         if force and kwargs.get("enable_thinking", True) is False:
             ids = ids + self.tok.encode(force, parse_special=True)
