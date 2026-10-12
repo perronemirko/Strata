@@ -60,6 +60,36 @@ Primo passo sul modello vero: `python3 tools/dump_safetensors_shapes.py --hf ope
   Decode of one token (`experts_decode`): the top-k experts run **at the same time**, one per device context (`kExpertCtxBatch = 4`): `expert_run_async` enqueues the whole expert without waiting, `expert_collect` waits per context and accumulates. Each expert's result goes into its own `part[k]` slice, so an expert without a slot (all slots pinned or in flight, upload or enqueue failed) runs on the host **while the device experts are still computing**, and a failed collect re-runs just that expert on the host; the sum into `acc` stays in k order. A slot in flight carries `busy = true` and cannot be chosen as the LRU victim. The scratch of the 4 contexts is reserved in `gpu_setup` before the pool, so no allocation happens during decode once VRAM is full.
   Proof of the async path (emulated device, never on CUDA): `test_gptoss_core` with `slots = 5`, `slots = 0` and `slots = -1` gives the same logits as the CPU path (max |diff| 3.3e-05 on decode, 6.9e-06 on the last token of a full prefill), identical to the run without the batched path.
 
+### The async decode on the real card (measured failure, 2026-10-12)
+
+The runs before 21:00 answered correctly; the runs from 21:50 on answer with gibberish. The difference is one commit:
+`experts_decode` and `expert_add_batched` landed in 45539c06 (21:00:50), and `build-out/gptoss_run_cuda` was rebuilt at
+21:45. The engine log of the broken runs (`serve-work/gptoss_engine.log`, lines 529, 634, 661, 680, 697, 719):
+
+```
+gptoss: CUDA device 'NVIDIA GeForce RTX 4090' (real): dense weights 2.88 GiB on device, 1407 expert slots of 12.62 MiB (31% of the 4608 experts)
+gptoss_run: 89 prompt (89 read) -> 529 tokens, cancel (4103 ms prefill = 21.7 tok/s, 17923 ms decode = 29.5 tok/s)
+gptoss_run: experts: 1407 slots (1125 pinned), hits 75037, lookups 75037, hit rate 100.0%; 995 of the 76032 routed experts read over PCIe, 0 on the host, oom fallbacks 0, promotions 14
+```
+
+What the numbers rule out: the cache. 100% hit rate, 0 host fallbacks, decode 6x the CPU path. The experts are found and
+uploaded; their **result** is wrong. So the fault is inside the CUDA async path itself - the streams, the events and the
+graph in `gpu_cuda.cu` - and that path has never been testable here: `gpu.cpp`'s `expert_run_async` runs the expert
+immediately and ignores `ci`'s stream, its event and the graph, so the emulated device passes with the same `model.cpp`
+(checked: `promote_test` with `slots=-1`, 63 real hits, `promote_locked` firing, max|diff| 3.32e-05 = the CPU path).
+
+Changed in this session (compiles clean with `nvcc` sm_89, no warning; `sh build.sh` still `all ok`): `expert_kernels`
+is the kernel sequence alone, `enqueue_expert` = copies + `expert_kernels` + copy back, and `build_graph` captures only
+the kernels, with `expert_run_async` issuing the desc/x/wt copies before `cudaGraphLaunch`. This makes the staged data
+explicit instead of relying on the graph replaying the copies; it is **not** a proven root cause, and it has not been run
+on a card.
+
+Owed, and what would settle it: one run on the free card, plus the new `--no-device-graphs` (in `RunOpts`, applied by
+`gpu_setup` through `gpu::set_options`: the same kernels enqueued one by one, no graph captured). If the no-graph run
+answers correctly and the graph run does not, the graph is the fault; if both are wrong, it is the stream/event ordering.
+`--gpu-slots 0` removes the device experts entirely and must answer correctly: it is the control for both. The exact
+commands are in [../../docs/TEST_REQUESTS.md](../../docs/TEST_REQUESTS.md) ("The gpt-oss async decode").
+
 ### The dense scratch and the VRAM budget (measured failure, 2026-10-12)
 
 The first real run on this PC (i7-14700K, 28 threads, RTX 4090 24564 MiB) never used the GPU. The engine log says so:

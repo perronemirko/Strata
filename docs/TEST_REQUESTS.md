@@ -18,5 +18,26 @@ This list is edited by the maintainers. An item stays until a report answers it.
 | AMD RX 7000 series (RX 7900 XTX, 7900 XT, 7800 XT and similar, RDNA 3) on Linux or Windows | The RX 7000 builds have not been run on a real RX 7000 card by us; the Docker image for them is also untested on a card | none yet |
 | Windows with an AMD card: the app or the Terminal, one model, one picture sent | The Windows AMD build has not been run on a real card, and neither has its picture reader (CPU under 24 GB, GPU from 24 GB) | none yet |
 | A Mac with Apple silicon (macOS 15 or newer): the app or the Terminal with a real model | Mac builds have run on very few Macs. Tell us the Mac's memory, the model, the speed, and anything that failed. Pictures on the Mac (GPU reader) were run on one Mac mini M4 only: tell us if they work on yours. The signing script has not been run against Apple's real notary service yet, so a first-launch warning is expected and useful to hear about | none yet |
+| The gpt-oss engine (`gptoss_ext/`) on a free NVIDIA card, three runs of the same prompt: with the CUDA graph, with `--no-device-graphs`, with `--gpu-slots 0` | The async decode of the top-k experts has never run on a card: on the emulated device it is correct (max |diff| 3.3e-05 against the CPU path), on the RTX 4090 at 2026-10-12 21:50 the same code answered with gibberish while its own counters said the cache was fine (100% hit rate, 0 host fallbacks, 29.5 tok/s). The three runs tell whether the graph or the stream/event ordering is at fault | none yet |
 
 To add a request, open a pull request that adds a row, or tell the maintainers in an issue.
+
+## The gpt-oss async decode (exact commands)
+
+The card must be free: the Qwen engine and the gpt-oss engine cannot share it (the attempt at 2026-10-12 15:51 died at
+`cudaSetDevice: out of memory` with the Qwen engine holding 23810 of 24564 MiB). Build first: `sh gptoss_ext/build.sh --cuda`
+(nvcc sm_89, clean). Then, on the same PC and model file, three runs of one prompt:
+
+```
+python3 gptoss_ext/tools/serve_gptoss_strata.py --model /media/albus/windows/Users/mio/models/llm_models/models/lmstudio-community/gpt-oss-120b \
+  --cuda --exe gptoss_ext/build-out/gptoss_run_cuda --ctx 8192 --threads 10 --prefill-chunk 4 --kv-rollback 4 --pin-pct 80 \
+  --expert-profile gptoss_ext/profile.prof --expert-profile-save gptoss_ext/profile.prof --expert-profile-save-every 1 \
+  --expert-lru-layered --expert-promote 25 --profile-decay 200000 --glu-halves --rope-pairs --no-concentration
+```
+
+- run 1: as above (the graph path).
+- run 2: add `--engine-arg --no-device-graphs` (the same kernels one at a time, no graph captured).
+- run 3: add `--engine-arg --gpu-slots 0` (no expert on the card: the control, must answer correctly).
+
+Report the answer text of each run, the `gptoss_run: experts:` line and the `T`/`DONE` lines from `gptoss_ext/serve-work/gptoss_engine.log`.
+What is not tested here: any CUDA path at all — the card is always held by the Qwen engine.
