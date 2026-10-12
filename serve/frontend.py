@@ -29,7 +29,6 @@ import jinja2
 from jinja2.sandbox import ImmutableSandboxedEnvironment
 
 LOGGER = logging.getLogger(__name__)
-from datetime import datetime
 
 
 # ------------------------------------------------------------------------------------------------ template
@@ -48,10 +47,16 @@ class ChatTemplate:
         def tojson(x, ensure_ascii=False, indent=None, separators=None, sort_keys=False):
             return json.dumps(x, ensure_ascii=ensure_ascii, indent=indent, separators=separators, sort_keys=sort_keys)
 
+        def strftime_now(fmt):
+            """The template's current date, as HF's apply_chat_template and llama.cpp both provide it.
+            gpt-oss's template calls strftime_now("%Y-%m-%d") in its system message (#1101)."""
+            import time
+            return time.strftime(fmt)
+
         env = ImmutableSandboxedEnvironment(trim_blocks=True, lstrip_blocks=True, extensions=["jinja2.ext.loopcontrols"])
         env.filters["tojson"] = tojson
         env.globals["raise_exception"] = raise_exception
-        env.globals["strftime_now"] = (lambda fmt: datetime.now().strftime(fmt))
+        env.globals["strftime_now"] = strftime_now
         self.source = Path(path).read_text(encoding="utf-8")
         self.template = env.from_string(self.source)
         self.caps = self._detect_caps()
