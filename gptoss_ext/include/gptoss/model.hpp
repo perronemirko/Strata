@@ -33,6 +33,7 @@ struct RunOpts {
     int expert_promote = 0;          // 0 = off: an LRU expert counted this many hits becomes pinned, and the least-used pinned expert becomes LRU (no PCIe traffic, same slot count)
     bool expert_lru_layered = false; // evict inside the requesting layer first, so a cold expert of one layer cannot push out a hot expert of another
     long long profile_decay = 0;     // 0 = off: halve every usage count after a save while their sum is above this, so the pinning follows the recent sessions
+    bool device_graphs = true;       // CUDA graphs for the decode expert pipeline (gpu::set_options). false = the same kernels, enqueued one by one: the switch that isolates the graph from the stream/event ordering
     // --- VRAM budget: --vram-pct of the card (or of --vram-total-mib when given) minus the reserve. With cuda=false it is only a plan.
     double vram_pct = -1;
     long long vram_total_mib = 0, vram_reserve_mib = 1024;

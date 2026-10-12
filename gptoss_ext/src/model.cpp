@@ -361,6 +361,7 @@ void Model::Impl::gpu_fail(const std::string& what) {
 
 bool Model::Impl::gpu_setup(std::string& err) {
     if (!gpu::init(o.cuda_device, err)) return false;
+    gpu::set_options(o.device_graphs);   // --no-device-graphs: the same kernels enqueued one by one, no graph captured
     size_t freeb = 0, totb = 0;
     gpu::mem_info(&freeb, &totb);
     const double total = o.vram_total_mib > 0 ? (double) o.vram_total_mib * 1048576.0 : (double) totb;
