@@ -127,18 +127,20 @@ The model said "stop", the client heard "length": the answer was cut and its rea
 
 ## Three knobs that only move WHICH experts hold the slots
 
-The line `gptoss: expert slots (1407): 9169 hits, 1859 misses` says 16.8% of the routed activations of that run missed. Two things decide that number, and both are blunt: the pinned set is chosen once, at load, from a profile that sums every past session; and the LRU region is `100 - --pin-pct` % of the slots (20% by default, ~280 slots spread over 31 layers). These three flags act on that, and on nothing else: no slot is added, no arithmetic changes, the GGUF is untouched. All are opt-in; with the defaults (`0`, off, `0`) the code path is the one of the previous release and the profile file is byte-identical.
+The line `gptoss: expert slots (1407): 9169 hits, 1859 misses` says 16.8% of the routed activations of that run missed. Two things decide that number, and both are blunt: the pinned set is chosen once, at load, from a profile that sums every past session; and the LRU region is `100 - --pin-pct` % of the slots (20% by default, ~280 slots spread over the model's 36 layers x 128 experts = 4608 experts, of which a 24.5 GiB card can hold ~1470). These three flags act on that, and on nothing else: no slot is added, no arithmetic changes, the GGUF is untouched. All are opt-in; with the defaults (`0`, off, `0`) the code path is the one of the previous release and the profile file is byte-identical.
+
+`--expert-promote` keeps the pinned set at the size `--pin-pct` asked for: below that cap a promoted expert only pins, at the cap it trades with the coldest pinned one. With `--pin-pct 0` the cap is 0 and the flag does nothing — a pure-LRU run has no pinned set to correct, so raise `--pin-pct` above 0 if the goal is to fight misses.
 
 | Flag | What it does | Where | Cost |
 | --- | --- | --- | --- |
-| `--expert-promote N` | an expert served N times from an LRU slot during the decode swaps its PIN with the coldest pinned expert; the swap happens only if the demoted one really is colder | `Model::Impl::promote_locked`, `src/model.cpp` | no PCIe, no upload: both experts are already in VRAM, only the flag trades |
+| `--expert-promote N` | an expert served N times from an LRU slot during the decode pins itself, and at the `--pin-pct` cap it trades with the coldest pinned expert; the trade happens only if the demoted one really is colder | `Model::Impl::promote_locked`, `src/model.cpp` | no PCIe, no upload: both experts are already in VRAM, only the flag trades |
 | `--expert-lru-layered` | on a miss, evict first the coldest LRU slot **of the requesting layer**; fall back to the global LRU scan when that layer has none | `Model::Impl::victim_slot`, `src/model.cpp` | one extra scan over the pool per miss |
 | `--profile-decay N` | after a profile save, halve the whole usage table once its sum passes N; the ranking is kept, the weight of old sessions is bounded | `Model::decay_profile`, called from `save_prof` (`src/serve_loop.cpp`) and from the one-shot exit path (`src/gptoss_run_main.cpp`) | one pass over `layers*experts` u64s, only at a save |
 
 Why they should help, on the shape of that run:
 
 - The pinned set follows the profile of every session ever run. A long run of a different task dilutes it, and the next start pins the wrong experts; `--profile-decay` keeps the ranking fresh without re-spawning the process.
-- A global LRU lets one chatty layer evict the LRU slots of every other layer. With ~280 LRU slots over 31 layers, one layer's traffic can evict another layer's hot expert; `--expert-lru-layered` keeps the eviction where it belongs.
+- A global LRU lets one chatty layer evict the LRU slots of every other layer. With ~280 LRU slots over 36 layers, one layer's traffic can evict another layer's hot expert; `--expert-lru-layered` keeps the eviction where it belongs.
 - `--expert-promote` fixes both at runtime, without a restart: whatever the decode really keeps using and was found by LRU becomes pinned, and the pinned expert the profile overestimated goes back to the LRU pool.
 
 **Not measured.** No run with these flags was started here (the GPU holds the next task). The `experts:` line printed after each request ends now with `promotions N` when `--expert-promote` is on (cumulative, like the other counters in that line; with the flag off the line is byte-identical to the last release, so the server window's `_parse_done` fields do not move). A run that never promotes is visible and one that promotes on every token is too. To compare: same binary, same prompts, one arm per flag, and report the `experts:` line of each arm.
