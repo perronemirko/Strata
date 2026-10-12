@@ -29,6 +29,10 @@ struct Layer {
     size_t slot(int pos) const { return sliding ? (size_t) pos % (size_t) cap : (size_t) pos; }
 };
 struct Work { std::vector<float> h, q, k, v, att, tmp, glog, y, gu, act, eb, sc, part; };   // part: [topk][H] per-expert contributions of one decode layer
+struct KvStage {                                       // a prefill chunk's own K/V, kept outside the ring until the chunk's attention has read it
+    const float *K = nullptr, *V = nullptr;            // [T][kv_dim] of positions base..base+T-1
+    int base = 0;
+};
 struct Slot {                                          // one expert in VRAM: [gate_up blocks | gate_up scales | down blocks | down scales | gate_up bias | down bias]
     void* base = nullptr;
     uint8_t *gu_b = nullptr, *gu_s = nullptr, *dn_b = nullptr, *dn_s = nullptr;
@@ -73,8 +77,8 @@ struct Model::Impl {
 
     void init_work(Work& w) const;
     Work& my_work();
-    void attn_in(Layer& y, Work& w, const float* x, int pos);
-    void attn_out(Layer& y, Work& w, float* x, int pos);
+    void attn_in(Layer& y, Work& w, const float* x, int pos, const KvStage& st = KvStage());
+    void attn_out(Layer& y, Work& w, float* x, int pos, const KvStage& st = KvStage());
     void route_tok(Layer& y, Work& w, const float* x, int32_t* idx, float* wt);
     void expert_add(Layer& y, Work& w, const float* h, int e, float wt, float* acc);
     void experts_decode(Layer& y, Work& w, const float* h, const int32_t* idx, const float* wt, float* acc);   // the token's top-k experts, in flight together
@@ -91,7 +95,7 @@ struct Model::Impl {
     void request_stats(unsigned long long*, unsigned long long*, unsigned long long*) const;
     void mv(const WView& w, const void* dW, const float* x, float* y);
     void mm(const WView& w, const void* dW, const float* x, int N, float* y);
-    void attn_heads(Layer& y, Work& w, int pos);
+    void attn_heads(Layer& y, Work& w, int pos, const KvStage& st = KvStage());
     void prefill_gpu(const int* tokens, int n, int start_pos, std::vector<float>* logits_last);
 };
 
@@ -180,7 +184,9 @@ bool Model::load(const std::string& dir, const RunOpts& opts, std::string& err) 
     std::vector<double> f;
     yarn_freqs(D, c.rope_theta, c.yarn_factor, c.yarn_orig, c.yarn_beta_fast, c.yarn_beta_slow, c.yarn_truncate, f);
     rope_table(f, opts.ctx, opts.no_concentration ? 1.0 : yarn_concentration(c.yarn_factor), s.rope_cos, s.rope_sin);
-    s.chunk_max = ring == opts.ctx ? std::max(1, opts.prefill_chunk) : std::max(1, std::min(opts.prefill_chunk, ring - c.window));   // a wrapping ring must not be overwritten mid-chunk
+    // The batch is no longer limited by the ring's margin: a prefill chunk stages its own K/V (KvStage) and commits it to the ring only after
+    // the chunk's attention has read it, so a 512-token chunk runs on a 132-position ring. With N >= 32 the device uses the tensor-core GEMM.
+    s.chunk_max = std::max(1, opts.prefill_chunk);
     int nt = 1;
 #ifdef _OPENMP
     nt = omp_get_max_threads();
@@ -258,7 +264,7 @@ std::string Model::Impl::fingerprint() const {
 
 // ---- building blocks shared by the single-token path and the batched prefill
 
-void Model::Impl::attn_in(Layer& y, Work& w, const float* x, int pos) {
+void Model::Impl::attn_in(Layer& y, Work& w, const float* x, int pos, const KvStage& st) {
     const int H = c.hidden, D = c.head_dim, half = D / 2, QD = c.q_dim(), KD = c.kv_dim();
     rmsnorm(x, y.in_ln.data(), c.eps, H, w.h.data());
     mv(y.q, y.dq, w.h.data(), w.q.data());
@@ -270,21 +276,35 @@ void Model::Impl::attn_in(Layer& y, Work& w, const float* x, int pos) {
     const float* sn = &rope_sin[(size_t) pos * half];
     for (int h = 0; h < c.heads; ++h) rotary(&w.q[(size_t) h * D], D, cs, sn, o.rope_pairs);
     for (int h = 0; h < c.kv_heads; ++h) rotary(&w.k[(size_t) h * D], D, cs, sn, o.rope_pairs);
-    std::memcpy(&y.K[y.slot(pos) * KD], w.k.data(), sizeof(float) * (size_t) KD);
-    std::memcpy(&y.V[y.slot(pos) * KD], w.v.data(), sizeof(float) * (size_t) KD);
+    if (st.K) {                                       // batched prefill: the chunk's K/V goes to the stage, not into the ring
+        std::memcpy(const_cast<float*>(st.K) + (size_t) (pos - st.base) * KD, w.k.data(), sizeof(float) * (size_t) KD);
+        std::memcpy(const_cast<float*>(st.V) + (size_t) (pos - st.base) * KD, w.v.data(), sizeof(float) * (size_t) KD);
+    } else {
+        std::memcpy(&y.K[y.slot(pos) * KD], w.k.data(), sizeof(float) * (size_t) KD);
+        std::memcpy(&y.V[y.slot(pos) * KD], w.v.data(), sizeof(float) * (size_t) KD);
+    }
 }
 
-void Model::Impl::attn_heads(Layer& y, Work& w, int pos) {
+void Model::Impl::attn_heads(Layer& y, Work& w, int pos, const KvStage& st) {
     const int H = c.hidden, D = c.head_dim, KD = c.kv_dim(), rep = c.heads / c.kv_heads;
     const int lo = y.sliding ? std::max(0, pos - c.window + 1) : 0;
     const float scale = 1.0f / std::sqrt((float) D);
+    // A staged position (this chunk's own K/V, not yet in the ring) is read from the stage; everything older is still in the ring.
+    auto key_at = [&](int u, int g) {
+        return (st.K && u >= st.base) ? st.K + (size_t) (u - st.base) * KD + (size_t) g * D
+                                      : &y.K[y.slot(u) * KD + (size_t) g * D];
+    };
+    auto val_at = [&](int u, int g) {
+        return (st.V && u >= st.base) ? st.V + (size_t) (u - st.base) * KD + (size_t) g * D
+                                      : &y.V[y.slot(u) * KD + (size_t) g * D];
+    };
     auto one_head = [&](Work& ww, int hd) {
         const float* q = &w.q[(size_t) hd * D];
         const int g = hd / rep;
         float* sc = ww.sc.data();
         float mx = y.sinks[(size_t) hd];                       // the sink joins the softmax denominator only (no value)
         for (int u = lo; u <= pos; ++u) {
-            const float* k = &y.K[y.slot(u) * KD + (size_t) g * D];
+            const float* k = key_at(u, g);
             float a = 0;
             for (int j = 0; j < D; ++j) a += q[j] * k[j];
             sc[u - lo] = a * scale;
@@ -296,7 +316,7 @@ void Model::Impl::attn_heads(Layer& y, Work& w, int pos) {
         for (int j = 0; j < D; ++j) out[j] = 0;
         for (int u = lo; u <= pos; ++u) {
             const float p = (float) (sc[u - lo] / z);
-            const float* v = &y.V[y.slot(u) * KD + (size_t) g * D];
+            const float* v = val_at(u, g);
             for (int j = 0; j < D; ++j) out[j] += p * v[j];
         }
     };
@@ -311,8 +331,8 @@ void Model::Impl::attn_heads(Layer& y, Work& w, int pos) {
     }
 }
 
-void Model::Impl::attn_out(Layer& y, Work& w, float* x, int pos) {
-    attn_heads(y, w, pos);
+void Model::Impl::attn_out(Layer& y, Work& w, float* x, int pos, const KvStage& st) {
+    attn_heads(y, w, pos, st);
     mv(y.o, y.dobj, w.att.data(), w.tmp.data());
     for (int i = 0; i < c.hidden; ++i) x[i] += w.tmp[(size_t) i] + y.bo[(size_t) i];
 }
@@ -626,13 +646,15 @@ void Model::Impl::experts_decode(Layer& y, Work& w, const float* h, const int32_
 // Batched prefill with the device: every projection and every expert is ONE pass over the weights for the whole chunk.
 void Model::Impl::prefill_gpu(const int* tokens, int n, int start_pos, std::vector<float>* logits_last) {
     const int H = c.hidden, E = c.n_exp, K = c.topk, I = c.moe_ff, QD = c.q_dim(), KD = c.kv_dim(), D = c.head_dim, half = D / 2;
-    std::vector<float> X, Hn, Qb, Kb, Vb, Ab, Ob, Gl, Y, Xe, GU, ACT, EB;
+    std::vector<float> X, Hn, Qb, Kb, Vb, Ab, Ob, Gl, Y, Xe, GU, ACT, EB, Ks, Vs;
     std::vector<int32_t> IDX;
     std::vector<float> WT;
     for (int c0 = 0; c0 < n; c0 += chunk_max) {
         const int T = std::min(chunk_max, n - c0), p0 = start_pos + c0;
         X.assign((size_t) T * H, 0.0f); Hn.assign((size_t) T * H, 0.0f); Qb.assign((size_t) T * QD, 0.0f); Kb.assign((size_t) T * KD, 0.0f);
         Vb.assign((size_t) T * KD, 0.0f); Ab.assign((size_t) T * QD, 0.0f); Ob.assign((size_t) T * H, 0.0f); Gl.assign((size_t) T * E, 0.0f);
+        Ks.assign((size_t) T * KD, 0.0f); Vs.assign((size_t) T * KD, 0.0f);
+        KvStage st; st.K = Ks.data(); st.V = Vs.data(); st.base = p0;   // the chunk's own K/V stays out of the ring until its attention has read it
         Y.assign((size_t) T * H, 0.0f); IDX.assign((size_t) T * K, 0); WT.assign((size_t) T * K, 0.0f);
 #pragma omp parallel for schedule(static)
         for (int t = 0; t < T; ++t) for (int i = 0; i < H; ++i) X[(size_t) t * H + i] = bf16_to_f32(((const uint16_t*) embed.p)[(size_t) tokens[c0 + t] * H + i]);
@@ -653,15 +675,21 @@ void Model::Impl::prefill_gpu(const int* tokens, int n, int start_pos, std::vect
                 const float* sn = &rope_sin[(size_t) pos * half];
                 for (int h = 0; h < c.heads; ++h) rotary(q + (size_t) h * D, D, cs, sn, o.rope_pairs);
                 for (int h = 0; h < c.kv_heads; ++h) rotary(k + (size_t) h * D, D, cs, sn, o.rope_pairs);
-                std::memcpy(&y.K[y.slot(pos) * KD], k, sizeof(float) * (size_t) KD);
-                std::memcpy(&y.V[y.slot(pos) * KD], v, sizeof(float) * (size_t) KD);
+                std::memcpy(&Ks[(size_t) t * KD], k, sizeof(float) * (size_t) KD);
+                std::memcpy(&Vs[(size_t) t * KD], v, sizeof(float) * (size_t) KD);
             }
 #pragma omp parallel for schedule(dynamic, 1)
-            for (int t = 0; t < T; ++t) {                                          // attention on the host: the KV cache lives there
+            for (int t = 0; t < T; ++t) {                                          // attention on the host: reads the stage, then the ring
                 Work& w = my_work();
                 std::copy(&Qb[(size_t) t * QD], &Qb[(size_t) (t + 1) * QD], w.q.begin());
-                attn_heads(y, w, p0 + t);
+                attn_heads(y, w, p0 + t, st);
                 std::copy(w.att.begin(), w.att.end(), &Ab[(size_t) t * QD]);
+            }
+#pragma omp parallel for schedule(static)
+            for (int t = 0; t < T; ++t) {                                        // commit: only now the chunk's K/V goes into the ring
+                const int pos = p0 + t;
+                std::memcpy(&y.K[y.slot(pos) * KD], &Ks[(size_t) t * KD], sizeof(float) * (size_t) KD);
+                std::memcpy(&y.V[y.slot(pos) * KD], &Vs[(size_t) t * KD], sizeof(float) * (size_t) KD);
             }
             mm(y.o, y.dobj, Ab.data(), T, Ob.data());
 #pragma omp parallel for schedule(static)
@@ -765,17 +793,19 @@ void Model::forward(int token, int pos, std::vector<float>* logits_out) {
 void Model::prefill(const int* tokens, int n, int start_pos, std::vector<float>* logits_last) {
     Impl& s = *p_;
     const GptConfig& c = s.c;
-    const int H = c.hidden, E = c.n_exp, K = c.topk, QD = c.q_dim();
+    const int H = c.hidden, E = c.n_exp, K = c.topk, QD = c.q_dim(), KD = c.kv_dim();
     if (n <= 0) return;
     bool bad = start_pos < 0 || start_pos + n > s.o.ctx;
     for (int i = 0; i < n && !bad; ++i) bad = tokens[i] < 0 || tokens[i] >= c.vocab;
     if (bad) { if (logits_last) logits_last->assign((size_t) c.vocab, 0.0f); return; }
     if (s.gpu_on) { s.prefill_gpu(tokens, n, start_pos, logits_last); return; }
-    std::vector<float> X, Hh, Y, Q;
+    std::vector<float> X, Hh, Y, Q, Ks, Vs;
     std::vector<int32_t> IDX; std::vector<float> WT;
     for (int c0 = 0; c0 < n; c0 += s.chunk_max) {
         const int T = std::min(s.chunk_max, n - c0), p0 = start_pos + c0;
         X.assign((size_t) T * H, 0.0f); Hh.assign((size_t) T * H, 0.0f); Y.assign((size_t) T * H, 0.0f); Q.assign((size_t) T * QD, 0.0f);
+        Ks.assign((size_t) T * KD, 0.0f); Vs.assign((size_t) T * KD, 0.0f);
+        KvStage st; st.K = Ks.data(); st.V = Vs.data(); st.base = p0;   // the chunk's own K/V stays out of the ring until its attention has read it
         IDX.assign((size_t) T * K, 0); WT.assign((size_t) T * K, 0.0f);
 #pragma omp parallel for schedule(static)
         for (int t = 0; t < T; ++t) for (int i = 0; i < H; ++i) X[(size_t) t * H + i] = bf16_to_f32(((const uint16_t*) s.embed.p)[(size_t) tokens[c0 + t] * H + i]);
@@ -784,16 +814,21 @@ void Model::prefill(const int* tokens, int n, int start_pos, std::vector<float>*
 #pragma omp parallel for schedule(dynamic, 1)
             for (int t = 0; t < T; ++t) {                                          // K/V of the whole chunk first
                 Work& w = s.my_work();
-                s.attn_in(L, w, &X[(size_t) t * H], p0 + t);
+                s.attn_in(L, w, &X[(size_t) t * H], p0 + t, st);
                 std::copy(w.q.begin(), w.q.end(), &Q[(size_t) t * QD]);            // the next loop may run this token on another thread
             }
 #pragma omp parallel for schedule(dynamic, 1)
             for (int t = 0; t < T; ++t) {                                          // then every token attends to its window / past
                 Work& w = s.my_work();
                 std::copy(&Q[(size_t) t * QD], &Q[(size_t) (t + 1) * QD], w.q.begin());
-                s.attn_out(L, w, &X[(size_t) t * H], p0 + t);
+                s.attn_out(L, w, &X[(size_t) t * H], p0 + t, st);
                 s.route_tok(L, w, &X[(size_t) t * H], &IDX[(size_t) t * K], &WT[(size_t) t * K]);
                 std::copy(w.h.begin(), w.h.end(), &Hh[(size_t) t * H]);
+            }
+#pragma omp parallel for schedule(static)
+            for (int t = 0; t < T; ++t) {                                        // commit: only after the chunk's attention has read it
+                std::memcpy(&L.K[L.slot(p0 + t) * KD], &Ks[(size_t) t * KD], sizeof(float) * (size_t) KD);
+                std::memcpy(&L.V[L.slot(p0 + t) * KD], &Vs[(size_t) t * KD], sizeof(float) * (size_t) KD);
             }
             std::fill(Y.begin(), Y.end(), 0.0f);
             std::vector<std::vector<int>> by_exp((size_t) E);
