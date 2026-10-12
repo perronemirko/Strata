@@ -484,8 +484,8 @@ Slot* Model::Impl::resident(int li, int e) {
 }
 
 // Which slot a miss in layer `li` should evict. With --expert-lru-layered the cold expert of one layer may not
-// push out the hot expert of another: the pool holds ~1400 slots over 31 layers, so a global LRU lets a single
-// chatty layer evict the pinned-adjacent LRU of every other layer. Prefer this layer's own LRU slot; if this
+// push out the hot expert of another: the model has 36 layers x 128 experts and a card takes ~1400 slots, so a
+// global LRU lets one chatty layer evict the LRU of every other layer. Prefer this layer's own LRU slot; if this
 // layer has none free, fall back to the global scan in resident().
 int Model::Impl::victim_slot(int li) {
     int v = -1;
@@ -501,24 +501,34 @@ int Model::Impl::victim_slot(int li) {
 void Model::Impl::promote_locked(int li, int e, int slot_idx) {
     const long long key = (long long) li * c.n_exp + e;
     const uint64_t mine = usage[(size_t) key];
+    // The pinned set stays the size --pin-pct asked for: below that cap a promoted expert only pins, at the cap
+    // it trades with the coldest pinned one. With --pin-pct 0 the cap is 0 and this flag does nothing, which is
+    // what a pure-LRU run wants: there is no pinned set to correct.
+    const size_t cap = (size_t) ((double) pool.size() * std::min(std::max(o.pin_pct, 0.0), 100.0) / 100.0);
+    size_t pinned_now = 0;
+    for (const Slot& sl : pool) pinned_now += sl.pinned ? 1 : 0;
     int w = -1;
-    uint64_t worst = ~(uint64_t) 0;
-    for (size_t i = 0; i < pool.size(); ++i)
-        if (pool[i].pinned && !pool[i].busy && usage[(size_t) pool[i].layer * (size_t) c.n_exp + (size_t) pool[i].exp] < worst) {
-            worst = usage[(size_t) pool[i].layer * (size_t) c.n_exp + (size_t) pool[i].exp];
-            w = (int) i;
-        }
-    // Only swap if the demoted pinned expert really is colder than the one being promoted: this is what stops
-    // two experts of the same rank from trading places on every token.
-    if (w < 0 || worst >= mine) { lru_hits[(size_t) key] = 0; return; }
-    if (pool[(size_t) w].layer < 0) { lru_hits[(size_t) key] = 0; return; }
+    if (pinned_now < cap) {
+        // room left in the pinned set: no expert has to be demoted
+    } else {
+        uint64_t worst = ~(uint64_t) 0;
+        for (size_t i = 0; i < pool.size(); ++i)
+            if (pool[i].pinned && !pool[i].busy && usage[(size_t) pool[i].layer * (size_t) c.n_exp + (size_t) pool[i].exp] < worst) {
+                worst = usage[(size_t) pool[i].layer * (size_t) c.n_exp + (size_t) pool[i].exp];
+                w = (int) i;
+            }
+        // Only trade if the demoted pinned expert really is colder than the one being promoted: this is what
+        // stops two experts of the same rank from changing places on every token.
+        if (w < 0 || worst >= mine) { lru_hits[(size_t) key] = 0; return; }
+        if (pool[(size_t) w].layer < 0) { lru_hits[(size_t) key] = 0; return; }
+        pool[(size_t) w].pinned = false;
+        lru_hits[(size_t) pool[(size_t) w].layer * (size_t) c.n_exp + (size_t) pool[(size_t) w].exp] = 0;
+    }
     // Neither expert changes slot, so `where` stays exactly as it is: only the PIN flag trades. The promoted
-    // expert stops being an eviction candidate; the demoted one becomes evictable and its bytes are dropped
+    // expert stops being an eviction candidate; a demoted one becomes evictable and its bytes are dropped
     // only later, if the LRU scan picks it.
     pool[(size_t) slot_idx].pinned = true;
-    pool[(size_t) w].pinned = false;
     lru_hits[(size_t) key] = 0;
-    lru_hits[(size_t) pool[(size_t) w].layer * (size_t) c.n_exp + (size_t) pool[(size_t) w].exp] = 0;
     ++promotions;
 }
 
