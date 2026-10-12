@@ -324,13 +324,13 @@ bool ctx_reserve(ExpCtx& c, int N, int H, int I) {
     return true;
 }
 
-// The whole expert on the context's stream, no host step in between.
-bool enqueue_expert(ExpCtx& c, int N) {
+// The expert's KERNELS on the context's stream. The host<->device copies live OUTSIDE this function: a captured
+// graph replays its nodes at fixed addresses, so a copy inside the graph would read the host staging buffer at
+// REPLAY time, not at enqueue time - and experts_decode overwrites c.h_x/c.h_wt/c.h_desc for the next token
+// while this token's graph is still pending, so the expert computes with another token's activations (garbage).
+static bool expert_kernels(ExpCtx& c, int N) {
     const int H = c.H, I = c.I;
     cudaStream_t st = c.stream;
-    if (!ck(cudaMemcpyAsync(c.d_desc, c.h_desc, sizeof(DDesc), cudaMemcpyHostToDevice, st), "desc h2d") ||
-        !ck(cudaMemcpyAsync(c.d_x, c.h_x, (size_t) N * H * 4, cudaMemcpyHostToDevice, st), "x h2d") ||
-        !ck(cudaMemcpyAsync(c.d_wt, c.h_wt, (size_t) N * 4, cudaMemcpyHostToDevice, st), "wt h2d")) return false;
     const bool gemm = use_gemm(N, H) && use_gemm(N, I);
     if (gemm) k_exp_gu_gemm<<<dim3((unsigned) ((2 * I + 63) / 64), (unsigned) ((N + 63) / 64)), 128, 0, st>>>(c.d_desc, c.d_x, c.d_gu);
     else k_exp_gu<<<(2 * I + WARPS - 1) / WARPS, WARPS * 32, 0, st>>>(c.d_desc, c.d_x, c.d_gu);
@@ -338,16 +338,27 @@ bool enqueue_expert(ExpCtx& c, int N) {
     if (gemm) k_exp_dn_gemm<<<dim3((unsigned) ((H + 63) / 64), (unsigned) ((N + 63) / 64)), 128, 0, st>>>(c.d_desc, c.d_act, c.d_eb);
     else k_exp_dn<<<(H + WARPS - 1) / WARPS, WARPS * 32, 0, st>>>(c.d_desc, c.d_act, c.d_eb);
     k_exp_fin<<<(unsigned) std::min<size_t>(((size_t) N * H + 255) / 256, 65535), 256, 0, st>>>(c.d_desc, c.d_eb, c.d_y);
-    if (!ck(cudaGetLastError(), "expert kernels")) return false;
+    return !ck(cudaGetLastError(), "expert kernels");
+}
+
+bool enqueue_expert(ExpCtx& c, int N) {
+    const int H = c.H;
+    cudaStream_t st = c.stream;
+    if (!ck(cudaMemcpyAsync(c.d_desc, c.h_desc, sizeof(DDesc), cudaMemcpyHostToDevice, st), "desc h2d") ||
+        !ck(cudaMemcpyAsync(c.d_x, c.h_x, (size_t) N * H * 4, cudaMemcpyHostToDevice, st), "x h2d") ||
+        !ck(cudaMemcpyAsync(c.d_wt, c.h_wt, (size_t) N * 4, cudaMemcpyHostToDevice, st), "wt h2d")) return false;
+    if (!expert_kernels(c, N)) return false;
     return ck(cudaMemcpyAsync(c.h_y, c.d_y, (size_t) N * H * 4, cudaMemcpyDeviceToHost, st), "y d2h");
 }
 
-// CUDA graph of the N == 1 pipeline, captured once per context (thread-local capture: other threads' CUDA calls are not recorded).
+// CUDA graph of the N == 1 KERNELS, captured once per context (thread-local capture: other threads' CUDA calls
+// are not recorded). Only the kernels are captured: the graph's nodes hold fixed device addresses, and the
+// staging buffers are re-uploaded before every launch by expert_run_async.
 bool build_graph(ExpCtx& c) {
     cudaGraph_t g = nullptr;
     bool ok = ck(cudaStreamBeginCapture(c.stream, cudaStreamCaptureModeThreadLocal), "begin capture");
     if (ok) {
-        const bool e = enqueue_expert(c, 1);
+        const bool e = expert_kernels(c, 1);
         const cudaError_t ce = cudaStreamEndCapture(c.stream, &g);
         ok = e && ck(ce, "end capture");
     }
@@ -443,7 +454,16 @@ bool expert_run_async(int ci, const ExpertDesc& d, const float* hx, const float*
     c.n = N;
     if (N == 1 && g_graphs && ci < kExpertCtxBatch) {
         if (!c.graph_tried) { c.graph_tried = true; c.graph_ok = build_graph(c); }
-        if (c.graph_ok) return ck(cudaGraphLaunch(c.graph, c.stream), "graph launch") && ck(cudaEventRecord(c.ev, c.stream), "expert event");
+        if (c.graph_ok) {
+            // stage this expert's x, wt and descriptor with plain copies, then replay the captured kernels
+            if (!ck(cudaMemcpyAsync(c.d_desc, c.h_desc, sizeof(DDesc), cudaMemcpyHostToDevice, c.stream), "desc h2d") ||
+                !ck(cudaMemcpyAsync(c.d_x, c.h_x, (size_t) N * c.H * 4, cudaMemcpyHostToDevice, c.stream), "x h2d") ||
+                !ck(cudaMemcpyAsync(c.d_wt, c.h_wt, (size_t) N * 4, cudaMemcpyHostToDevice, c.stream), "wt h2d") ||
+                !ck(cudaGraphLaunch(c.graph, c.stream), "graph launch") ||
+                !ck(cudaMemcpyAsync(c.h_y, c.d_y, (size_t) N * c.H * 4, cudaMemcpyDeviceToHost, c.stream), "y d2h"))
+                return false;
+            return ck(cudaEventRecord(c.ev, c.stream), "expert event");
+        }
     }
     return enqueue_expert(c, N) && ck(cudaEventRecord(c.ev, c.stream), "expert event");
 }
