@@ -298,6 +298,7 @@ namespace gptoss
             // The KV cache survives between requests: only what differs from the cached tokens is prefilled.
             std::vector<float> logits;
             std::vector<int> history = ids; // the penalties count over prompt + generated
+            m.begin_request_stats();        // the request's own expert counters (the DONE line's hit-rate fields)
             const int keep = m.reuse_prefix(ids);
             std::fprintf(stderr, "gptoss_run: KV reuse: %d of %zu prompt tokens already cached, %zu to prefill\n", keep, ids.size(), ids.size() - (size_t)keep);
             std::fflush(stderr);
@@ -387,12 +388,21 @@ namespace gptoss
             const double decode_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tg).count();
             std::fprintf(stderr, "gptoss_run: finish=%s generated=%d max_new=%d\n", finish.c_str(), generated, max_new);
             std::fflush(stderr);
-            // DONE  <prompt_tokens> <prompt_ms> <decode_ms> : the five fields server.py's
-            // _parse_done always reads. The later fields it only reads when present are left out on purpose.
-            std::printf("DONE %d %zu %.1f %.1f %s\n", generated, ids.size(), prefill_ms, decode_ms, finish.c_str());
+            // DONE with the SAME field layout as Strata's engine, so serve/server.py's _parse_done reads it
+            // unchanged and the server window prints the same engineering lines (thinking/done with tok/s,
+            // expert cache hit rate, PCIe share). Fields: generated prompt_tokens prompt_ms decode_ms finish
+            // drafts_accepted drafts_offered reused hits lookups ram_blobs file_blobs file_mb prompt_read offloaded.
+            // No speculative decoding here, so drafts are 0/0; there is no RAM or file expert tier, so those are 0.
+            unsigned long long hits = 0, lookups = 0, pcie = 0;
+            m.request_stats(&hits, &lookups, &pcie);
+            const size_t prompt_read = ids.size() - (size_t)keep;
+            std::printf("DONE %d %zu %.1f %.1f %s 0 0 %d %llu %llu 0 0 0.0 %zu %llu\n",
+                        generated, ids.size(), prefill_ms, decode_ms, finish.c_str(), keep, hits, lookups, prompt_read, pcie);
             std::fflush(stdout);
-            std::fprintf(stderr, "gptoss_run: %zu prompt -> %d tokens, %s (%.0f ms prefill, %.0f ms decode)\n",
-                         ids.size(), generated, finish.c_str(), prefill_ms, decode_ms);
+            const double prefill_tps = (double) prompt_read * 1000.0 / std::max(prefill_ms, 1e-9);
+            const double decode_tps = (double) generated * 1000.0 / std::max(decode_ms, 1e-9);
+            std::fprintf(stderr, "gptoss_run: %zu prompt (%zu read) -> %d tokens, %s (%.0f ms prefill = %.1f tok/s, %.0f ms decode = %.1f tok/s)\n",
+                         ids.size(), prompt_read, generated, finish.c_str(), prefill_ms, prefill_tps, decode_ms, decode_tps);
             std::fflush(stderr);
             {
                 const std::string st = m.stats();
