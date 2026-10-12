@@ -58,10 +58,21 @@ class ChatTemplate:
         def tojson(x, ensure_ascii=False, indent=None, separators=None, sort_keys=False):
             return json.dumps(x, ensure_ascii=ensure_ascii, indent=indent, separators=separators, sort_keys=sort_keys)
 
+<<<<<<< HEAD:terminal/serve/frontend.py
         env = ImmutableSandboxedEnvironment(trim_blocks=True, lstrip_blocks=True,
                                             extensions=["jinja2.ext.loopcontrols", _GenerationExtension])
+=======
+        def strftime_now(fmt):
+            """The template's current date, as HF's apply_chat_template and llama.cpp both provide it.
+            gpt-oss's template calls strftime_now("%Y-%m-%d") in its system message (#1101)."""
+            import time
+            return time.strftime(fmt)
+
+        env = ImmutableSandboxedEnvironment(trim_blocks=True, lstrip_blocks=True, extensions=["jinja2.ext.loopcontrols"])
+>>>>>>> 13f134b7c (gptoss_ext: the dense scratch sized for one token OOM'd at the first prefill call and put the whole gpt-oss session on the CPU (4.1 tok/s prefill, 4.5 tok/s decode on an RTX 4090); gpu_setup now reserves it for the chunk and an allocation that does not fit keeps the device):serve/frontend.py
         env.filters["tojson"] = tojson
         env.globals["raise_exception"] = raise_exception
+        env.globals["strftime_now"] = strftime_now
         self.source = Path(path).read_text(encoding="utf-8")
         self._is_hy4 = "<tool_calls{}>" in self.source or "<\uff5creasoning_mode" in self.source
         self._is_inkling2 = "<|content_invoke_tool_json|>" in self.source or "tool_declare<|content_xml|>" in self.source
