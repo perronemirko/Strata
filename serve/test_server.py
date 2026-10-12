@@ -5373,6 +5373,44 @@ class StopStrings(unittest.TestCase):
         self.assertEqual(m.push("more"), "")
 
 
+class TurnEndIds(unittest.TestCase):
+    """The ids that end a turn come from the vocabulary that is loaded, not from names assumed.
+
+    gpt-oss's o200k_harmony has no <|im_end|>: its spelling is six ordinary text ids an answer can
+    contain, and the token that closes a turn (200002) is only named in the pack's tokenizer.json.
+    The Qwen path must keep the set it had."""
+
+    def make(self, tok):
+        return Service(MockEngine(tok, "ok", max_context=CTX), tok,
+                       ChatTemplate(ROOT / "serve/chat_template.jinja"))
+
+    def test_a_vocabulary_without_the_markers(self):
+        import strata_tokenizer as ST
+        b2u = ST.bytes_to_unicode()
+        bar = lambda name: "<|" + name + "|>"          # built: the pack's own control names
+        markers = [bar("endoftext"), bar("return"), bar("channel")]
+        tok = ST.Tokenizer([b2u[b] for b in range(256)] + markers, [], [1] * 256 + [3] * len(markers),
+                           special_ids={"tokenizer.ggml.eos_token_id": 257})
+        svc = self.make(tok)
+        self.assertEqual(svc.stop_ids, {256, 257})   # the marker that exists, plus the pack's eos
+        pieces = tok.encode("<|im_end|>", parse_special=True)
+        self.assertGreater(len(pieces), 1)
+        self.assertFalse(any(p in svc.stop_ids for p in pieces),
+                         "the pieces of a marker this vocabulary does not have are not stops")
+
+    def test_the_default_vocabulary_is_unchanged(self):
+        tok = ByteTokenizer()
+        svc = self.make(tok)
+        self.assertEqual(svc.stop_ids, set(tok.encode("<|im_end|>", parse_special=True)
+                                           + tok.encode("<|endoftext|>", parse_special=True)))
+
+    def test_a_tokenizer_that_names_nothing(self):
+        import strata_tokenizer as ST
+        b2u = ST.bytes_to_unicode()
+        tok = ST.Tokenizer([b2u[b] for b in range(256)], [], [1] * 256)
+        self.assertEqual(self.make(tok).stop_ids, set(), "nothing known: no ids invented from a marker's spelling")
+
+
 class ConnectionClose(unittest.TestCase):
     """The server is HTTP/1.0 and closes the connection after every response.  Without saying so, .NET's pooled
     HttpClient put its next request on the closing socket and got "response ended prematurely" (2026-10-03)."""
