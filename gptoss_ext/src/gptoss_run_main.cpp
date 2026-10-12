@@ -18,7 +18,9 @@ static void usage() {
         "gptoss_run --model DIR [--ctx N] [--threads N]\n"
         "       [--prompt-ids 1,2,3 --n-predict N [--temperature T --top-k K --top-p P --seed S]] | [--serve [--eos-ids 200002,200012]]\n"
         "       [--selfcheck] [--prefill-chunk N] [--kv-rollback N] [--kv-checkpoint FILE] [--kv-unified]\n"
-        "       [--cuda [--cuda-device N] [--vram-pct P] [--vram-total-mib N] [--vram-reserve-mib N] [--gpu-slots N] [--expert-profile FILE] [--expert-profile-save FILE] [--expert-profile-save-every SEC] [--pin-pct P]]   (--cuda needs the --cuda build; the profile works on the CPU build too)\n"
+        "       [--cuda [--cuda-device N] [--vram-pct P] [--vram-total-mib N] [--vram-reserve-mib N] [--gpu-slots N] [--expert-profile FILE] [--expert-profile-save FILE] [--expert-profile-save-every SEC] [--pin-pct P] [--expert-promote N] [--expert-lru-layered] [--profile-decay N]]\n"
+        "         expert cache, opt-in (0/off = the previous release): --expert-promote N pins an LRU expert after N decode hits and unpins the coldest pinned one;\n"
+        "         --expert-lru-layered evicts inside the requesting layer first; --profile-decay N halves the usage profile past N routed activations\n"
         "  facts the model card does not settle (docs/gptoss_porting.md):  --glu-halves  --rope-pairs  --no-concentration\n");
 }
 
@@ -51,6 +53,9 @@ int main(int argc, char** argv) {
         else if (a == "--expert-profile-save") o.expert_profile_save = val();
         else if (a == "--expert-profile-save-every") o.expert_profile_save_every = std::atof(val());
         else if (a == "--pin-pct") o.pin_pct = std::atof(val());
+        else if (a == "--expert-promote") o.expert_promote = std::atoi(val());
+        else if (a == "--expert-lru-layered") o.expert_lru_layered = true;
+        else if (a == "--profile-decay") o.profile_decay = std::atoll(val());
         else if (a == "--vram-pct") o.vram_pct = std::atof(val());
         else if (a == "--vram-total-mib") o.vram_total_mib = std::atoll(val());
         else if (a == "--vram-reserve-mib") o.vram_reserve_mib = std::atoll(val());
@@ -93,7 +98,7 @@ int main(int argc, char** argv) {
         const std::string pp = !o.expert_profile_save.empty() ? o.expert_profile_save : o.expert_profile;
         if (!pp.empty()) {
             std::string perr;
-            if (m.save_profile(pp, perr)) std::fprintf(stderr, "gptoss_run: expert profile saved to %s (exit)\n", pp.c_str());
+            if (m.save_profile(pp, perr)) { std::fprintf(stderr, "gptoss_run: expert profile saved to %s (exit)\n", pp.c_str()); m.decay_profile(); }
             else std::fprintf(stderr, "gptoss_run: profile save FAILED: %s\n", perr.c_str());
         }
     }

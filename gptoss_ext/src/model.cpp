@@ -67,6 +67,8 @@ struct Model::Impl {
     bool counting = false;                             // true only inside Model::forward (decode): prefill lookups are not counted
     uint64_t base_hits = 0, base_lookups = 0, base_pcie = 0;   // counters at the start of the request, for the per-request line
     std::vector<uint64_t> usage;                       // [layer*E + expert]: times routed to (the profile)
+    std::vector<uint64_t> lru_hits;                    // [layer*E + expert]: decode hits on an LRU slot, for --expert-promote
+    uint64_t promotions = 0;                           // LRU <-> pinned swaps done by --expert-promote
     std::mutex gmu;                                    // every device call is serialised
 
     void init_work(Work& w) const;
@@ -83,6 +85,8 @@ struct Model::Impl {
     bool upload_expert(Slot& sl, int li, int e);
     void count_use(int li, const int32_t* idx);
     Slot* resident(int layer, int e);                  // expert -> slot (upload on miss = PCIe, LRU eviction); nullptr when there is no pool or the expert runs on the host
+    int victim_slot(int li);                           // slot to evict for a miss in layer li: this layer first (--expert-lru-layered), then the whole pool
+    void promote_locked(int li, int e, int slot_idx);  // an LRU expert that keeps being used takes the place of the least-used pinned one
     void begin_request_stats();
     void request_stats(unsigned long long*, unsigned long long*, unsigned long long*) const;
     void mv(const WView& w, const void* dW, const float* x, float* y);
@@ -189,6 +193,7 @@ bool Model::load(const std::string& dir, const RunOpts& opts, std::string& err) 
         std::fprintf(stderr, "gptoss: KV cache %.2f GiB (fp32; banded layers hold %d positions, dense layers %d)\n", kv / 1073741824.0, ring, opts.ctx);
     }
     s.usage.assign((size_t) c.layers * (size_t) c.n_exp, 0);
+    s.lru_hits.assign((size_t) c.layers * (size_t) c.n_exp, 0);
     if (!opts.expert_profile.empty()) {
         if (FILE* fp = std::fopen(opts.expert_profile.c_str(), "rb")) {
             std::fclose(fp);
@@ -443,10 +448,25 @@ Slot* Model::Impl::resident(int li, int e) {
     const long long key = (long long) li * c.n_exp + e;
     ++tick;
     auto it = where.find(key);
-    if (it != where.end()) { if (count) { ++hits; if (pool[(size_t) it->second].pinned) ++pin_hits; } pool[(size_t) it->second].tick = tick; return &pool[(size_t) it->second]; }
+    if (it != where.end()) {
+        Slot& hit = pool[(size_t) it->second];
+        if (count) {
+            ++hits;
+            if (hit.pinned) ++pin_hits;
+            else ++lru_hits[(size_t) key];
+            // --expert-promote: an LRU expert that keeps being used swaps its PIN with the least-used pinned
+            // expert. Both experts are already in VRAM, so the swap costs no PCIe and no slot is added: it only
+            // moves WHICH experts hold the slots. Without the flag this branch is never taken.
+            if (o.expert_promote > 0 && (long long) lru_hits[(size_t) key] >= (long long) o.expert_promote)
+                promote_locked(li, e, (int) it->second);
+        }
+        hit.tick = tick;
+        return &pool[(size_t) it->second];
+    }
     // A miss: the bytes go to the card over PCIe if a slot can take them; otherwise this expert runs on the host.
     int v = -1;
     for (size_t i = 0; i < pool.size() && v < 0; ++i) if (pool[i].layer < 0) v = (int) i;
+    if (v < 0) v = o.expert_lru_layered ? victim_slot(li) : -1;   // --expert-lru-layered: evict inside this layer first
     if (v < 0) {                                       // LRU
         uint64_t best = ~(uint64_t) 0;
         for (size_t i = 0; i < pool.size(); ++i) if (!pool[i].pinned && !pool[i].busy && pool[i].tick < best) { best = pool[i].tick; v = (int) i; }
@@ -461,6 +481,45 @@ Slot* Model::Impl::resident(int li, int e) {
     sl.layer = li; sl.exp = e; sl.tick = tick;
     where[key] = v;
     return &sl;
+}
+
+// Which slot a miss in layer `li` should evict. With --expert-lru-layered the cold expert of one layer may not
+// push out the hot expert of another: the pool holds ~1400 slots over 31 layers, so a global LRU lets a single
+// chatty layer evict the pinned-adjacent LRU of every other layer. Prefer this layer's own LRU slot; if this
+// layer has none free, fall back to the global scan in resident().
+int Model::Impl::victim_slot(int li) {
+    int v = -1;
+    uint64_t best = ~(uint64_t) 0;
+    for (size_t i = 0; i < pool.size(); ++i)
+        if (!pool[i].pinned && !pool[i].busy && pool[i].layer == li && pool[i].tick < best) { best = pool[i].tick; v = (int) i; }
+    return v;
+}
+
+// The swap behind --expert-promote. Both slots are already filled, so this is a two-line change of bookkeeping:
+// no upload, no eviction of a resident expert, no extra slot. The demoted expert goes back to the LRU pool and
+// is re-uploaded only if it is routed again.
+void Model::Impl::promote_locked(int li, int e, int slot_idx) {
+    const long long key = (long long) li * c.n_exp + e;
+    const uint64_t mine = usage[(size_t) key];
+    int w = -1;
+    uint64_t worst = ~(uint64_t) 0;
+    for (size_t i = 0; i < pool.size(); ++i)
+        if (pool[i].pinned && !pool[i].busy && usage[(size_t) pool[i].layer * (size_t) c.n_exp + (size_t) pool[i].exp] < worst) {
+            worst = usage[(size_t) pool[i].layer * (size_t) c.n_exp + (size_t) pool[i].exp];
+            w = (int) i;
+        }
+    // Only swap if the demoted pinned expert really is colder than the one being promoted: this is what stops
+    // two experts of the same rank from trading places on every token.
+    if (w < 0 || worst >= mine) { lru_hits[(size_t) key] = 0; return; }
+    if (pool[(size_t) w].layer < 0) { lru_hits[(size_t) key] = 0; return; }
+    // Neither expert changes slot, so `where` stays exactly as it is: only the PIN flag trades. The promoted
+    // expert stops being an eviction candidate; the demoted one becomes evictable and its bytes are dropped
+    // only later, if the LRU scan picks it.
+    pool[(size_t) slot_idx].pinned = true;
+    pool[(size_t) w].pinned = false;
+    lru_hits[(size_t) key] = 0;
+    lru_hits[(size_t) pool[(size_t) w].layer * (size_t) c.n_exp + (size_t) pool[(size_t) w].exp] = 0;
+    ++promotions;
 }
 
 void Model::Impl::mv(const WView& w, const void* dW, const float* x, float* y) {
@@ -816,8 +875,8 @@ bool Model::load_kv(const std::string& path, std::string& err) {
     return true;
 }
 
-bool Model::save_profile(const std::string& path, std::string& err) const {
-    const Impl& s = *p_;
+bool Model::save_profile(const std::string& path, std::string& err) {
+    Impl& s = *p_;
     const std::string tmp = path + ".tmp";
     FILE* f = std::fopen(tmp.c_str(), "wb");
     if (!f) { err = "cannot write " + tmp; return false; }
@@ -828,6 +887,21 @@ bool Model::save_profile(const std::string& path, std::string& err) const {
     if (!ok) { err = "write error on " + tmp; std::remove(tmp.c_str()); return false; }
     if (std::rename(tmp.c_str(), path.c_str()) != 0) { err = "rename failed"; return false; }
     return true;
+}
+
+// --profile-decay: the profile is a sum over every past session, so after a few long runs its counts are
+// dominated by old traffic and the pinning at the next start follows the wrong session. Halving the whole
+// table once it passes the decay bound keeps the ranking (a monotone transform of every count) while
+// bounding how much history still weighs. Off (0) leaves the file byte-identical to the last release.
+void Model::decay_profile() {
+    Impl& s = *p_;
+    if (s.o.profile_decay <= 0 || s.usage.empty()) return;
+    uint64_t total = 0;
+    for (uint64_t v : s.usage) total += v;
+    if ((long long) total <= s.o.profile_decay) return;
+    for (uint64_t& v : s.usage) v /= 2;
+    std::fprintf(stderr, "gptoss: profile decayed: %llu routed activations halved, the ranking is kept\n", (unsigned long long) total);
+    std::fflush(stderr);
 }
 
 bool Model::load_profile(const std::string& path, std::string& err) {
@@ -864,12 +938,23 @@ std::string Model::stats() const {
     for (const auto& sl : s.pool) pinned += sl.pinned ? 1 : 0;
     const unsigned long long lookups = (unsigned long long) (s.hits + s.host_served);
     const double tot = (double) lookups;
-    char b[320];
-    std::snprintf(b, sizeof b, "experts: %zu slots (%zu pinned), hits %llu (of which pinned %llu), lookups %llu, hit rate %.1f%%; %llu of the %llu routed experts read over PCIe, %llu on the host, oom fallbacks %llu",
-                  s.pool.size(), pinned, (unsigned long long) s.hits, (unsigned long long) s.pin_hits, lookups,
-                  tot > 0 ? 100.0 * (double) s.hits / tot : 0.0,
-                  (unsigned long long) s.pcie_served, (unsigned long long) (lookups + s.pcie_served),
-                  (unsigned long long) s.host_served, (unsigned long long) s.oom_fallbacks);
+    char b[400];
+    // The line stays exactly as in the last release unless --expert-promote is on: a new field would move the
+    // fields the server window reads.
+    if (s.o.expert_promote <= 0) {
+        std::snprintf(b, sizeof b, "experts: %zu slots (%zu pinned), hits %llu (of which pinned %llu), lookups %llu, hit rate %.1f%%; %llu of the %llu routed experts read over PCIe, %llu on the host, oom fallbacks %llu",
+                      s.pool.size(), pinned, (unsigned long long) s.hits, (unsigned long long) s.pin_hits, lookups,
+                      tot > 0 ? 100.0 * (double) s.hits / tot : 0.0,
+                      (unsigned long long) s.pcie_served, (unsigned long long) (lookups + s.pcie_served),
+                      (unsigned long long) s.host_served, (unsigned long long) s.oom_fallbacks);
+    } else {
+        std::snprintf(b, sizeof b, "experts: %zu slots (%zu pinned), hits %llu (of which pinned %llu), lookups %llu, hit rate %.1f%%; %llu of the %llu routed experts read over PCIe, %llu on the host, oom fallbacks %llu, promotions %llu",
+                      s.pool.size(), pinned, (unsigned long long) s.hits, (unsigned long long) s.pin_hits, lookups,
+                      tot > 0 ? 100.0 * (double) s.hits / tot : 0.0,
+                      (unsigned long long) s.pcie_served, (unsigned long long) (lookups + s.pcie_served),
+                      (unsigned long long) s.host_served, (unsigned long long) s.oom_fallbacks,
+                      (unsigned long long) s.promotions);
+    }
     return b;
 }
 

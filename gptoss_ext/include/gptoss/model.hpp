@@ -28,6 +28,11 @@ struct RunOpts {
     double expert_profile_save_every = 0;   // seconds between periodic saves while generating (0 = only after each request and at exit)
     double pin_pct = 80;               // % of the expert slots reserved for the most-used experts of the profile (the rest is LRU for the others)
     int gpu_slots = -1;                // cap on the expert slots in VRAM (-1 = as many as the budget allows)
+    // --- expert cache: three opt-in knobs that only move WHICH experts hold the slots, never how many slots there are.
+    //     0 / false keeps the previous release's behaviour byte-for-byte.
+    int expert_promote = 0;          // 0 = off: an LRU expert counted this many hits becomes pinned, and the least-used pinned expert becomes LRU (no PCIe traffic, same slot count)
+    bool expert_lru_layered = false; // evict inside the requesting layer first, so a cold expert of one layer cannot push out a hot expert of another
+    long long profile_decay = 0;     // 0 = off: halve every usage count after a save while their sum is above this, so the pinning follows the recent sessions
     // --- VRAM budget: --vram-pct of the card (or of --vram-total-mib when given) minus the reserve. With cuda=false it is only a plan.
     double vram_pct = -1;
     long long vram_total_mib = 0, vram_reserve_mib = 1024;
@@ -52,8 +57,9 @@ public:
     bool save_kv(const std::string& path, std::string& err) const;
     bool load_kv(const std::string& path, std::string& err);
     /// Expert usage profile (how many times each (layer, expert) was routed to). Binary: "GPPRF001", u32 layers, u32 experts, u64[layers*experts].
-    bool save_profile(const std::string& path, std::string& err) const;
+    bool save_profile(const std::string& path, std::string& err);   // with --profile-decay it also ages the in-memory counts it just wrote
     bool load_profile(const std::string& path, std::string& err);
+    void decay_profile();             // call after every profile save: with --profile-decay 0 it does nothing
     std::string stats() const;          // slots / pinned / hits / misses / PCIe ("" without a device pool)
     /// Per-request decode counters, same fields as Strata's DONE line (hits, lookups, offloaded over PCIe).
     /// Call begin_request_stats() before the request; request_stats() after it returns the request's own counts.
