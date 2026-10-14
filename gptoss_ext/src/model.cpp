@@ -88,6 +88,7 @@ struct Model::Impl {
     void plan_vram() const;
     bool gpu_setup(std::string& err);
     void gpu_fail(const std::string& what);
+    void pdev_fail_(const char* why);                    // the device-resident prefill turns itself off: the device stays on, the old prefill continues
     bool upload_expert(Slot& sl, int li, int e);
     void count_use(int li, const int32_t* idx);
     Slot* resident(int layer, int e);                  // expert -> slot (upload on miss = PCIe, LRU eviction); nullptr when there is no pool or the expert runs on the host
@@ -294,7 +295,7 @@ void Model::Impl::attn_in(Layer& y, Work& w, const float* x, int pos, const KvSt
 }
 
 void Model::Impl::attn_heads(Layer& y, Work& w, int pos, const KvStage& st) {
-    const int H = c.hidden, D = c.head_dim, KD = c.kv_dim(), rep = c.heads / c.kv_heads;
+    const int D = c.head_dim, KD = c.kv_dim(), rep = c.heads / c.kv_heads;   // H unused: heads read q/K/V, not the residual
     const int lo = y.sliding ? std::max(0, pos - c.window + 1) : 0;
     const float scale = 1.0f / std::sqrt((float) D);
     // A staged position (this chunk's own K/V, not yet in the ring) is read from the stage; everything older is still in the ring.
@@ -354,6 +355,11 @@ void Model::Impl::route_tok(Layer& y, Work& w, const float* x, int32_t* idx, flo
 }
 
 void Model::Impl::gpu_fail(const std::string& what) {
+    if (what.empty()) {                                // not a CUDA call that failed: a path we turned off ourselves
+        // (prefill_dev keeps its own error string and never touches gpu::last_error). An empty message is by
+        // definition not a poisoned context: the device stays on and the caller already chose another path.
+        return;
+    }
     if (gpu::last_oom()) {                             // an allocation that did not fit is NOT a poisoned context: run this call on the host,
         ++oom_fallbacks;                               // shrink the chunk so the next one fits, and keep the device for the rest of the session
         if (chunk_max > 1) {
@@ -497,6 +503,14 @@ bool Model::Impl::upload_expert(Slot& sl, int li, int e) {
            gpu::h2d(sl.dn_s, y.dn.scales + (size_t) e * H * G2, H * G2) &&
            gpu::h2d(sl.gu_bias, y.gu_bias + (size_t) e * 2 * I, 2 * I * 2) &&
            gpu::h2d(sl.dn_bias, y.dn_bias + (size_t) e * H, H * 2);
+}
+
+// The device-resident prefill found a reason not to run this chunk on the card (its card KV window is smaller than
+// the dense history, or a slot cannot take an expert). That is NOT a CUDA call that failed: gpu::last_error() is
+// empty and gpu_on must stay true - the old prefill path does the rest of the chunk with the device.
+void Model::Impl::pdev_fail_(const char* why) {
+    pdev_on = false;
+    std::fprintf(stderr, "gptoss: device-resident prefill off (%s): the old prefill continues on the device\n", why);
 }
 
 void Model::Impl::count_use(int li, const int32_t* idx) {
@@ -826,12 +840,12 @@ int Model::Impl::prefill_pdev(const int* tokens, int n, int start_pos, std::vect
         IDX.assign((size_t) T * K, 0); WT.assign((size_t) T * K, 0.0f);
 #pragma omp parallel for schedule(static)
         for (int t = 0; t < T; ++t) for (int i = 0; i < H; ++i) X[(size_t) t * H + i] = bf16_to_f32(((const uint16_t*) embed.p)[(size_t) tokens[c0 + t] * H + i]);
-        if (!pdev::x_upload(X.data(), T)) { pdev_on = false; return c0; }
+        if (!pdev::x_upload(X.data(), T)) { pdev_fail_("x upload"); return c0; }
         for (int l = 0; l < c.layers && pdev_on; ++l) {
             Layer& y = L[(size_t) l];
             pdev::kv_prefetch(l, y.K.data(), y.V.data(), y.cap, y.sliding, p0);
             pdev::LayerIO w{y.dq, y.dk, y.dv, y.dobj, y.drt};
-            if (!pdev::run_layer(pdev_cfg(), l, w, T, p0, y.sliding, Gl.data())) { pdev_on = false; return c0; }
+            if (!pdev::run_layer(pdev_cfg(), l, w, T, p0, y.sliding, Gl.data())) { pdev_fail_("layer"); return c0; }
 #pragma omp parallel for schedule(static)
             for (int t = 0; t < T; ++t) {
                 float* g = &Gl[(size_t) t * E];
@@ -861,20 +875,20 @@ int Model::Impl::prefill_pdev(const int* tokens, int n, int start_pos, std::vect
                 for (int e = 0; e < E && pdev_on; ++e) {
                     if (!cnt[e]) continue;
                     Slot* sl = resident(l, e);
-                    if (!sl) { pdev_on = false; break; }   // no slot can take it: the old prefill does this chunk's session from here on
+                    if (!sl) { pdev_fail_("no slot can take this expert"); break; }   // no slot can take it: the old prefill does this chunk's session from here on
                     per[(size_t) e].gu_b = sl->gu_b; per[(size_t) e].dn_b = sl->dn_b;
                     per[(size_t) e].gu_s = sl->gu_s; per[(size_t) e].dn_s = sl->dn_s;
                     per[(size_t) e].gu_bias = sl->gu_bias; per[(size_t) e].dn_bias = sl->dn_bias;
                 }
             }
             if (!pdev_on) return c0;
-            if (!pdev::run_experts(pdev_cfg(), T, per.data(), cnt.data(), src.data(), WTR.data(), IDX.data())) { pdev_on = false; return c0; }
+            if (!pdev::run_experts(pdev_cfg(), T, per.data(), cnt.data(), src.data(), WTR.data(), IDX.data())) { pdev_fail_("experts"); return c0; }
             pdev::kv_store_back(l, y.K.data(), y.V.data(), y.cap, y.sliding, T, p0);
         }
         if (!pdev_on) return c0;
         pdev::advance(T);
-        if (!pdev::x_download(X.data(), T)) { pdev_on = false; return c0; }
-        if (!pdev::sync_all()) { pdev_on = false; return c0; }   // the K/V rows are back in the host cache before anything reads it
+        if (!pdev::x_download(X.data(), T)) { pdev_fail_("x download"); return c0; }
+        if (!pdev::sync_all()) { pdev_fail_("sync"); return c0; }   // the K/V rows are back in the host cache before anything reads it
         if ((int) cached.size() > p0) cached.resize((size_t) p0);
         for (int t = 0; t < T; ++t) if ((int) cached.size() == p0 + t) cached.push_back(tokens[c0 + t]);
         if (logits_last && c0 + T == n) {
