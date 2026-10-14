@@ -18,7 +18,8 @@ static void usage() {
         "gptoss_run --model DIR [--ctx N] [--threads N]\n"
         "       [--prompt-ids 1,2,3 --n-predict N [--temperature T --top-k K --top-p P --seed S]] | [--serve [--eos-ids 200002,200012]]\n"
         "       [--selfcheck] [--prefill-chunk N] [--kv-rollback N] [--kv-checkpoint FILE] [--kv-unified]\n"
-        "       [--cuda [--cuda-device N] [--vram-pct P] [--vram-total-mib N] [--vram-reserve-mib N] [--gpu-slots N] [--expert-profile FILE] [--expert-profile-save FILE] [--expert-profile-save-every SEC] [--pin-pct P] [--expert-promote N] [--expert-lru-layered] [--profile-decay N]]\n"
+        "       [--cuda [--cuda-device N] [--vram-pct P] [--vram-total-mib N] [--vram-reserve-mib N] [--gpu-slots N] [--expert-profile FILE] [--expert-profile-save FILE] [--expert-profile-save-every SEC] [--pin-pct P] [--expert-promote N] [--expert-lru-layered] [--profile-decay N] [--prefill-dev-pct P]]\n"
+        "         --prefill-dev-pct P: percent of the VRAM left for the device-resident prefill (its KV windows + chunk scratch); 0 = the old prefill (default 50)\n"
         "         expert cache, opt-in (0/off = the previous release): --expert-promote N pins an LRU expert after N decode hits and unpins the coldest pinned one;\n"
         "         --expert-lru-layered evicts inside the requesting layer first; --profile-decay N halves the usage profile past N routed activations\n"
         "         --no-device-graphs: the decode experts run as separate kernel enqueues, no CUDA graph captured (the switch that isolates the graph from the stream/event ordering)\n"
@@ -61,6 +62,7 @@ int main(int argc, char** argv) {
         else if (a == "--vram-pct") o.vram_pct = std::atof(val());
         else if (a == "--vram-total-mib") o.vram_total_mib = std::atoll(val());
         else if (a == "--vram-reserve-mib") o.vram_reserve_mib = std::atoll(val());
+        else if (a == "--prefill-dev-pct") o.prefill_dev_pct = std::atof(val());
         else if (a == "--glu-halves") o.glu_halves = true;
         else if (a == "--rope-pairs") o.rope_pairs = true;
         else if (a == "--no-concentration") o.no_concentration = true;
