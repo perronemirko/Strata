@@ -14,6 +14,7 @@ namespace gpu {
 
 bool is_emulated();
 bool init(int device, std::string& err);
+void bind_thread();                          // makes the CALLING thread use the device chosen by init() (CUDA binds the device per host thread): call it first in any helper thread
 const char* device_name();
 void mem_info(size_t* free_bytes, size_t* total_bytes);
 void* alloc(size_t n);                       // nullptr on failure (also clears a non-sticky OOM)

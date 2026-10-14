@@ -53,6 +53,8 @@ int main(int argc, char** argv) {
         else if (a == "--cuda-device") o.cuda_device = std::atoi(val());
         else if (a == "--gpu-slots") o.gpu_slots = std::atoi(val());
         else if (a == "--no-gpu-attn") o.gpu_attn = false;
+        else if (a == "--no-preload") o.preload = false;
+        else if (a == "--preload-wait") o.preload_wait = true;
         else if (a == "--expert-profile") o.expert_profile = val();
         else if (a == "--expert-profile-save") o.expert_profile_save = val();
         else if (a == "--expert-profile-save-every") o.expert_profile_save_every = std::atof(val());
