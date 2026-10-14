@@ -23,6 +23,7 @@ static void usage() {
         "         expert cache, opt-in (0/off = the previous release): --expert-promote N pins an LRU expert after N decode hits and unpins the coldest pinned one;\n"
         "         --expert-lru-layered evicts inside the requesting layer first; --profile-decay N halves the usage profile past N routed activations\n"
         "         --no-device-graphs: the decode experts run as separate kernel enqueues, no CUDA graph captured (the switch that isolates the graph from the stream/event ordering)\n"
+        "         --no-async-dense: the decode's q/k/v run as three separate round-trips (the control arm for the fused one)\n"
         "  facts the model card does not settle (docs/gptoss_porting.md):  --glu-halves  --rope-pairs  --no-concentration\n");
 }
 
@@ -59,6 +60,7 @@ int main(int argc, char** argv) {
         else if (a == "--expert-lru-layered") o.expert_lru_layered = true;
         else if (a == "--profile-decay") o.profile_decay = std::atoll(val());
         else if (a == "--no-device-graphs") o.device_graphs = false;
+        else if (a == "--no-async-dense") o.async_dense = false;
         else if (a == "--vram-pct") o.vram_pct = std::atof(val());
         else if (a == "--vram-total-mib") o.vram_total_mib = std::atoll(val());
         else if (a == "--vram-reserve-mib") o.vram_reserve_mib = std::atoll(val());
