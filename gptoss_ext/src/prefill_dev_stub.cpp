@@ -22,6 +22,7 @@ void kv_store_back(int, float*, float*, int, bool, int, int) {}
 bool run_experts(const Cfg&, int, const ExpertPtrs*, const int*, const int*, const float*, const int32_t*) { return false; }
 void advance(int) {}
 bool sync_all() { return false; }
+std::string last_error() { return ""; }
 
 }  // namespace pdev
 }  // namespace gptoss
