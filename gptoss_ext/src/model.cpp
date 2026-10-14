@@ -2,6 +2,7 @@
 #include "gptoss/safetensors.hpp"
 #include "gptoss/weights.hpp"
 #include "gptoss/gpu.hpp"
+#include "gptoss/prefill_dev.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -64,6 +65,7 @@ struct Model::Impl {
     uint64_t oom_fallbacks = 0;                        // device calls that found the scratch/slot allocation did not fit: host fallback, device stays on
     // --- device state (empty/false unless RunOpts::cuda)
     bool gpu_on = false;
+    bool pdev_on = false;                            // device-resident prefill (prefill_dev): the chunk never crosses PCIe except X in/out + router logits
     void* d_head = nullptr;                            // lm_head on the device
     std::vector<Slot> pool;                            // expert slots
     std::unordered_map<long long, int> where;          // layer*E+expert -> slot
@@ -97,6 +99,11 @@ struct Model::Impl {
     void mm(const WView& w, const void* dW, const float* x, int N, float* y);
     void attn_heads(Layer& y, Work& w, int pos, const KvStage& st = KvStage());
     void prefill_gpu(const int* tokens, int n, int start_pos, std::vector<float>* logits_last);
+    pdev::Cfg pdev_cfg() const;
+    /// Device-resident prefill. Returns how many leading tokens were fully processed (a multiple of chunk_max): n on success,
+    /// the failed chunk's start if a device call failed mid-way - the host cache is consistent up to that point and the caller
+    /// resumes the rest with the old path.
+    int prefill_pdev(const int* tokens, int n, int start_pos, std::vector<float>* logits_last);
 };
 
 Model::Model() : p_(new Impl) {}
@@ -105,6 +112,7 @@ Model::~Model() {
     Impl& s = *p_;
     if (s.hits + s.host_served + s.pcie_served) std::fprintf(stderr, "gptoss: expert slots (%zu): %llu hits, %llu over PCIe, %llu on the host\n", s.pool.size(),
                    (unsigned long long) s.hits, (unsigned long long) s.pcie_served, (unsigned long long) s.host_served);
+    pdev::shutdown();                                // its buffers are separate allocations; free them before the process exits
     for (auto& sl : s.pool) gpu::release(sl.base);
     for (auto& y : s.L) { gpu::release(y.dq); gpu::release(y.dk); gpu::release(y.dv); gpu::release(y.dobj); gpu::release(y.drt); }
     gpu::release(s.d_head);
@@ -439,6 +447,31 @@ bool Model::Impl::gpu_setup(std::string& err) {
         std::fprintf(stderr, "gptoss: pinned %zu hot experts (%.1f%% of the routed activations in the profile); %zu slots stay LRU\n",
                      done, total ? 100.0 * (double) covered / (double) total : 0.0, pool.size() - done);
     }
+    // Device-resident prefill (prefill_dev): its KV windows + scratch take VRAM from what is left AFTER the pool. If it
+    // does not fit, the old prefill stays on for the whole session - an honest fallback, no partial state.
+    if (pdev::available()) {
+        pdev::Cfg pc = pdev_cfg();
+        std::vector<char> sl((size_t) c.layers);
+        for (int l = 0; l < c.layers; ++l) sl[(size_t) l] = L[(size_t) l].sliding ? 1 : 0;
+        if (pdev::init(pc, sl.data(), budget > 0 ? (size_t) budget : 0)) {
+            bool up_ok = true;
+            for (int l = 0; l < c.layers && up_ok; ++l) {
+                Layer& y = L[(size_t) l];
+                up_ok = pdev::upload_layer(l, y.sliding, y.in_ln.data(), y.post_ln.data(), y.sinks.data(), y.bq.data(), y.bk.data(),
+                                           y.bv.data(), y.bo.data(), y.rbias.data(), y.dq, y.dk, y.dv, y.dobj, y.drt);
+            }
+            if (up_ok) {
+                pdev::set_rope(rope_cos.data(), rope_sin.data(), o.ctx);
+                pdev_on = true;
+                std::fprintf(stderr, "gptoss: device-resident prefill on (KV windows + scratch took the VRAM left after the pool)\n");
+            } else {
+                pdev::shutdown();
+                std::fprintf(stderr, "gptoss: device-resident prefill off (a layer's dense weights are not all on the device): old prefill\n");
+            }
+        } else {
+            std::fprintf(stderr, "gptoss: device-resident prefill off (its KV windows + scratch do not fit the VRAM left after the pool): old prefill\n");
+        }
+    }
     gpu_on = true;
     std::fprintf(stderr, "gptoss: CUDA device '%s' (%s): dense weights %.2f GiB on device%s, %zu expert slots of %.2f MiB (%.0f%% of the %d experts)\n",
                  gpu::device_name(), gpu::is_emulated() ? "EMULATED" : "real", dense_used / 1073741824.0, d_head ? "" : " (lm_head stays on the host: no room)",
@@ -761,6 +794,89 @@ void Model::Impl::prefill_gpu(const int* tokens, int n, int start_pos, std::vect
     }
 }
 
+pdev::Cfg Model::Impl::pdev_cfg() const {
+    pdev::Cfg pc;
+    pc.H = c.hidden; pc.I = c.moe_ff; pc.E = c.n_exp; pc.topk = c.topk; pc.layers = c.layers;
+    pc.ctx = o.ctx; pc.window = c.window; pc.heads = c.heads; pc.kv_heads = c.kv_heads; pc.head_dim = c.head_dim;
+    pc.eps = c.eps; pc.limit = c.swiglu_limit; pc.alpha = c.swiglu_alpha;
+    pc.rope_pairs = o.rope_pairs; pc.glu_halves = o.glu_halves; pc.chunk_max = std::max(1, chunk_max);
+    return pc;
+}
+
+// Device-resident prefill: the chunk's residual stream stays on the card for the whole layer loop. Per layer the host
+// only routes (router logits down, routing tables up) and resolves the touched experts' slots; per chunk it crosses
+// PCIe once more with X in/out and the new K/V rows back to the host cache (checkpoint + decode stay on the host KV).
+int Model::Impl::prefill_pdev(const int* tokens, int n, int start_pos, std::vector<float>* logits_last) {
+    const int H = c.hidden, E = c.n_exp, K = c.topk;
+    std::vector<float> X, Gl;
+    std::vector<int32_t> IDX;
+    std::vector<float> WT;
+    for (int c0 = 0; c0 < n && pdev_on; c0 += chunk_max) {
+        const int T = std::min(chunk_max, n - c0), p0 = start_pos + c0;
+        X.assign((size_t) T * H, 0.0f); Gl.assign((size_t) T * E, 0.0f);
+        IDX.assign((size_t) T * K, 0); WT.assign((size_t) T * K, 0.0f);
+#pragma omp parallel for schedule(static)
+        for (int t = 0; t < T; ++t) for (int i = 0; i < H; ++i) X[(size_t) t * H + i] = bf16_to_f32(((const uint16_t*) embed.p)[(size_t) tokens[c0 + t] * H + i]);
+        if (!pdev::x_upload(X.data(), T)) { pdev_on = false; return c0; }
+        for (int l = 0; l < c.layers && pdev_on; ++l) {
+            Layer& y = L[(size_t) l];
+            pdev::kv_prefetch(l, y.K.data(), y.V.data(), y.cap, y.sliding, p0);
+            pdev::LayerIO w{y.dq, y.dk, y.dv, y.dobj, y.drt};
+            if (!pdev::run_layer(pdev_cfg(), l, w, T, p0, y.sliding, Gl.data())) { pdev_on = false; return c0; }
+#pragma omp parallel for schedule(static)
+            for (int t = 0; t < T; ++t) {
+                float* g = &Gl[(size_t) t * E];
+                for (int e = 0; e < E; ++e) g[e] += y.rbias[(size_t) e];
+                route(g, E, K, &IDX[(size_t) t * K], &WT[(size_t) t * K]);
+                count_use(l, &IDX[(size_t) t * K]);
+            }
+            // group the routed rows by expert (index order), resolve every touched expert's slot, upload the tables
+            std::vector<int> cnt((size_t) E, 0);
+            for (int t = 0; t < T; ++t) for (int k = 0; k < K; ++k) cnt[(size_t) IDX[(size_t) t * K + k]]++;
+            std::vector<int> rowoff((size_t) E + 1, 0);
+            for (int e = 0; e < E; ++e) rowoff[(size_t) e + 1] = rowoff[e] + cnt[e];
+            const int R_tot = rowoff[E];
+            std::vector<int> src((size_t) R_tot), pos_in_exp((size_t) E, 0);
+            std::vector<float> WTR((size_t) R_tot, 0.0f);
+            for (int t = 0; t < T; ++t) for (int k = 0; k < K; ++k) {
+                const int e = IDX[(size_t) t * K + k];
+                const int r = rowoff[e] + pos_in_exp[e];
+                src[r] = t;
+                WTR[r] = WT[(size_t) t * K + k];
+                IDX[(size_t) t * K + k] = r;   // reuse IDX as the global rowof table (t*K+k order, what run_experts wants)
+                ++pos_in_exp[e];
+            }
+            std::vector<pdev::ExpertPtrs> per((size_t) E);
+            {
+                std::lock_guard<std::mutex> g(gmu);
+                for (int e = 0; e < E && pdev_on; ++e) {
+                    if (!cnt[e]) continue;
+                    Slot* sl = resident(l, e);
+                    if (!sl) { pdev_on = false; break; }   // no slot can take it: the old prefill does this chunk's session from here on
+                    per[(size_t) e].gu_b = sl->gu_b; per[(size_t) e].dn_b = sl->dn_b;
+                    per[(size_t) e].gu_s = sl->gu_s; per[(size_t) e].dn_s = sl->dn_s;
+                    per[(size_t) e].gu_bias = sl->gu_bias; per[(size_t) e].dn_bias = sl->dn_bias;
+                }
+            }
+            if (!pdev_on) return c0;
+            if (!pdev::run_experts(pdev_cfg(), T, per.data(), cnt.data(), src.data(), WTR.data(), IDX.data())) { pdev_on = false; return c0; }
+            pdev::kv_store_back(l, y.K.data(), y.V.data(), y.cap, y.sliding, T, p0);
+        }
+        if (!pdev_on) return c0;
+        pdev::advance(T);
+        if (!pdev::x_download(X.data(), T)) { pdev_on = false; return c0; }
+        if (!pdev::sync_all()) { pdev_on = false; return c0; }   // the K/V rows are back in the host cache before anything reads it
+        if ((int) cached.size() > p0) cached.resize((size_t) p0);
+        for (int t = 0; t < T; ++t) if ((int) cached.size() == p0 + t) cached.push_back(tokens[c0 + t]);
+        if (logits_last && c0 + T == n) {
+            rmsnorm(&X[(size_t) (T - 1) * H], final_norm.data(), c.eps, H, lastn.data());
+            logits_last->resize((size_t) c.vocab);
+            mv(lm_head, d_head, lastn.data(), logits_last->data());
+        }
+    }
+    return n;
+}
+
 void Model::forward(int token, int pos, std::vector<float>* logits_out) {
     Impl& s = *p_;
     const GptConfig& c = s.c;
@@ -799,6 +915,12 @@ void Model::prefill(const int* tokens, int n, int start_pos, std::vector<float>*
     bool bad = start_pos < 0 || start_pos + n > s.o.ctx;
     for (int i = 0; i < n && !bad; ++i) bad = tokens[i] < 0 || tokens[i] >= c.vocab;
     if (bad) { if (logits_last) logits_last->assign((size_t) c.vocab, 0.0f); return; }
+    if (s.gpu_on && s.pdev_on) {
+        const int done = s.prefill_pdev(tokens, n, start_pos, logits_last);   // a device failure stops it: the host cache is consistent up to `done`
+        if (done == n) return;
+        s.prefill_gpu(tokens + done, n - done, start_pos + done, logits_last);   // the old path finishes the rest from the same host cache
+        return;
+    }
     if (s.gpu_on) { s.prefill_gpu(tokens, n, start_pos, logits_last); return; }
     std::vector<float> X, Hh, Y, Q, Ks, Vs;
     std::vector<int32_t> IDX; std::vector<float> WT;
