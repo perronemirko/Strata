@@ -27,6 +27,8 @@ struct Layer {
     const uint16_t *gu_bias = nullptr, *dn_bias = nullptr;   // BF16 [E,2I], [E,H] (mmap)
     std::vector<float> K, V;                           // [cap][kv_dim]
     void *dq = nullptr, *dk = nullptr, *dv = nullptr, *dobj = nullptr, *drt = nullptr;   // device copies of the BF16 projections (null = host)
+    float *d_in_ln = nullptr, *d_post_ln = nullptr, *d_bq = nullptr, *d_bk = nullptr, *d_bv = nullptr, *d_bo = nullptr, *d_sinks = nullptr;   // device copies (attention on the device)
+    float *dKc = nullptr, *dVc = nullptr;              // device KV cache of the layer, [cap][kv_dim] fp32, same slots as K / V (the host copy is kept in sync)
     size_t slot(int pos) const { return sliding ? (size_t) pos % (size_t) cap : (size_t) pos; }
 };
 struct Work { std::vector<float> h, q, k, v, att, tmp, glog, y, gu, act, eb, sc, part; };   // part: [topk][H] per-expert contributions of one decode layer
@@ -77,6 +79,12 @@ struct Model::Impl {
     uint64_t promotions = 0;                           // LRU <-> pinned swaps done by --expert-promote
     std::mutex gmu;                                    // every device call is serialised
 
+    // --- attention on the device (batched prefill): the activations of one chunk stay in VRAM for every layer
+    bool attn_dev = false;
+    float *d_cos = nullptr, *d_sin = nullptr;          // RoPE tables [ctx][D/2]
+    float *a_X = nullptr, *a_Hn = nullptr, *a_Q = nullptr, *a_K = nullptr, *a_V = nullptr, *a_Att = nullptr, *a_Ob = nullptr, *a_Gl = nullptr, *a_Y = nullptr;
+    int dev_kv_pos = 0;                                // positions [0, dev_kv_pos) of the device KV are known to equal the host KV (decode writes the host only)
+
     void init_work(Work& w) const;
     Work& my_work();
     void attn_in(Layer& y, Work& w, const float* x, int pos, const KvStage& st = KvStage());
@@ -105,6 +113,11 @@ struct Model::Impl {
     /// the failed chunk's start if a device call failed mid-way - the host cache is consistent up to that point and the caller
     /// resumes the rest with the old path.
     int prefill_pdev(const int* tokens, int n, int start_pos, std::vector<float>* logits_last);
+    void moe_prefill_layer(int l, int T, const float* Hn, const int32_t* IDX, const float* WT, float* Y);   // routed experts of one layer for a chunk (Y = sum, zeroed here)
+    bool chunk_dev(int T, int p0, const float* X0, float* Xlast);   // one chunk, whole stack on the device; false = redo it on the host
+    bool kv_sync_to_dev(int upto);
+    bool setup_attn_dev(double& budget);
+    void release_attn();
 };
 
 Model::Model() : p_(new Impl) {}
@@ -117,10 +130,12 @@ Model::~Model() {
     for (auto& sl : s.pool) gpu::release(sl.base);
     for (auto& y : s.L) { gpu::release(y.dq); gpu::release(y.dk); gpu::release(y.dv); gpu::release(y.dobj); gpu::release(y.drt); }
     gpu::release(s.d_head);
+    s.release_attn();
 }
 const GptConfig& Model::config() const { return p_->c; }
 uint64_t Model::weight_bytes() const { return p_->st.total_bytes(); }
-void Model::reset() { p_->cached.clear(); }
+void Model::reset() { p_->cached.clear(); p_->dev_kv_pos = 0; }
+bool Model::gpu_attention() const { return p_->attn_dev && p_->gpu_on; }
 int Model::cached_len() const { return (int) p_->cached.size(); }
 
 bool Model::load(const std::string& dir, const RunOpts& opts, std::string& err) {
@@ -195,7 +210,10 @@ bool Model::load(const std::string& dir, const RunOpts& opts, std::string& err) 
     rope_table(f, opts.ctx, opts.no_concentration ? 1.0 : yarn_concentration(c.yarn_factor), s.rope_cos, s.rope_sin);
     // The batch is no longer limited by the ring's margin: a prefill chunk stages its own K/V (KvStage) and commits it to the ring only after
     // the chunk's attention has read it, so a 512-token chunk runs on a 132-position ring. With N >= 32 the device uses the tensor-core GEMM.
-    s.chunk_max = std::max(1, opts.prefill_chunk);
+    // 0 = auto: a device wants the whole prompt in as few chunks as possible (the per-chunk cost is the PCIe round-trip, not the math),
+    // the CPU keeps the old 512. gpu_setup may still halve it, so the chunk's scratch fits the VRAM left after the dense weights.
+    const int pchunk = opts.prefill_chunk > 0 ? opts.prefill_chunk : (opts.cuda ? 8192 : 512);
+    s.chunk_max = std::max(1, pchunk);
     int nt = 1;
 #ifdef _OPENMP
     nt = omp_get_max_threads();
@@ -421,6 +439,11 @@ bool Model::Impl::gpu_setup(std::string& err) {
     size_t max_rows = (size_t) c.n_exp;                // rows of the projections that run batched: q, k, v, o, router
     for (const Layer& y : L) { max_rows = std::max(max_rows, std::max((size_t) y.q.rows, std::max((size_t) y.k.rows, std::max((size_t) y.v.rows, std::max((size_t) y.o.rows, (size_t) y.router.rows))))); }
     const double ctx_floats = 3.0 * (double) H + 3.0 * (double) I + 1.0;   // one expert context at N == 1 (d_x, d_wt, d_gu, d_act, d_eb, d_y)
+    // The batch expert context (context kExpertCtxBatch, used by the pipelined prefill) is the SAME buffers at N == chunk:
+    // it is the biggest single reservation of the whole plan (at gpt-oss-120b: 2I = 28800 rows of fp32 GU alone), so it
+    // is counted in the loop that halves the chunk - a chunk that survives always leaves room for its own expert batch.
+    // The pipelined prefill holds TWO of them at once (expert a computes while a+1 is gathered/uploaded), so the budget
+    // counts 2 * chunk * ctx_floats, not 1.
     // The async dense context (decode's fused q/k/v) is a FIXED cost, independent of the chunk: one row of x plus the
     // three output blocks. Count it in the loop that halves the chunk, so the chunk that survives always leaves room
     // for it: reserving it only after the loop would OOM at load and turn the whole device off.
@@ -435,15 +458,16 @@ bool Model::Impl::gpu_setup(std::string& err) {
     for (;;) {
         nx = (size_t) chunk * H;
         ny = std::max((size_t) chunk * max_rows, (size_t) c.vocab);        // the lm_head/router mv() calls run at N == 1 over vocab rows
-        const double need = 4.0 * ((double) (nx + ny) + (double) (gpu::kExpertCtxBatch + 1) * ctx_floats) + dense_async_bytes;
+        // the four decode contexts stay at N == 1; the batch context grows with the chunk, so it is counted at N == chunk
+        const double need = 4.0 * ((double) (nx + ny) + (double) gpu::kExpertCtxBatch * ctx_floats + (double) chunk * ctx_floats) + dense_async_bytes;
         if (need <= budget) break;
         if (chunk == 1) { std::fprintf(stderr, "gptoss:   the dense scratch does not fit the VRAM left: the device path stays off\n"); err = "dense scratch does not fit"; return false; }
         chunk /= 2;
     }
     // Reserve it with the rest of the scratch, BEFORE the slots take the VRAM: no cudaMalloc mid-generation.
     const size_t dense_async_y = (size_t) c.q_dim() + 2 * (size_t) c.kv_dim();
-    if (!gpu::reserve_scratch(nx, ny, 1, (int) H, (int) I, o.async_dense ? dense_async_y : (size_t) 0)) { err = gpu::last_error(); return false; }
-    budget -= 4.0 * ((double) (nx + ny) + (double) (gpu::kExpertCtxBatch + 1) * ctx_floats) + dense_async_bytes;
+    if (!gpu::reserve_scratch(nx, ny, chunk, (int) H, (int) I, o.async_dense ? dense_async_y : (size_t) 0)) { err = gpu::last_error(); return false; }
+    budget -= 4.0 * ((double) (nx + ny) + (double) gpu::kExpertCtxBatch * ctx_floats + (double) chunk * ctx_floats) + dense_async_bytes;
     if (chunk < want_chunk) {
         chunk_max = chunk;
         std::fprintf(stderr, "gptoss: prefill chunk %d -> %d so the dense scratch fits the VRAM left\n", want_chunk, chunk);
@@ -482,6 +506,9 @@ bool Model::Impl::gpu_setup(std::string& err) {
             std::fprintf(stderr, "gptoss: device-resident prefill off (its KV windows + scratch do not fit its share of the VRAM left): old prefill\n");
         }
     }
+    // Attention on the device is for the batched prefill only; the device-resident prefill (prefill_dev) keeps the whole
+    // chunk on the card already and runs instead of it, so when that one is on there is nothing to reserve.
+    if (o.gpu_attn && !pdev_on) setup_attn_dev(budget);
     auto al = [](size_t v) { return (v + 255) & ~(size_t) 255; };
     const size_t s_gub = 2 * I * (H / 32) * 16, s_gus = 2 * I * (H / 32), s_dnb = H * (I / 32) * 16, s_dns = H * (I / 32);
     const size_t s_gubias = 2 * I * 2, s_dnbias = H * 2;   // the BF16 bias rows travel with the expert: the async pipeline has no host step to add them
@@ -543,6 +570,78 @@ void Model::Impl::pdev_fail_(const std::string& why) {
     const std::string perr = pdev::last_error();
     std::fprintf(stderr, "gptoss: device-resident prefill off (%s): %s: the old prefill continues on the device\n",
                  why.c_str(), perr.empty() ? "no CUDA call failed" : perr.c_str());
+}
+
+// Everything the device needs to run the whole stack of a prefill chunk without going back to the host between the projections: device KV per layer, the
+// per-layer norms/biases/sinks, the RoPE tables and the chunk's activation buffers. All or nothing (one layer on the host would break the resident flow);
+// at most 45% of what is left of the budget, and the chunk is shortened if its activations do not fit.
+bool Model::Impl::setup_attn_dev(double& budget) {
+    const size_t H = (size_t) c.hidden, QD = (size_t) c.q_dim(), KD = (size_t) c.kv_dim(), E = (size_t) c.n_exp, D = (size_t) c.head_dim;
+    auto no = [&](const char* why) { if (o.verbose) std::fprintf(stderr, "gptoss: attention stays on the host in the prefill (%s)\n", why); return false; };
+    // The shape rule belongs to the BACKEND's kernel, not to the path: the emulated device runs the host math and accepts
+    // any shape (it is the executable spec the tests run against), the CUDA kernel owns one dimension per lane. Ask it.
+    gpu::AttnShape probe;
+    probe.heads = c.heads; probe.kv_heads = c.kv_heads; probe.D = c.head_dim; probe.window = c.window; probe.cap = 1;
+    if (!gpu::attn_supported(probe)) return no("the attention kernel needs head_dim a multiple of 32, at most 128");
+    for (const auto& y : L) if (!y.dq || !y.dk || !y.dv || !y.dobj || !y.drt) return no("a dense matmul did not fit on the device");
+    double kvb = 0;
+    for (const auto& y : L) kvb += 2.0 * (double) y.cap * (double) KD * 4.0;
+    const double small = (double) c.layers * (double) (2 * H + QD + 2 * KD + H + (size_t) c.heads) * 4.0 + 2.0 * (double) o.ctx * (double) (D / 2) * 4.0;
+    const double ppt = (double) (4 * H + 2 * QD + 2 * KD + E) * 4.0;                       // device bytes per token of the chunk
+    const double room = budget * 0.45 - kvb - small;
+    const long long tmax = room > 0 ? (long long) (room / ppt) : 0;
+    if (tmax < std::min<long long>(chunk_max, 64)) return no("the device KV cache does not fit; try a smaller --ctx");
+    if (tmax < chunk_max) {
+        if (o.verbose) std::fprintf(stderr, "gptoss: prefill chunk %d -> %lld (the activations stay in VRAM)\n", chunk_max, tmax);
+        chunk_max = (int) tmax;
+    }
+    bool ok = true;
+    auto upf = [&](const float* h, size_t n, float*& d) {
+        if (!ok) return;
+        d = (float*) gpu::alloc(n * 4);
+        if (!d || !gpu::h2d(d, h, n * 4)) ok = false;
+    };
+    auto buf = [&](size_t n, float*& d) { if (!ok) return; d = (float*) gpu::alloc(n * 4); if (!d) ok = false; };
+    for (auto& y : L) {
+        upf(y.in_ln.data(), H, y.d_in_ln); upf(y.post_ln.data(), H, y.d_post_ln); upf(y.bq.data(), QD, y.d_bq); upf(y.bk.data(), KD, y.d_bk);
+        upf(y.bv.data(), KD, y.d_bv); upf(y.bo.data(), H, y.d_bo); upf(y.sinks.data(), (size_t) c.heads, y.d_sinks);
+        buf((size_t) y.cap * KD, y.dKc); buf((size_t) y.cap * KD, y.dVc);
+    }
+    upf(rope_cos.data(), rope_cos.size(), d_cos); upf(rope_sin.data(), rope_sin.size(), d_sin);
+    const size_t T = (size_t) chunk_max;
+    buf(T * H, a_X); buf(T * H, a_Hn); buf(T * QD, a_Q); buf(T * KD, a_K); buf(T * KD, a_V); buf(T * QD, a_Att); buf(T * H, a_Ob); buf(T * E, a_Gl); buf(T * H, a_Y);
+    if (!ok) { release_attn(); return no("device allocation failed"); }
+    budget -= kvb + small + ppt * (double) T;
+    attn_dev = true;
+    dev_kv_pos = 0;
+    if (o.verbose) std::fprintf(stderr, "gptoss: attention + KV on the device for the prefill: KV %.2f GiB, activations for %d tokens %.2f GiB\n", kvb / 1073741824.0, chunk_max, ppt * (double) T / 1073741824.0);
+    return true;
+}
+
+void Model::Impl::release_attn() {
+    for (auto& y : L) {
+        float** v[] = {&y.d_in_ln, &y.d_post_ln, &y.d_bq, &y.d_bk, &y.d_bv, &y.d_bo, &y.d_sinks, &y.dKc, &y.dVc};
+        for (float** p : v) { gpu::release(*p); *p = nullptr; }
+    }
+    float** g[] = {&d_cos, &d_sin, &a_X, &a_Hn, &a_Q, &a_K, &a_V, &a_Att, &a_Ob, &a_Gl, &a_Y};
+    for (float** p : g) { gpu::release(*p); *p = nullptr; }
+    attn_dev = false;
+}
+
+// Host KV -> device KV for positions [dev_kv_pos, upto) (what decode wrote since the last device prefill); banded layers only need the last `cap` of them.
+bool Model::Impl::kv_sync_to_dev(int upto) {
+    const size_t KD = (size_t) c.kv_dim();
+    for (auto& y : L) {
+        const int a = std::max(dev_kv_pos, y.sliding ? std::max(0, upto - y.cap) : 0);
+        for (int pos = a; pos < upto;) {
+            const size_t slot = y.slot(pos);
+            const int run = y.sliding ? std::min(upto - pos, y.cap - (int) slot) : upto - pos;
+            if (!gpu::h2d(y.dKc + slot * KD, &y.K[slot * KD], (size_t) run * KD * 4) || !gpu::h2d(y.dVc + slot * KD, &y.V[slot * KD], (size_t) run * KD * 4)) return false;
+            pos += run;
+        }
+    }
+    dev_kv_pos = std::max(dev_kv_pos, upto);
+    return true;
 }
 
 void Model::Impl::count_use(int li, const int32_t* idx) {
@@ -732,10 +831,180 @@ void Model::Impl::experts_decode(Layer& y, Work& w, const float* h, const int32_
     for (int k = 0; k < K; ++k) { const float* pk = part + (size_t) k * H; for (int i = 0; i < H; ++i) acc[i] += pk[i]; }
 }
 
+// The routed experts of one layer for a whole chunk: Y = the sum of the top-k contributions (zeroed here). Shared by the
+// host-resident prefill (prefill_gpu) and the device-resident one (chunk_dev): in both, the experts' input rows come from
+// the host, so this is the only part that still crosses PCIe per layer.
+void Model::Impl::moe_prefill_layer(int l, int T, const float* Hn, const int32_t* IDX, const float* WT, float* Y) {
+    const int H = c.hidden, E = c.n_exp, K = c.topk, I = c.moe_ff;
+    Layer& y = L[(size_t) l];
+    std::vector<float> Xe, GU, ACT, EB;
+    std::fill(Y, Y + (size_t) T * H, 0.0f);
+    std::vector<std::vector<int>> by_exp((size_t) E);
+    for (int t = 0; t < T; ++t) for (int k = 0; k < K; ++k) by_exp[(size_t) IDX[(size_t) t * K + k]].push_back(t * K + k);
+    auto sync_expert = [&](int e) {                                        // synchronous path: [device matmat | host SwiGLU | device matmat], or all on the host
+        const auto& lst = by_exp[(size_t) e];
+        const int N = (int) lst.size();
+        if (N == 0) return;
+        Xe.assign((size_t) N * H, 0.0f);
+        for (int i = 0; i < N; ++i) std::copy(&Hn[(size_t) (lst[(size_t) i] / K) * H], &Hn[(size_t) (lst[(size_t) i] / K) * H] + H, &Xe[(size_t) i * H]);
+        Slot* sl = nullptr;
+        if (gpu_on && !pool.empty()) { std::lock_guard<std::mutex> g(gmu); sl = resident(l, e); }
+        GU.assign((size_t) N * 2 * I, 0.0f);
+        bool ok = false;
+        if (sl) { std::lock_guard<std::mutex> g(gmu); ok = gpu::matmat_mx(sl->gu_b, sl->gu_s, 2 * I, H, Xe.data(), N, GU.data()); if (!ok) gpu_fail(gpu::last_error()); }
+        if (!ok) {
+            MxView gu = y.gu; gu.blocks += (size_t) e * 2 * I * (H / 32) * 16; gu.scales += (size_t) e * 2 * I * (H / 32);
+            for (int i = 0; i < N; ++i) matvec_mx(gu, &Xe[(size_t) i * H], &GU[(size_t) i * 2 * I]);
+        }
+        ACT.assign((size_t) N * I, 0.0f);
+        const uint16_t* gb = y.gu_bias + (size_t) e * 2 * I;
+#pragma omp parallel for schedule(static)
+        for (int i = 0; i < N; ++i) {
+            const float* r = &GU[(size_t) i * 2 * I];
+            for (int j = 0; j < I; ++j) {
+                const float gt = (o.glu_halves ? r[j] : r[2 * j]) + bf16_to_f32(gb[o.glu_halves ? j : 2 * j]);
+                const float up = (o.glu_halves ? r[I + j] : r[2 * j + 1]) + bf16_to_f32(gb[o.glu_halves ? I + j : 2 * j + 1]);
+                ACT[(size_t) i * I + j] = swiglu(gt, up, c.swiglu_limit, c.swiglu_alpha);
+            }
+        }
+        EB.assign((size_t) N * H, 0.0f);
+        ok = false;
+        if (sl && gpu_on) { std::lock_guard<std::mutex> g(gmu); ok = gpu::matmat_mx(sl->dn_b, sl->dn_s, H, I, ACT.data(), N, EB.data()); if (!ok) gpu_fail(gpu::last_error()); }
+        if (!ok) {
+            MxView dn = y.dn; dn.blocks += (size_t) e * H * (I / 32) * 16; dn.scales += (size_t) e * H * (I / 32);
+            for (int i = 0; i < N; ++i) matvec_mx(dn, &ACT[(size_t) i * I], &EB[(size_t) i * H]);
+        }
+        const uint16_t* db = y.dn_bias + (size_t) e * H;
+        for (int i = 0; i < N; ++i) {                                      // a token has an expert at most once: no overlap on Y[t]
+            const int t = lst[(size_t) i] / K;
+            const float wt = WT[(size_t) lst[(size_t) i]];
+            for (int j = 0; j < H; ++j) Y[(size_t) t * H + j] += wt * (EB[(size_t) i * H + j] + bf16_to_f32(db[j]));
+        }
+    };
+    std::vector<int> act;
+    for (int e = 0; e < E; ++e) if (!by_exp[(size_t) e].empty()) act.push_back(e);
+    if (!(gpu_on && !pool.empty())) {
+        for (int e : act) sync_expert(e);
+    } else {
+        // Pipelined: while the device computes expert a (whole expert in one launch on the batch context: x/wt up, gate_up GEMM, SwiGLU, down GEMM,
+        // y down), the host gathers the rows of expert a+1 and uploads its weights over PCIe; expert a+1 is launched BEFORE the host scatters a's result.
+        struct Stage { int e = -1, N = 0; Slot* sl = nullptr; bool fly = false; std::vector<float> xe, wt, eb; };
+        Stage stg[2];
+        const int Ke = K;
+        auto prep = [&](Stage& s, int e) {
+            const auto& lst = by_exp[(size_t) e];
+            s.e = e; s.N = (int) lst.size(); s.fly = false; s.sl = nullptr;
+            s.xe.resize((size_t) s.N * H); s.wt.resize((size_t) s.N);
+            for (int i = 0; i < s.N; ++i) {
+                const int r = lst[(size_t) i];
+                std::copy(&Hn[(size_t) (r / Ke) * H], &Hn[(size_t) (r / Ke) * H] + H, &s.xe[(size_t) i * H]);
+                s.wt[(size_t) i] = WT[(size_t) r];
+            }
+            if (gpu_on) { std::lock_guard<std::mutex> g(gmu); s.sl = resident(l, e); if (s.sl) s.sl->busy = true; }   // busy: not evictable until collected
+        };
+        auto launch = [&](Stage& s) {
+            if (!s.sl || !gpu_on) return;
+            gpu::ExpertDesc d;
+            d.gu_b = s.sl->gu_b; d.gu_s = s.sl->gu_s; d.gu_bias = s.sl->gu_bias;      // the bias rows live inside the slot: no per-layer copy
+            d.dn_b = s.sl->dn_b; d.dn_s = s.sl->dn_s; d.dn_bias = s.sl->dn_bias;
+            d.H = H; d.I = I; d.halves = o.glu_halves ? 1 : 0; d.limit = c.swiglu_limit; d.alpha = c.swiglu_alpha;
+            std::lock_guard<std::mutex> g(gmu);
+            if (gpu::expert_run_async(gpu::kExpertCtxBatch, d, s.xe.data(), s.wt.data(), s.N)) s.fly = true;
+            else gpu_fail(gpu::last_error());
+        };
+        auto collect = [&](Stage& s) -> bool {          // true: s.eb holds wt * (down + bias) for each of the N rows
+            bool ok = false;
+            if (s.fly) {
+                s.eb.resize((size_t) s.N * H);
+                std::lock_guard<std::mutex> g(gmu);
+                ok = gpu::expert_collect(gpu::kExpertCtxBatch, s.eb.data());
+                if (!ok) gpu_fail(gpu::last_error());
+            }
+            if (s.sl) { std::lock_guard<std::mutex> g(gmu); s.sl->busy = false; }
+            s.fly = false;
+            return ok;
+        };
+        Stage* cur = &stg[0]; Stage* nxt = &stg[1];
+        if (!act.empty()) { prep(*cur, act[0]); launch(*cur); }
+        for (size_t a = 0; a < act.size(); ++a) {
+            const bool more = a + 1 < act.size();
+            if (more) prep(*nxt, act[a + 1]);                              // gather + PCIe upload while `cur` computes
+            const bool done = collect(*cur);
+            if (more) launch(*nxt);                                        // the device is busy again while the host scatters below
+            if (done) {
+                const auto& lst = by_exp[(size_t) cur->e];                 // a token has an expert at most once: no overlap on Y[t]
+                for (int i = 0; i < cur->N; ++i) {
+                    float* yt = &Y[(size_t) (lst[(size_t) i] / K) * H];
+                    const float* eb = &cur->eb[(size_t) i * H];
+                    for (int j = 0; j < H; ++j) yt[j] += eb[j];
+                }
+            } else sync_expert(cur->e);                                    // no slot / launch or collect failed: the old path
+            std::swap(cur, nxt);
+        }
+    }
+}
+
+// One chunk of the prefill with the activations resident in VRAM: x goes up ONCE, then for every layer [norm, q/k/v, bias+RoPE+KV write, attention, o,
+// residual, norm, router] run on the device; down come only the post-norm rows (the experts' input), the router logits and the K/V rows of the chunk (to keep
+// the host KV, which decode / checkpoints / reuse_prefix use, identical). The routed experts go through moe_prefill_layer; their sum goes up and is added on
+// the device. At the end only the last row of x comes back (the lm_head input). false: the device failed -> the caller redoes the chunk on the host
+// (the host X was never touched and every KV slot of the chunk is rewritten by that path).
+bool Model::Impl::chunk_dev(int T, int p0, const float* X0, float* Xlast) {
+    const int H = c.hidden, E = c.n_exp, K = c.topk, QD = c.q_dim(), KD = c.kv_dim();
+    auto bad = [&]() { if (gpu_on) gpu_fail(gpu::last_error()); return false; };
+    std::vector<float> Hn((size_t) T * H), Gl((size_t) T * E), Y((size_t) T * H), WT((size_t) T * K);
+    std::vector<int32_t> IDX((size_t) T * K);
+    {
+        std::lock_guard<std::mutex> g(gmu);
+        if (!gpu_on || !kv_sync_to_dev(p0) || !gpu::h2d(a_X, X0, (size_t) T * H * 4)) return bad();
+    }
+    for (int l = 0; l < c.layers; ++l) {
+        if (!gpu_on) return false;
+        Layer& y = L[(size_t) l];
+        gpu::AttnShape a;
+        a.heads = c.heads; a.kv_heads = c.kv_heads; a.D = c.head_dim; a.window = c.window; a.sliding = y.sliding; a.cap = y.cap; a.rope_pairs = o.rope_pairs;
+        {
+            std::lock_guard<std::mutex> g(gmu);
+            bool ok = gpu::rms_rows(a_X, y.d_in_ln, c.eps, T, H, a_Hn) && gpu::dmm_bf16(y.dq, QD, H, a_Hn, T, a_Q) && gpu::dmm_bf16(y.dk, KD, H, a_Hn, T, a_K) &&
+                      gpu::dmm_bf16(y.dv, KD, H, a_Hn, T, a_V) && gpu::qk_rope_kv(a_Q, a_K, a_V, y.d_bq, y.d_bk, y.d_bv, d_cos, d_sin, T, p0, a, y.dKc, y.dVc) &&
+                      gpu::attn_rows(a_Q, y.dKc, y.dVc, y.d_sinks, T, p0, a, a_Att) && gpu::dmm_bf16(y.dobj, H, QD, a_Att, T, a_Ob) && gpu::add_rows(a_X, a_Ob, y.d_bo, T, H) &&
+                      gpu::rms_rows(a_X, y.d_post_ln, c.eps, T, H, a_Hn) && gpu::dmm_bf16(y.drt, E, H, a_Hn, T, a_Gl) &&
+                      gpu::d2h(Hn.data(), a_Hn, (size_t) T * H * 4) && gpu::d2h(Gl.data(), a_Gl, (size_t) T * E * 4);
+            for (int pos = p0; ok && pos < p0 + T;) {                          // K/V rows of the chunk -> host cache (one segment, two if the ring wraps)
+                const size_t slot = y.slot(pos);
+                const int run = y.sliding ? std::min(p0 + T - pos, y.cap - (int) slot) : p0 + T - pos;
+                ok = gpu::d2h(&y.K[slot * KD], y.dKc + slot * KD, (size_t) run * KD * 4) && gpu::d2h(&y.V[slot * KD], y.dVc + slot * KD, (size_t) run * KD * 4);
+                pos += run;
+            }
+            if (!ok) return bad();
+        }
+#pragma omp parallel for schedule(static)
+        for (int t = 0; t < T; ++t) {
+            float* gl = &Gl[(size_t) t * E];
+            for (int e = 0; e < E; ++e) gl[e] += y.rbias[(size_t) e];
+            route(gl, E, K, &IDX[(size_t) t * K], &WT[(size_t) t * K]);
+            count_use(l, &IDX[(size_t) t * K]);
+        }
+        moe_prefill_layer(l, T, Hn.data(), IDX.data(), WT.data(), Y.data());
+        {
+            std::lock_guard<std::mutex> g(gmu);
+            if (!gpu_on || !gpu::h2d(a_Y, Y.data(), (size_t) T * H * 4) || !gpu::add_rows(a_X, a_Y, nullptr, T, H)) return bad();
+        }
+    }
+    {
+        std::lock_guard<std::mutex> g(gmu);
+        std::vector<float> last((size_t) H);
+        if (!gpu_on || !gpu::d2h(last.data(), a_X + (size_t) (T - 1) * H, (size_t) H * 4)) return bad();
+        std::memcpy(Xlast, last.data(), (size_t) H * 4);          // Xlast aliases the host X the caller would recompute from: written only on success
+    }
+    dev_kv_pos = p0 + T;
+    return true;
+}
+
 // Batched prefill with the device: every projection and every expert is ONE pass over the weights for the whole chunk.
 void Model::Impl::prefill_gpu(const int* tokens, int n, int start_pos, std::vector<float>* logits_last) {
-    const int H = c.hidden, E = c.n_exp, K = c.topk, I = c.moe_ff, QD = c.q_dim(), KD = c.kv_dim(), D = c.head_dim, half = D / 2;
-    std::vector<float> X, Hn, Qb, Kb, Vb, Ab, Ob, Gl, Y, Xe, GU, ACT, EB, Ks, Vs;
+    const int H = c.hidden, E = c.n_exp, K = c.topk, QD = c.q_dim(), KD = c.kv_dim(), D = c.head_dim, half = D / 2;
+    std::vector<float> X, Hn, Qb, Kb, Vb, Ab, Ob, Gl, Y, Ks, Vs;
     std::vector<int32_t> IDX;
     std::vector<float> WT;
     for (int c0 = 0; c0 < n; c0 += chunk_max) {
@@ -747,7 +1016,9 @@ void Model::Impl::prefill_gpu(const int* tokens, int n, int start_pos, std::vect
         Y.assign((size_t) T * H, 0.0f); IDX.assign((size_t) T * K, 0); WT.assign((size_t) T * K, 0.0f);
 #pragma omp parallel for schedule(static)
         for (int t = 0; t < T; ++t) for (int i = 0; i < H; ++i) X[(size_t) t * H + i] = bf16_to_f32(((const uint16_t*) embed.p)[(size_t) tokens[c0 + t] * H + i]);
-        for (int l = 0; l < c.layers; ++l) {
+        bool dev_done = false;
+        if (attn_dev && gpu_on) dev_done = chunk_dev(T, p0, X.data(), &X[(size_t) (T - 1) * H]);   // success: only X's last row is meaningful
+        if (!dev_done) for (int l = 0; l < c.layers; ++l) {
             Layer& y = L[(size_t) l];
 #pragma omp parallel for schedule(static)
             for (int t = 0; t < T; ++t) rmsnorm(&X[(size_t) t * H], y.in_ln.data(), c.eps, H, &Hn[(size_t) t * H]);
@@ -794,49 +1065,7 @@ void Model::Impl::prefill_gpu(const int* tokens, int n, int start_pos, std::vect
                 route(g, E, K, &IDX[(size_t) t * K], &WT[(size_t) t * K]);
                 count_use(l, &IDX[(size_t) t * K]);
             }
-            std::fill(Y.begin(), Y.end(), 0.0f);
-            std::vector<std::vector<int>> by_exp((size_t) E);
-            for (int t = 0; t < T; ++t) for (int k = 0; k < K; ++k) by_exp[(size_t) IDX[(size_t) t * K + k]].push_back(t * K + k);
-            for (int e = 0; e < E; ++e) {
-                const auto& lst = by_exp[(size_t) e];
-                const int N = (int) lst.size();
-                if (N == 0) continue;
-                Xe.assign((size_t) N * H, 0.0f);
-                for (int i = 0; i < N; ++i) std::copy(&Hn[(size_t) (lst[(size_t) i] / K) * H], &Hn[(size_t) (lst[(size_t) i] / K) * H] + H, &Xe[(size_t) i * H]);
-                Slot* sl = nullptr;
-                if (gpu_on && !pool.empty()) { std::lock_guard<std::mutex> g(gmu); sl = resident(l, e); }
-                GU.assign((size_t) N * 2 * I, 0.0f);
-                bool ok = false;
-                if (sl) { std::lock_guard<std::mutex> g(gmu); ok = gpu::matmat_mx(sl->gu_b, sl->gu_s, 2 * I, H, Xe.data(), N, GU.data()); if (!ok) gpu_fail(gpu::last_error()); }
-                if (!ok) {
-                    MxView gu = y.gu; gu.blocks += (size_t) e * 2 * I * (H / 32) * 16; gu.scales += (size_t) e * 2 * I * (H / 32);
-                    for (int i = 0; i < N; ++i) matvec_mx(gu, &Xe[(size_t) i * H], &GU[(size_t) i * 2 * I]);
-                }
-                ACT.assign((size_t) N * I, 0.0f);
-                const uint16_t* gb = y.gu_bias + (size_t) e * 2 * I;
-#pragma omp parallel for schedule(static)
-                for (int i = 0; i < N; ++i) {
-                    const float* r = &GU[(size_t) i * 2 * I];
-                    for (int j = 0; j < I; ++j) {
-                        const float gt = (o.glu_halves ? r[j] : r[2 * j]) + bf16_to_f32(gb[o.glu_halves ? j : 2 * j]);
-                        const float up = (o.glu_halves ? r[I + j] : r[2 * j + 1]) + bf16_to_f32(gb[o.glu_halves ? I + j : 2 * j + 1]);
-                        ACT[(size_t) i * I + j] = swiglu(gt, up, c.swiglu_limit, c.swiglu_alpha);
-                    }
-                }
-                EB.assign((size_t) N * H, 0.0f);
-                ok = false;
-                if (sl && gpu_on) { std::lock_guard<std::mutex> g(gmu); ok = gpu::matmat_mx(sl->dn_b, sl->dn_s, H, I, ACT.data(), N, EB.data()); if (!ok) gpu_fail(gpu::last_error()); }
-                if (!ok) {
-                    MxView dn = y.dn; dn.blocks += (size_t) e * H * (I / 32) * 16; dn.scales += (size_t) e * H * (I / 32);
-                    for (int i = 0; i < N; ++i) matvec_mx(dn, &ACT[(size_t) i * I], &EB[(size_t) i * H]);
-                }
-                const uint16_t* db = y.dn_bias + (size_t) e * H;
-                for (int i = 0; i < N; ++i) {                                      // a token has an expert at most once: no overlap on Y[t]
-                    const int t = lst[(size_t) i] / K;
-                    const float wt = WT[(size_t) lst[(size_t) i]];
-                    for (int j = 0; j < H; ++j) Y[(size_t) t * H + j] += wt * (EB[(size_t) i * H + j] + bf16_to_f32(db[j]));
-                }
-            }
+            moe_prefill_layer(l, T, Hn.data(), IDX.data(), WT.data(), Y.data());
             for (size_t i = 0; i < X.size(); ++i) X[i] += Y[i];
         }
         if ((int) cached.size() > p0) cached.resize((size_t) p0);
@@ -941,6 +1170,7 @@ void Model::forward(int token, int pos, std::vector<float>* logits_out) {
     std::vector<float> x((size_t) H), acc((size_t) H);
     for (int i = 0; i < H; ++i) x[(size_t) i] = bf16_to_f32(((const uint16_t*) s.embed.p)[(size_t) token * H + i]);
     Work& w = s.works[0];
+    if (s.dev_kv_pos > pos) s.dev_kv_pos = pos;            // decode writes the host KV only: the device copy is valid up to here
     for (int l = 0; l < c.layers; ++l) {
         Layer& L = s.L[(size_t) l];
         s.attn_in(L, w, x.data(), pos);
@@ -1095,6 +1325,7 @@ bool Model::load_kv(const std::string& path, std::string& err) {
     std::fclose(f);
     if (!ok) { s.cached.clear(); err = "truncated checkpoint"; return false; }
     s.cached = std::move(toks);
+    s.dev_kv_pos = 0;                                  // the host KV was replaced: the device copy is re-uploaded at the next prefill
     return true;
 }
 
