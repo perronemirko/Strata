@@ -113,6 +113,28 @@ int main(int argc, char** argv) {
         std::printf("%s device(emulated) slots=%-2d decode max|diff| = %.3g, full prefill last-token = %.3g\n", (w < 1e-3 && w2 < 1e-3) ? "ok  " : "FAIL", slots, w, w2);
         CHECK(w < 1e-3); CHECK(w2 < 1e-3);
     }
+    // Attention + KV resident on the (emulated) device: prefill in chunks -> host KV mirrored -> decode on it -> a prefill that starts after the decoded positions,
+    // so the device KV must be re-synced from the host. Full cache and wrapping ring.
+    for (int rollback : {8192, 6}) for (int chunk : {3, 5}) {
+        Model m; RunOpts o; o.ctx = 64; o.verbose = false; o.cuda = true; o.vram_total_mib = 512; o.vram_pct = 90; o.vram_reserve_mib = 0;
+        o.prefill_chunk = chunk; o.kv_rollback = rollback; std::string err;
+        if (!m.load(dir, o, err)) { std::fprintf(stderr, "device load: %s\n", err.c_str()); return 2; }
+        CHECK(m.gpu_attention());
+        std::vector<float> lg; m.prefill(ids.data(), 16, 0, nullptr);
+        double w = 0;
+        for (size_t t = 16; t < ids.size(); ++t) {
+            m.forward(ids[t], (int) t, &lg);
+            for (int j = 0; j < V; ++j) w = std::max(w, (double) std::fabs(ref[t * V + (size_t) j] - lg[(size_t) j]));
+        }
+        std::vector<float> lg2; m.prefill(ids.data() + ids.size() - 1, 1, (int) ids.size() - 1, &lg2);
+        const double w2 = worst_last(lg2);
+        Model m2; if (!m2.load(dir, o, err)) return 2;
+        std::vector<float> lg3; m2.prefill(ids.data(), (int) ids.size(), 0, &lg3);
+        const double w3 = worst_last(lg3);
+        const bool ok = w < 1e-3 && w2 < 1e-3 && w3 < 1e-3;
+        std::printf("%s device attention+KV chunk=%d rollback=%-4d: decode %.3g, re-prefill after decode %.3g, full prefill %.3g\n", ok ? "ok  " : "FAIL", chunk, rollback, w, w2, w3);
+        CHECK(ok);
+    }
     { SampleOpts so; Sampler sm(so); std::vector<float> l = {0.1f, 2.0f, -1.0f}; CHECK(sm.sample(l.data(), 3, {}) == 1); }
     std::printf(g_fail ? "FAILED (%d)\n" : "all ok\n", g_fail);
     return g_fail ? 1 : 0;

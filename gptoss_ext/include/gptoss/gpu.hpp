@@ -62,6 +62,33 @@ bool h2d_copy_async(void* dev, const void* host, size_t n);   // on the copy str
 bool event_record_copy(int ev);              // records `ev` after every copy issued so far on the copy stream
 bool host_register(const void* p, size_t n); // page-locks a host range (read-only) so copies from it are true DMA; pages inside only
 
+// ---- device-resident activations (batched prefill with ATTENTION on the device). Every pointer here is a DEVICE pointer (gpu::alloc) unless named h*.
+// The calls are ordered on the compute stream; d2h waits. A failure sets last_error() and returns false.
+bool d2h(void* host, const void* dev, size_t n);                                       // synchronous
+/// Same as matmat_bf16 but x and y are already on the device: dy[n][rows] = W dx[n][cols].
+bool dmm_bf16(const void* dW, int rows, int cols, const float* dx, int N, float* dy);
+/// dy[n] = dg * (dx[n] * 1/sqrt(mean(dx[n]^2) + eps)), dg == nullptr -> gain 1 (the host rmsnorm).
+bool rms_rows(const float* dx, const float* dg, float eps, int N, int H, float* dy);
+/// dX[n][i] += (dA ? dA[n][i] : 0) + (dbias ? dbias[i] : 0)
+bool add_rows(float* dX, const float* dA, const float* dbias, int N, int H);
+struct AttnShape {
+    int heads = 0, kv_heads = 0, D = 0;      // D % 32 == 0, D <= 128
+    int window = 0;                          // banded layers: keys visible = window, current token included (sliding == true)
+    bool sliding = false;
+    int cap = 0;                             // positions held by the K/V cache of the layer: slot(pos) = sliding ? pos % cap : pos
+    bool rope_pairs = false;
+};
+/// Tokens p0 .. p0+N-1. dq [N][heads*D] and dk [N][kv_heads*D] are the raw projections: adds the biases, applies RoPE (cos/sin tables [pos][D/2] on the device,
+/// indexed by ABSOLUTE position) IN PLACE, and writes the rotated K and the biased V of every token into the layer's device cache (dKc, dVc: [cap][kv_heads*D]).
+bool qk_rope_kv(float* dq, float* dk, const float* dv, const float* dbq, const float* dbk, const float* dbv, const float* dcos, const float* dsin,
+                int N, int p0, const AttnShape& a, float* dKc, float* dVc);
+/// Attention of the N tokens over the device cache, sink in the softmax denominator only: dout [N][heads*D].
+bool attn_rows(const float* dq, const float* dKc, const float* dVc, const float* dsinks, int N, int p0, const AttnShape& a, float* dout);
+/// Can THIS backend run the attention kernels for this shape? The emulated device runs the host math and accepts any shape (it is the executable
+/// spec the tests run against); the CUDA kernel owns one dimension per lane, so it needs D % 32 == 0 and D <= 128. The Model asks before
+/// reserving anything, so an unsupported shape turns the path off with a printed reason instead of failing mid-prefill.
+bool attn_supported(const AttnShape& a);
+
 std::string last_error();
 bool last_oom();                       // true if the last failure was an allocation that did not fit (not a poisoned context: the host can shrink and retry)
 
