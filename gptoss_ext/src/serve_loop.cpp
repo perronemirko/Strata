@@ -310,7 +310,9 @@ namespace gptoss
             int pos = keep;
             bool stopped = false;
             // Prefill in batched chunks: one PP line per chunk (server.py's silence watchdog needs a line often enough).
-            const int chunk = std::max(1, o.prefill_chunk);
+            // 0 = auto, same rule as Model::load: this only sets how often a PP line is printed - Model::prefill clamps
+            // the real chunk to the ring and to what the device scratch fits.
+            const int chunk = o.prefill_chunk > 0 ? o.prefill_chunk : (o.cuda ? 8192 : 512);
             while (pos < (int)ids.size())
             {
                 const int n = std::min(chunk, (int)ids.size() - pos);
