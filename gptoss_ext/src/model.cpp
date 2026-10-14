@@ -88,7 +88,7 @@ struct Model::Impl {
     void plan_vram() const;
     bool gpu_setup(std::string& err);
     void gpu_fail(const std::string& what);
-    void pdev_fail_(const char* why);                    // the device-resident prefill turns itself off: the device stays on, the old prefill continues
+    void pdev_fail_(const std::string& why);             // the device-resident prefill turns itself off: the device stays on, the old prefill continues
     bool upload_expert(Slot& sl, int li, int e);
     void count_use(int li, const int32_t* idx);
     Slot* resident(int layer, int e);                  // expert -> slot (upload on miss = PCIe, LRU eviction); nullptr when there is no pool or the expert runs on the host
@@ -505,12 +505,15 @@ bool Model::Impl::upload_expert(Slot& sl, int li, int e) {
            gpu::h2d(sl.dn_bias, y.dn_bias + (size_t) e * H, H * 2);
 }
 
-// The device-resident prefill found a reason not to run this chunk on the card (its card KV window is smaller than
-// the dense history, or a slot cannot take an expert). That is NOT a CUDA call that failed: gpu::last_error() is
-// empty and gpu_on must stay true - the old prefill path does the rest of the chunk with the device.
-void Model::Impl::pdev_fail_(const char* why) {
+// The device-resident prefill found a reason not to run this chunk on the card. That is NOT a CUDA call that
+// failed: gpu::last_error() is empty and gpu_on must stay true - the old prefill path does the rest of the chunk
+// with the device. pdev::last_error() says which call refused and why (a CUDA error, or a policy refusal such as
+// a history longer than the mirrored KV window); it is printed here because it is the only copy.
+void Model::Impl::pdev_fail_(const std::string& why) {
     pdev_on = false;
-    std::fprintf(stderr, "gptoss: device-resident prefill off (%s): the old prefill continues on the device\n", why);
+    const std::string perr = pdev::last_error();
+    std::fprintf(stderr, "gptoss: device-resident prefill off (%s): %s: the old prefill continues on the device\n",
+                 why.c_str(), perr.empty() ? "no CUDA call failed" : perr.c_str());
 }
 
 void Model::Impl::count_use(int li, const int32_t* idx) {
@@ -845,7 +848,7 @@ int Model::Impl::prefill_pdev(const int* tokens, int n, int start_pos, std::vect
             Layer& y = L[(size_t) l];
             pdev::kv_prefetch(l, y.K.data(), y.V.data(), y.cap, y.sliding, p0);
             pdev::LayerIO w{y.dq, y.dk, y.dv, y.dobj, y.drt};
-            if (!pdev::run_layer(pdev_cfg(), l, w, T, p0, y.sliding, Gl.data())) { pdev_fail_("layer"); return c0; }
+            if (!pdev::run_layer(pdev_cfg(), l, w, T, p0, y.sliding, Gl.data())) { pdev_fail_("layer " + std::to_string(l) + " at position " + std::to_string(p0)); return c0; }
 #pragma omp parallel for schedule(static)
             for (int t = 0; t < T; ++t) {
                 float* g = &Gl[(size_t) t * E];
