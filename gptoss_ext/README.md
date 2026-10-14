@@ -29,5 +29,6 @@ Il motore lavora su id di token (Harmony e tokenizer o200k_harmony stanno fuori)
 | Modello vero (qualsiasi cosa) | **NON RUN** | 60,8 GiB, nessuna rete verso HF nel sandbox |
 | Incognite 1-4, 6-8 della tabella "Non noto" | **APERTE** | servono i logit di riferimento |
 | 32k token/s di prefill | **NON raggiunto** | ~0,33 PFLOP/s necessari |
+| Prefill resident on the card (`prefill_dev`, `--prefill-dev-pct P`): one launch per layer of MoE, the chunk never crosses PCIe | **code written, compiled (nvcc sm_89), NEVER executed** | the Qwen engine holds the card |
 | CUDA (`src/gpu_cuda.cu`, pool di expert in VRAM con LRU, matmat BF16/MXFP4, prefill a batch su device) | **codice scritto, MAI compilato ne' eseguito** | il percorso e' provato solo sul device emulato (test `device(emulated)`, scritti ma non lanciati dopo l'ultima modifica) |
 | GPU, memoria a livelli, GEMM di prefill | NON FATTI | |
