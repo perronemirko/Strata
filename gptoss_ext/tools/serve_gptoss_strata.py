@@ -72,7 +72,9 @@ def convert_tokenizer(model_dir: Path, out: Path, bos: int, eos: int, pad: int) 
     out.mkdir(parents=True, exist_ok=True)
     ordered = dict(sorted(vocab.items(), key=lambda kv: kv[1]))
     (out / "vocab.json").write_text(json.dumps(ordered, ensure_ascii=False), encoding="utf-8")
-    (out / "merges.txt").write_text("\n".join(merges) + "\n", encoding="utf-8")
+    # No trailing newline: the reader does read_text().split("\n"), so a final "\n" would add an empty merge
+    # ("merge N is not a pair: ''"). Same format as the proven writer in tools/strata_tokenizer.py.
+    (out / "merges.txt").write_text("\n".join(merges), encoding="utf-8")
     (out / "token_type.json").write_text(json.dumps(ttype), encoding="utf-8")
     cfg = {"model": "gpt2", "pre": "o200k_harmony", "vocab_size": n, "n_merges": len(merges),
            "special_ids": {"tokenizer.ggml.bos_token_id": bos, "tokenizer.ggml.eos_token_id": eos, "tokenizer.ggml.padding_token_id": pad},
@@ -99,12 +101,14 @@ def main() -> int:
     ap.add_argument("--kv-checkpoint", default=None, help="KV checkpoint file, rewritten after every request, restored at start")
     ap.add_argument("--vram-pct", type=float, default=None, help="VRAM plan only (no CUDA backend yet)")
     ap.add_argument("--vram-total-mib", type=int, default=None)
+    ap.add_argument("--vram-reserve-mib", type=int, default=None, help="MiB kept out of the VRAM budget (the engine's default is 1024)")
     ap.add_argument("--cuda", action="store_true", help="run on the GPU (needs --exe build-out/gptoss_run_cuda from `sh build.sh --cuda`)")
     ap.add_argument("--cuda-device", type=int, default=None)
     ap.add_argument("--gpu-slots", type=int, default=None, help="cap on expert slots in VRAM")
     ap.add_argument("--expert-profile", default=None, help="expert-usage profile: pins the hottest experts in VRAM, rewritten after every request")
     ap.add_argument("--pin-pct", type=float, default=None, help="%% of the slots reserved for pinned experts (default 80)")
     ap.add_argument("--kv-rollback", type=int, default=None)
+    ap.add_argument("--prefill-dev-pct", type=float, default=None, help="percent of the VRAM left for the device-resident prefill (its KV windows + chunk scratch); 0 = the old prefill")
     ap.add_argument("--eos-ids", default="200002,200012", help="stop ids: <|return|>=200002 (config) and <|call|>=200012 (NOT verified)")
     ap.add_argument("--glu-halves", action="store_true")
     ap.add_argument("--rope-pairs", action="store_true")
@@ -141,7 +145,8 @@ def main() -> int:
 
     args = ["--model", str(model), "--ctx", str(a.ctx), "--kv-unified"]
     for flag, val in (("--threads", a.threads), ("--prefill-chunk", a.prefill_chunk), ("--vram-pct", a.vram_pct),
-                      ("--vram-total-mib", a.vram_total_mib), ("--kv-rollback", a.kv_rollback), ("--cuda-device", a.cuda_device), ("--gpu-slots", a.gpu_slots), ("--pin-pct", a.pin_pct), ("--eos-ids", a.eos_ids)):
+                      ("--vram-total-mib", a.vram_total_mib), ("--vram-reserve-mib", a.vram_reserve_mib), ("--kv-rollback", a.kv_rollback), ("--cuda-device", a.cuda_device), ("--gpu-slots", a.gpu_slots), ("--pin-pct", a.pin_pct),
+                      ("--prefill-dev-pct", a.prefill_dev_pct), ("--eos-ids", a.eos_ids)):
         if val is not None:
             args += [flag, str(val)]
     if a.expert_profile:
