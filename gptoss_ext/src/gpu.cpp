@@ -27,6 +27,7 @@ int g_events = 0;
 
 bool is_emulated() { return true; }
 bool init(int, std::string&) { return true; }
+void bind_thread() {}
 const char* device_name() { return "CPU-emulated device"; }
 void mem_info(size_t* f, size_t* t) { *t = (size_t) 16 << 30; *f = *t; }
 void* alloc(size_t n) { return std::malloc(n ? n : 1); }

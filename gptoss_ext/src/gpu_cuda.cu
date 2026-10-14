@@ -34,6 +34,7 @@ bool g_oom = false;                   // last ck() failure was cudaErrorMemoryAl
 std::mutex g_err_mu, g_copy_mu;
 cudaStream_t g_comp = nullptr, g_copy = nullptr;
 int g_cc = 0;                           // compute capability, major*10 + minor
+int g_dev = 0;                          // device chosen by init(); bind_thread() re-selects it in other host threads (CUDA binds the device per thread)
 bool g_graphs = true;
 __constant__ float c_fp4[16];
 
@@ -529,6 +530,7 @@ bool init(int device, std::string& err) {
     int n = 0;
     if (!ck(cudaGetDeviceCount(&n), "cudaGetDeviceCount") || n == 0) { err = last_error().empty() ? "no CUDA device" : last_error(); return false; }
     if (!ck(cudaSetDevice(device), "cudaSetDevice")) { err = last_error(); return false; }
+    g_dev = device;
     int maj = 0, min = 0;
     cudaDeviceGetAttribute(&maj, cudaDevAttrComputeCapabilityMajor, device);
     cudaDeviceGetAttribute(&min, cudaDevAttrComputeCapabilityMinor, device);
@@ -538,6 +540,8 @@ bool init(int device, std::string& err) {
         !ck(cudaStreamCreateWithFlags(&g_copy, cudaStreamNonBlocking), "copy stream")) { err = last_error(); return false; }
     return true;
 }
+
+void bind_thread() { cudaSetDevice(g_dev); }
 
 const char* device_name() {
     static cudaDeviceProp p;

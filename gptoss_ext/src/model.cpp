@@ -8,7 +8,10 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <atomic>
+#include <chrono>
 #include <mutex>
+#include <thread>
 #include <unordered_map>
 #include <sys/stat.h>
 #ifdef _OPENMP
@@ -83,6 +86,13 @@ struct Model::Impl {
     bool attn_dev = false;
     float *d_cos = nullptr, *d_sin = nullptr;          // RoPE tables [ctx][D/2]
     float *a_X = nullptr, *a_Hn = nullptr, *a_Q = nullptr, *a_K = nullptr, *a_V = nullptr, *a_Att = nullptr, *a_Ob = nullptr, *a_Gl = nullptr, *a_Y = nullptr;
+    // --- background preload of the expert slots
+    struct PreTarget { int slot, layer, exp; };
+    std::vector<PreTarget> pre_targets;
+    std::thread pre_th;
+    std::atomic<bool> pre_stop{false};
+    std::atomic<size_t> pre_done{0};
+    std::atomic<int> pre_state{0};                     // 0 off, 1 running, 2 done, 3 stopped on an error
     int dev_kv_pos = 0;                                // positions [0, dev_kv_pos) of the device KV are known to equal the host KV (decode writes the host only)
 
     void init_work(Work& w) const;
@@ -118,12 +128,18 @@ struct Model::Impl {
     bool kv_sync_to_dev(int upto);
     bool setup_attn_dev(double& budget);
     void release_attn();
+    void preload_plan();
+    void preload_run();
+    void preload_start();
+    void preload_join();
+    void preload_wait();
 };
 
 Model::Model() : p_(new Impl) {}
 Model::~Model() {
     if (!p_) return;
     Impl& s = *p_;
+    s.preload_join();                                  // before any slot is released: a copy may still be in flight
     if (s.hits + s.host_served + s.pcie_served) std::fprintf(stderr, "gptoss: expert slots (%zu): %llu hits, %llu over PCIe, %llu on the host\n", s.pool.size(),
                    (unsigned long long) s.hits, (unsigned long long) s.pcie_served, (unsigned long long) s.host_served);
     pdev::shutdown();                                // its buffers are separate allocations; free them before the process exits
@@ -135,6 +151,7 @@ Model::~Model() {
 const GptConfig& Model::config() const { return p_->c; }
 uint64_t Model::weight_bytes() const { return p_->st.total_bytes(); }
 void Model::reset() { p_->cached.clear(); p_->dev_kv_pos = 0; }
+void Model::preload_wait() { p_->preload_wait(); }
 bool Model::gpu_attention() const { return p_->attn_dev && p_->gpu_on; }
 int Model::cached_len() const { return (int) p_->cached.size(); }
 
@@ -524,7 +541,7 @@ bool Model::Impl::gpu_setup(std::string& err) {
         sl.gu_bias = (uint16_t*) (p + o5); sl.dn_bias = (uint16_t*) (p + o6);
         pool.push_back(sl);
     }
-    if (!pool.empty() && o.pin_pct > 0) {              // pin the hottest experts of the profile, globally ranked
+    if (!pool.empty() && o.pin_pct > 0 && !o.preload) {   // (--no-preload) pin the hottest experts of the profile, globally ranked, synchronously
         std::vector<std::pair<uint64_t, int>> rank;
         for (size_t i = 0; i < usage.size(); ++i) if (usage[i] > 0) rank.push_back({usage[i], (int) i});
         std::sort(rank.begin(), rank.end(), [](const std::pair<uint64_t, int>& a, const std::pair<uint64_t, int>& b) { return a.first != b.first ? a.first > b.first : a.second < b.second; });
@@ -547,6 +564,12 @@ bool Model::Impl::gpu_setup(std::string& err) {
     std::fprintf(stderr, "gptoss: CUDA device '%s' (%s): dense weights %.2f GiB on device%s, %zu expert slots of %.2f MiB (%.0f%% of the %d experts)\n",
                  gpu::device_name(), gpu::is_emulated() ? "EMULATED" : "real", dense_used / 1073741824.0, d_head ? "" : " (lm_head stays on the host: no room)",
                  pool.size(), (double) slot_bytes / 1048576.0, 100.0 * (double) pool.size() / ((double) c.layers * c.n_exp), c.layers * c.n_exp);
+    preload_start();
+    if (o.preload_wait) {
+        const auto t0 = std::chrono::steady_clock::now();
+        preload_wait();
+        std::fprintf(stderr, "gptoss: preload finished: %zu experts in %.1f s\n", pre_done.load(), std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+    }
     return true;
 }
 
@@ -644,6 +667,94 @@ bool Model::Impl::kv_sync_to_dev(int upto) {
     return true;
 }
 
+// ---- background preload of the expert slots (startup). The copy side of the device API is thread-safe and runs on its own stream, so a thread fills the slots
+// while the rest of the startup (and the first requests) go on. Order: the pinned experts of the profile, then the rest of the profile hottest first, then
+// layer order. A slot under load is `busy` (neither victim nor free for resident()) and unpublished (not in `where`); the thread publishes it under gmu only after
+// the copy is COMPLETE (event_sync), so the compute side never sees half a weight. A request that wants an expert not published yet just takes the normal miss path.
+void Model::Impl::preload_plan() {
+    const size_t NE = (size_t) c.n_exp, total_keys = (size_t) c.layers * NE;
+    std::vector<std::pair<uint64_t, int>> rank;
+    for (size_t i = 0; i < usage.size(); ++i) if (usage[i] > 0) rank.push_back({usage[i], (int) i});
+    std::sort(rank.begin(), rank.end(), [](const std::pair<uint64_t, int>& a, const std::pair<uint64_t, int>& b) { return a.first != b.first ? a.first > b.first : a.second < b.second; });
+    const size_t npin = o.pin_pct > 0 ? std::min(rank.size(), (size_t) ((double) pool.size() * std::min(o.pin_pct, 100.0) / 100.0)) : 0;
+    std::vector<char> taken(total_keys, 0);
+    pre_targets.clear();
+    auto add = [&](size_t key, bool pin) {
+        if (pre_targets.size() >= pool.size() || taken[key]) return;
+        Slot& sl = pool[pre_targets.size()];
+        sl.busy = true; sl.pinned = pin; sl.layer = -1;
+        pre_targets.push_back({(int) pre_targets.size(), (int) (key / NE), (int) (key % NE)});
+        taken[key] = 1;
+    };
+    for (size_t i = 0; i < npin; ++i) add((size_t) rank[i].second, true);
+    for (size_t i = npin; i < rank.size(); ++i) add((size_t) rank[i].second, false);
+    for (size_t k = 0; k < total_keys; ++k) add(k, false);
+    uint64_t tot = 0, cov = 0;
+    for (auto v : usage) tot += v;
+    for (size_t i = 0; i < npin; ++i) cov += rank[i].first;
+    std::fprintf(stderr, "gptoss: preloading %zu experts in the background (%zu pinned = %.1f%% of the routed activations in the profile)\n", pre_targets.size(), npin,
+                 tot ? 100.0 * (double) cov / (double) tot : 0.0);
+}
+
+void Model::Impl::preload_run() {
+    gpu::bind_thread();
+    const size_t H = (size_t) c.hidden, I = (size_t) c.moe_ff, G1 = H / 32, G2 = I / 32;
+    const int ev = gpu::event_create();
+    size_t next = 0;                                   // targets [0, next) are published or released
+    bool failed = ev < 0;
+    constexpr size_t B = 4;                            // experts per event wait
+    while (!failed && next < pre_targets.size() && !pre_stop.load()) {
+        const size_t n = std::min(B, pre_targets.size() - next);
+        bool ok = true;
+        for (size_t j = 0; j < n && ok; ++j) {
+            const PreTarget& t = pre_targets[next + j];
+            Slot& sl = pool[(size_t) t.slot];
+            const Layer& y = L[(size_t) t.layer];
+            const size_t e = (size_t) t.exp;
+            // The slot carries the BF16 bias rows too (this branch's layout): a preloaded expert must get them,
+            // or the device kernels would add whatever was in the slot before. Same ranges as upload_expert.
+            ok = gpu::h2d_copy_async(sl.gu_b, y.gu.blocks + e * 2 * I * G1 * 16, 2 * I * G1 * 16) && gpu::h2d_copy_async(sl.gu_s, y.gu.scales + e * 2 * I * G1, 2 * I * G1) &&
+                 gpu::h2d_copy_async(sl.dn_b, y.dn.blocks + e * H * G2 * 16, H * G2 * 16) && gpu::h2d_copy_async(sl.dn_s, y.dn.scales + e * H * G2, H * G2) &&
+                 gpu::h2d_copy_async(sl.gu_bias, y.gu_bias + e * 2 * I, (size_t) 2 * I * 2) && gpu::h2d_copy_async(sl.dn_bias, y.dn_bias + e * H, (size_t) H * 2);
+        }
+        ok = ok && gpu::event_record_copy(ev) && gpu::event_sync(ev);     // always waited for, even on failure paths below: no DMA may outlive its slot
+        std::lock_guard<std::mutex> g(gmu);
+        for (size_t j = 0; j < n; ++j) {
+            const PreTarget& t = pre_targets[next + j];
+            Slot& sl = pool[(size_t) t.slot];
+            const long long key = (long long) t.layer * c.n_exp + t.exp;
+            if (ok && where.find(key) == where.end()) { sl.layer = t.layer; sl.exp = t.exp; sl.tick = 0; where[key] = t.slot; }
+            else sl.pinned = false;                    // failed, or a miss loaded it first: the slot is an ordinary free one
+            sl.busy = false;
+        }
+        next += n;
+        pre_done.store(next);
+        if (!ok) failed = true;
+    }
+    {
+        std::lock_guard<std::mutex> g(gmu);
+        for (size_t k = next; k < pre_targets.size(); ++k) { Slot& sl = pool[(size_t) pre_targets[k].slot]; sl.busy = false; sl.pinned = false; }   // stopped / failed: free the rest
+    }
+    if (failed) std::fprintf(stderr, "gptoss: expert preload stopped after %zu experts (%s): the slots fill on demand\n", next, gpu::last_error().c_str());
+    pre_state.store(failed ? 3 : 2);
+}
+
+void Model::Impl::preload_start() {
+    if (pool.empty() || !o.preload) return;
+    preload_plan();
+    pre_state.store(1);
+    pre_th = std::thread([this] { preload_run(); });
+}
+
+void Model::Impl::preload_join() {
+    pre_stop.store(true);
+    if (pre_th.joinable()) pre_th.join();
+}
+
+void Model::Impl::preload_wait() {
+    while (pre_state.load() == 1) std::this_thread::sleep_for(std::chrono::milliseconds(5));
+}
+
 void Model::Impl::count_use(int li, const int32_t* idx) {
     for (int k = 0; k < c.topk; ++k) __atomic_fetch_add(&usage[(size_t) li * (size_t) c.n_exp + (size_t) idx[k]], (uint64_t) 1, __ATOMIC_RELAXED);
 }
@@ -673,7 +784,7 @@ Slot* Model::Impl::resident(int li, int e) {
     }
     // A miss: the bytes go to the card over PCIe if a slot can take them; otherwise this expert runs on the host.
     int v = -1;
-    for (size_t i = 0; i < pool.size() && v < 0; ++i) if (pool[i].layer < 0) v = (int) i;
+    for (size_t i = 0; i < pool.size() && v < 0; ++i) if (pool[i].layer < 0 && !pool[i].busy) v = (int) i;   // a slot being filled by the preload thread is not free
     if (v < 0) v = o.expert_lru_layered ? victim_slot(li) : -1;   // --expert-lru-layered: evict inside this layer first
     if (v < 0) {                                       // LRU
         uint64_t best = ~(uint64_t) 0;
@@ -1409,7 +1520,13 @@ std::string Model::stats() const {
                       (unsigned long long) s.host_served, (unsigned long long) s.oom_fallbacks,
                       (unsigned long long) s.promotions);
     }
-    return b;
+    std::string r = b;
+    if (s.pre_state.load() != 0) {
+        const char* st[] = {"off", "running", "done", "stopped on an error"};
+        std::snprintf(b, sizeof b, ", preload %zu/%zu (%s)", s.pre_done.load(), s.pre_targets.size(), st[s.pre_state.load()]);
+        r += b;
+    }
+    return r;
 }
 
 }  // namespace gptoss
