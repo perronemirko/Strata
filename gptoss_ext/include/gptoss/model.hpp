@@ -12,7 +12,7 @@ namespace gptoss {
 struct RunOpts {
     int ctx = 8192;                    // positions of the dense layers' KV cache (the model supports 131072; fp32 KV = 4 KiB/layer/token)
     int threads = 0;                   // 0 = every core
-    int prefill_chunk = 512;           // tokens per batched prefill step; clamped so a banded layer's ring is never overwritten mid-chunk
+    int prefill_chunk = 0;             // tokens per batched prefill step (0 = auto: 8192 with --cuda, 512 on the CPU); clamped so a banded layer's ring is never overwritten mid-chunk, and on a device to what its scratch allows
     int kv_rollback = 8192;            // extra positions kept by every banded layer's ring: how far a new prompt may rewind into the cache
     std::string kv_checkpoint;         // loaded at start if present, rewritten after EVERY request ("" = off)
     // --- facts the model card / config.json do not settle (docs/gptoss_porting.md, "Non noto"). Defaults = best reading.
@@ -27,6 +27,7 @@ struct RunOpts {
     std::string expert_profile_save;   // where the profile is written (default: the --expert-profile path)
     double expert_profile_save_every = 0;   // seconds between periodic saves while generating (0 = only after each request and at exit)
     double pin_pct = 80;               // % of the expert slots reserved for the most-used experts of the profile (the rest is LRU for the others)
+    bool gpu_attn = true;              // device prefill keeps the activations and the KV cache in VRAM and runs attention there (needs every dense matmul on the device and the KV to fit); --no-gpu-attn turns it off
     int gpu_slots = -1;                // cap on the expert slots in VRAM (-1 = as many as the budget allows)
     // --- expert cache: three opt-in knobs that only move WHICH experts hold the slots, never how many slots there are.
     //     0 / false keeps the previous release's behaviour byte-for-byte.
@@ -63,6 +64,7 @@ public:
     bool save_profile(const std::string& path, std::string& err);   // with --profile-decay it also ages the in-memory counts it just wrote
     bool load_profile(const std::string& path, std::string& err);
     void decay_profile();             // call after every profile save: with --profile-decay 0 it does nothing
+    bool gpu_attention() const;         // true when the batched prefill runs attention + KV on the device
     std::string stats() const;          // slots / pinned / hits / misses / PCIe ("" without a device pool)
     /// Per-request decode counters, same fields as Strata's DONE line (hits, lookups, offloaded over PCIe).
     /// Call begin_request_stats() before the request; request_stats() after it returns the request's own counts.

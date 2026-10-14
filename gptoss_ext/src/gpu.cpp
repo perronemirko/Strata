@@ -3,6 +3,8 @@
 #include "gptoss/ops.hpp"
 #include "gptoss/weights.hpp"
 
+#include <algorithm>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <vector>
@@ -76,6 +78,67 @@ bool expert_collect(int ci, float* hy) {
     if (ci < 0 || ci > kExpertCtxBatch) return false;
     const EmuCtx& c = g_emu[ci];
     std::memcpy(hy, c.y.data(), c.y.size() * sizeof(float));
+    return true;
+}
+
+// Device-resident activations: the emulated device runs the SAME math as the host path (ops.cpp / Model::attn_heads),
+// so it is the executable specification of the CUDA kernels in gpu_cuda.cu and the tests compare against the CPU path.
+bool d2h(void* h, const void* d, size_t n) { std::memcpy(h, d, n); return true; }
+bool dmm_bf16(const void* dW, int rows, int cols, const float* dx, int N, float* dy) { return matmat_bf16(dW, rows, cols, dx, N, dy); }
+bool rms_rows(const float* dx, const float* dg, float eps, int N, int H, float* dy) {
+    for (int n = 0; n < N; ++n) gptoss::rmsnorm(dx + (size_t) n * H, dg, eps, H, dy + (size_t) n * H);
+    return true;
+}
+bool add_rows(float* dX, const float* dA, const float* db, int N, int H) {
+    for (int n = 0; n < N; ++n) for (int i = 0; i < H; ++i) dX[(size_t) n * H + i] += (dA ? dA[(size_t) n * H + i] : 0.0f) + (db ? db[i] : 0.0f);
+    return true;
+}
+bool qk_rope_kv(float* dq, float* dk, const float* dv, const float* bq, const float* bk, const float* bv, const float* cs, const float* sn,
+                int N, int p0, const AttnShape& a, float* Kc, float* Vc) {
+    const int D = a.D, half = D / 2, QD = a.heads * D, KD = a.kv_heads * D;
+    for (int t = 0; t < N; ++t) {
+        const int pos = p0 + t;
+        const size_t slot = a.sliding ? (size_t) pos % (size_t) a.cap : (size_t) pos;
+        float* q = dq + (size_t) t * QD; float* k = dk + (size_t) t * KD;
+        for (int i = 0; i < QD; ++i) q[i] += bq[i];
+        for (int i = 0; i < KD; ++i) k[i] += bk[i];
+        for (int h = 0; h < a.heads; ++h) rotary(q + (size_t) h * D, D, cs + (size_t) pos * half, sn + (size_t) pos * half, a.rope_pairs);
+        for (int h = 0; h < a.kv_heads; ++h) rotary(k + (size_t) h * D, D, cs + (size_t) pos * half, sn + (size_t) pos * half, a.rope_pairs);
+        std::memcpy(Kc + slot * KD, k, sizeof(float) * (size_t) KD);
+        for (int i = 0; i < KD; ++i) Vc[slot * KD + (size_t) i] = dv[(size_t) t * KD + i] + bv[i];
+    }
+    return true;
+}
+bool attn_supported(const AttnShape&) { return true; }   // the emulated device runs the host math: any shape is the spec
+bool attn_rows(const float* dq, const float* Kc, const float* Vc, const float* sinks, int N, int p0, const AttnShape& a, float* out) {
+    const int D = a.D, QD = a.heads * D, KD = a.kv_heads * D, rep = a.heads / a.kv_heads;
+    const float scale = 1.0f / std::sqrt((float) D);
+    std::vector<float> sc;
+    for (int t = 0; t < N; ++t) {
+        const int pos = p0 + t, lo = a.sliding ? std::max(0, pos - a.window + 1) : 0;
+        sc.assign((size_t) (pos - lo + 1), 0.0f);
+        for (int hd = 0; hd < a.heads; ++hd) {
+            const float* q = dq + (size_t) t * QD + (size_t) hd * D;
+            const int g = hd / rep;
+            float mx = sinks[hd];
+            for (int u = lo; u <= pos; ++u) {
+                const size_t slot = a.sliding ? (size_t) u % (size_t) a.cap : (size_t) u;
+                const float* k = Kc + slot * KD + (size_t) g * D;
+                float s = 0; for (int j = 0; j < D; ++j) s += q[j] * k[j];
+                sc[(size_t) (u - lo)] = s * scale; mx = std::max(mx, sc[(size_t) (u - lo)]);
+            }
+            double z = std::exp((double) sinks[hd] - mx);
+            for (int u = lo; u <= pos; ++u) { sc[(size_t) (u - lo)] = std::exp(sc[(size_t) (u - lo)] - mx); z += sc[(size_t) (u - lo)]; }
+            float* o = out + (size_t) t * QD + (size_t) hd * D;
+            for (int j = 0; j < D; ++j) o[j] = 0;
+            for (int u = lo; u <= pos; ++u) {
+                const size_t slot = a.sliding ? (size_t) u % (size_t) a.cap : (size_t) u;
+                const float p = (float) (sc[(size_t) (u - lo)] / z);
+                const float* v = Vc + slot * KD + (size_t) g * D;
+                for (int j = 0; j < D; ++j) o[j] += p * v[j];
+            }
+        }
+    }
     return true;
 }
 

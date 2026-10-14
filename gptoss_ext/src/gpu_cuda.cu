@@ -317,6 +317,109 @@ bool run_matmat(bool mx, const void* W, const void* S, int rows, int cols, const
     return true;
 }
 
+// ---------------------------------------------------------------- device-resident activations (batched prefill, attention on the device)
+// Plain, correctness-first kernels; the numbers follow src/ops.cpp and Model::attn_heads (the emulated device in gpu.cpp is the executable spec).
+__global__ void k_rms(const float* __restrict__ x, const float* __restrict__ g, float eps, int H, float* __restrict__ y) {   // one block per row
+    const float* xr = x + (size_t) blockIdx.x * H;
+    float ss = 0.0f;
+    for (int i = threadIdx.x; i < H; i += blockDim.x) ss += xr[i] * xr[i];
+    __shared__ float red[32];
+    __shared__ float tot;
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) ss += __shfl_xor_sync(0xffffffffu, ss, o);
+    if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = ss;
+    __syncthreads();
+    if (threadIdx.x < 32) {
+        float v = threadIdx.x < (blockDim.x >> 5) ? red[threadIdx.x] : 0.0f;
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+        if (threadIdx.x == 0) tot = v;
+    }
+    __syncthreads();
+    const float r = 1.0f / sqrtf(tot / (float) H + eps);
+    float* yr = y + (size_t) blockIdx.x * H;
+    for (int i = threadIdx.x; i < H; i += blockDim.x) yr[i] = (g ? g[i] : 1.0f) * (xr[i] * r);
+}
+
+__global__ void k_add_rows(float* __restrict__ X, const float* __restrict__ A, const float* __restrict__ b, size_t total, int H) {
+    for (size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x; i < total; i += (size_t) gridDim.x * blockDim.x)
+        X[i] += (A ? A[i] : 0.0f) + (b ? b[i % (size_t) H] : 0.0f);
+}
+
+// bias + RoPE, in place, on the heads of q (hh < heads) and k (hh >= heads); the rotated k is also written to the K cache slot of its position.
+__global__ void k_qk_rope(float* __restrict__ q, float* __restrict__ k, const float* __restrict__ bq, const float* __restrict__ bk, const float* __restrict__ cs,
+                          const float* __restrict__ sn, int N, int p0, int heads, int kv_heads, int D, int sliding, int cap, int pairs, float* __restrict__ Kc) {
+    const int half = D / 2, nh = heads + kv_heads;
+    const size_t total = (size_t) N * nh * half;
+    for (size_t idx = (size_t) blockIdx.x * blockDim.x + threadIdx.x; idx < total; idx += (size_t) gridDim.x * blockDim.x) {
+        const int i = (int) (idx % half);
+        const int hh = (int) ((idx / half) % nh);
+        const int t = (int) (idx / ((size_t) half * nh));
+        const int pos = p0 + t;
+        const bool isq = hh < heads;
+        const int kh = hh - heads;
+        float* p = isq ? q + (size_t) t * heads * D + (size_t) hh * D : k + (size_t) t * kv_heads * D + (size_t) kh * D;
+        const float* bs = isq ? bq + (size_t) hh * D : bk + (size_t) kh * D;
+        const int ia = pairs ? 2 * i : i, ib = pairs ? 2 * i + 1 : i + half;
+        const float a = p[ia] + bs[ia], b = p[ib] + bs[ib];
+        const float c = cs[(size_t) pos * half + i], s = sn[(size_t) pos * half + i];
+        const float r0 = a * c - b * s;
+        const float r1 = pairs ? a * s + b * c : b * c + a * s;
+        p[ia] = r0; p[ib] = r1;
+        if (!isq) {
+            const size_t slot = sliding ? (size_t) (pos % cap) : (size_t) pos;
+            float* kc = Kc + slot * kv_heads * D + (size_t) kh * D;
+            kc[ia] = r0; kc[ib] = r1;
+        }
+    }
+}
+
+__global__ void k_v_write(const float* __restrict__ v, const float* __restrict__ bv, int N, int p0, int KD, int sliding, int cap, float* __restrict__ Vc) {
+    const size_t total = (size_t) N * KD;
+    for (size_t idx = (size_t) blockIdx.x * blockDim.x + threadIdx.x; idx < total; idx += (size_t) gridDim.x * blockDim.x) {
+        const int t = (int) (idx / KD), j = (int) (idx % KD);
+        const int pos = p0 + t;
+        const size_t slot = sliding ? (size_t) (pos % cap) : (size_t) pos;
+        Vc[slot * KD + j] = v[idx] + bv[j];
+    }
+}
+
+// One warp per (token, head): online softmax over the visible keys (the sink starts the running max / denominator, it has no value), so no score buffer
+// is needed and any context length works. Lane l owns dimensions l, l+32, ... (D % 32 == 0, D <= 128).
+__global__ void k_attn(const float* __restrict__ q, const float* __restrict__ Kc, const float* __restrict__ Vc, const float* __restrict__ sinks, int p0, int heads,
+                       int kv_heads, int D, int window, int cap, int sliding, float scale, float* __restrict__ out) {
+    const int t = blockIdx.x, hd = blockIdx.y, lane = threadIdx.x;
+    const int pos = p0 + t;
+    const int QD = heads * D, KD = kv_heads * D, g = hd / (heads / kv_heads), nv = D >> 5;
+    const int lo = sliding ? max(0, pos - window + 1) : 0;
+    float qv[4], acc[4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) { qv[i] = i < nv ? q[(size_t) t * QD + (size_t) hd * D + lane + 32 * i] : 0.0f; acc[i] = 0.0f; }
+    float m = sinks[hd], l = 1.0f;
+    for (int u = lo; u <= pos; ++u) {
+        const size_t slot = sliding ? (size_t) (u % cap) : (size_t) u;
+        const float* kr = Kc + slot * KD + (size_t) g * D;
+        float s = 0.0f;
+#pragma unroll
+        for (int i = 0; i < 4; ++i) if (i < nv) s += qv[i] * kr[lane + 32 * i];
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) s += __shfl_xor_sync(0xffffffffu, s, o);
+        s *= scale;
+        const float mn = fmaxf(m, s);
+        const float a = expf(m - mn), p = expf(s - mn);
+        l = l * a + p;
+        const float* vr = Vc + slot * KD + (size_t) g * D;
+#pragma unroll
+        for (int i = 0; i < 4; ++i) if (i < nv) acc[i] = acc[i] * a + p * vr[lane + 32 * i];
+        m = mn;
+    }
+    const float inv = 1.0f / l;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) if (i < nv) out[(size_t) t * QD + (size_t) hd * D + lane + 32 * i] = acc[i] * inv;
+}
+
+unsigned grid1d(size_t total, int block) { return (unsigned) std::min<size_t>((total + block - 1) / block, 65535); }
+
 // ---------------------------------------------------------------- expert contexts
 struct ExpCtx {
     cudaStream_t stream = nullptr;
@@ -554,6 +657,50 @@ bool expert_collect(int ci, float* hy) {
     if (!ck(cudaEventSynchronize(c.ev), "expert wait")) return false;
     std::memcpy(hy, c.h_y, (size_t) c.n * c.H * sizeof(float));
     return true;
+}
+
+bool d2h(void* h, const void* d, size_t n) {
+    return ck(cudaMemcpyAsync(h, d, n, cudaMemcpyDeviceToHost, g_comp), "d2h") && ck(cudaStreamSynchronize(g_comp), "d2h sync");
+}
+
+bool dmm_bf16(const void* dW, int rows, int cols, const float* dx, int N, float* dy) {
+    if (N <= 0) return true;
+    if (use_gemm(N, cols)) k_gemm_bf16<<<dim3((unsigned) ((rows + 63) / 64), (unsigned) ((N + 63) / 64)), 128, 0, g_comp>>>((const unsigned short*) dW, rows, cols, dx, N, dy);
+    else k_bf16<<<(rows + WARPS - 1) / WARPS, WARPS * 32, 0, g_comp>>>((const unsigned short*) dW, rows, cols, dx, N, dy);
+    return ck(cudaGetLastError(), "dmm_bf16 launch");
+}
+
+bool rms_rows(const float* dx, const float* dg, float eps, int N, int H, float* dy) {
+    if (N <= 0) return true;
+    k_rms<<<N, 256, 0, g_comp>>>(dx, dg, eps, H, dy);
+    return ck(cudaGetLastError(), "rms_rows launch");
+}
+
+bool add_rows(float* dX, const float* dA, const float* db, int N, int H) {
+    if (N <= 0) return true;
+    k_add_rows<<<grid1d((size_t) N * H, 256), 256, 0, g_comp>>>(dX, dA, db, (size_t) N * H, H);
+    return ck(cudaGetLastError(), "add_rows launch");
+}
+
+bool attn_supported(const AttnShape& a) { return a.D % 32 == 0 && a.D <= 128 && a.heads % a.kv_heads == 0 && a.cap > 0; }
+
+bool qk_rope_kv(float* dq, float* dk, const float* dv, const float* dbq, const float* dbk, const float* dbv, const float* dcos, const float* dsin,
+                int N, int p0, const AttnShape& a, float* dKc, float* dVc) {
+    if (N <= 0) return true;
+    if (a.D % 32 != 0 || a.D > 128 || a.heads % a.kv_heads != 0 || a.cap <= 0) { std::lock_guard<std::mutex> lk(g_err_mu); g_err = "qk_rope_kv: unsupported shape"; return false; }
+    const size_t items = (size_t) N * (a.heads + a.kv_heads) * (a.D / 2);
+    k_qk_rope<<<grid1d(items, 256), 256, 0, g_comp>>>(dq, dk, dbq, dbk, dcos, dsin, N, p0, a.heads, a.kv_heads, a.D, a.sliding ? 1 : 0, a.cap, a.rope_pairs ? 1 : 0, dKc);
+    if (!ck(cudaGetLastError(), "k_qk_rope launch")) return false;
+    k_v_write<<<grid1d((size_t) N * a.kv_heads * a.D, 256), 256, 0, g_comp>>>(dv, dbv, N, p0, a.kv_heads * a.D, a.sliding ? 1 : 0, a.cap, dVc);
+    return ck(cudaGetLastError(), "k_v_write launch");
+}
+
+bool attn_rows(const float* dq, const float* dKc, const float* dVc, const float* dsinks, int N, int p0, const AttnShape& a, float* dout) {
+    if (N <= 0) return true;
+    if (a.D % 32 != 0 || a.D > 128 || a.heads % a.kv_heads != 0 || a.cap <= 0) { std::lock_guard<std::mutex> lk(g_err_mu); g_err = "attn_rows: unsupported shape"; return false; }
+    k_attn<<<dim3((unsigned) N, (unsigned) a.heads), 32, 0, g_comp>>>(dq, dKc, dVc, dsinks, p0, a.heads, a.kv_heads, a.D, a.window, a.cap, a.sliding ? 1 : 0,
+                                                                        1.0f / sqrtf((float) a.D), dout);
+    return ck(cudaGetLastError(), "k_attn launch");
 }
 
 int event_create() {
