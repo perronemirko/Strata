@@ -522,10 +522,14 @@ bool init(const Cfg& cfg, const char* layer_sliding, size_t budget_bytes) {
     const int H = cfg.H, I = cfg.I, E = cfg.E, topk = cfg.topk, layers = cfg.layers, ctx = cfg.ctx;
     const int qd = cfg.heads * cfg.head_dim, kd = cfg.kv_heads * cfg.head_dim;
     int T = std::max(1, cfg.chunk_max);
+    // A dense layer's attention reads the WHOLE history, so its card cache must hold ctx rows: dense_rows is never
+    // shrunk below cfg.ctx. run_layer() refuses a chunk whose history is past the card cache, and that refusal is
+    // NOT an allocation that did not fit - if init accepted a small card cache the path would fail mid-prefill and
+    // the session would lose the device. Better to refuse the whole path here, where the caller falls back to the
+    // old prefill and the device stays on.
     int dense_rows = cfg.ctx;
     for (;;) {
         if (plan_bytes(cfg, layer_sliding, T, dense_rows) <= budget_bytes) break;
-        if (dense_rows > cfg.window + T) { dense_rows = std::max(cfg.window + T, 1); continue; }
         if (T == 1) { g_err = "prefill_dev: the reservation does not fit the VRAM left"; g_bad = true; return false; }
         T /= 2;
     }
@@ -668,7 +672,7 @@ bool run_layer(const Cfg& cfg, int layer, const LayerIO& w, int T, int pos0, boo
     if (bad(cudaGetLastError(), "rope")) return false;
     KVDev& kv = g_kv[(size_t) layer];
     // a dense layer reads the whole history: past what the card holds, this chunk is not device-resident
-    if (!sliding && pos0 + T > kv.cap) { g_err = "prefill_dev: dense history past the card cache"; return false; }
+    if (!sliding && pos0 + T > kv.cap) { g_err = "prefill_dev: dense history past the card cache"; return false; }   // cannot happen: init keeps dense_rows == ctx
     k_attn<<<(unsigned) (size_t) T * heads, ATTN_THREADS, 0, g_st>>>(
         g_Q, g_KS, g_VS, kv.K, kv.V, d.sinks, g_ATT, T, pos0, cfg.window, sliding, qd, kd, D, heads, rep, kv.base);
     if (bad(cudaGetLastError(), "attn")) return false;
