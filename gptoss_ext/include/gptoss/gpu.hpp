@@ -21,9 +21,10 @@ void release(void* p);                       // release(nullptr) is a no-op
 bool h2d(void* dev, const void* host, size_t n);        // synchronous: complete when it returns
 void set_options(bool use_graphs);           // CUDA graphs for the decode expert pipeline (default on)
 
-/// Allocates the scratch buffers UP FRONT (device + pinned host) for batches of up to `dense_x_floats` / `dense_y_floats` floats of dense-matmat input / output and
-/// `expert_batch_n` tokens per expert call, so no cudaMalloc happens later when the expert slots have taken the VRAM.
-bool reserve_scratch(size_t dense_x_floats, size_t dense_y_floats, int expert_batch_n, int H, int I);
+/// Allocates the scratch buffers UP FRONT (device + pinned host) for batches of up to `dense_x_floats` / `dense_y_floats` floats of dense-matmat input / output,
+/// `expert_batch_n` tokens per expert call, and `dense_async_floats` floats of output for ONE async dense batch (the decode's q/k/v, see below), so no
+/// cudaMalloc happens later when the expert slots have taken the VRAM. Pass 0 for `dense_async_floats` to keep that path unreserved.
+bool reserve_scratch(size_t dense_x_floats, size_t dense_y_floats, int expert_batch_n, int H, int I, size_t dense_async_floats);
 
 /// y[n][rows] = W x[n][cols], n < N, host x/y. W: BF16 [rows][cols] on the device. N >= 32 uses the tensor-core GEMM (sm_80+), smaller N a warp-per-row kernel.
 bool matmat_bf16(const void* dW, int rows, int cols, const float* hx, int N, float* hy);
@@ -43,6 +44,16 @@ constexpr int kExpertCtxBatch = 4;           // contexts 0..3: decode (N == 1, g
 /// enqueue up to 4 decode experts back to back, then collect them.
 bool expert_run_async(int ctx, const ExpertDesc& d, const float* hx, const float* wt, int N);
 bool expert_collect(int ctx, float* hy);     // waits for that context's work and copies y[N][H] out
+
+/// Async dense projections for the DECODE. The q/k/v of one layer read the SAME input x, so they run as ONE x upload,
+/// `count` kernels, ONE result copy and ONE wait instead of `count` full round-trips (each of which was an upload, a
+/// kernel, a copy back and a cudaStreamSynchronize). The results land in the caller's host buffers at dense_collect.
+/// The dense context is independent of the expert contexts; dense_run_async records its own event.
+struct DenseOp { const void* W = nullptr; int rows = 0, cols = 0; };   // W: BF16 [rows][cols] already on the device
+constexpr int kDenseCtxBatch = 1;                                      // context 0: the decode's q/k/v batch
+constexpr int kDenseMaxOps = 4;                                       // ops per batch: q, k, v (+ o if ever batched)
+bool dense_run_async(int ctx, const float* hx, int N, const DenseOp* ops, int count);
+bool dense_collect(int ctx, float* const* out);                        // waits for that context, then copies each op's [N][rows] block
 
 // ---- copy side (prefetch): its own stream
 int event_create();
