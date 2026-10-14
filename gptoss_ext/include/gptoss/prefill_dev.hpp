@@ -12,6 +12,7 @@
 #pragma once
 #include <cstddef>
 #include <cstdint>
+#include <string>
 
 namespace gptoss {
 namespace pdev {
@@ -56,6 +57,7 @@ bool run_experts(const Cfg& cfg, int T, const ExpertPtrs* per_expert, const int*
                  const float* row_weight, const int32_t* idx_tok);
 void advance(int T);                                // the chunk's positions become history for the next chunk
 bool sync_all();                                    // every pending KV copy is back in the host cache
+std::string last_error();                           // why the last call refused (empty = no CUDA call failed): the Model prints it when it turns this path off
 
 }  // namespace pdev
 }  // namespace gptoss
