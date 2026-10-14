@@ -20,9 +20,9 @@ if [ "$1" = "--cuda" ]; then
   # Compilazione asincrona del nuovo kernel di dequantizzazione GGUF Q4_K_L
   $NVCC -O3 -std=c++17 -arch="$ARCH" -Iinclude -c src/gguf_dequantize.cu -o "$OUT/gguf_dequantize.o"
   
-  # Links finali unificati inclusi src/gpu_cuda.cu e il file oggetto del modulo GGUF
+  # Links finali unificati inclusi src/gpu_cuda.cu, il prefill device-resident (src/prefill_dev.cu) e il file oggetto del modulo GGUF
   $NVCC -O3 -std=c++17 -arch="$ARCH" ${OMP:+-Xcompiler -fopenmp} -Iinclude \
-    src/gptoss_run_main.cpp $COMMON src/gpu_cuda.cu "$OUT/gguf_dequantize.o" \
+    src/gptoss_run_main.cpp $COMMON src/gpu_cuda.cu src/prefill_dev.cu "$OUT/gguf_dequantize.o" \
     ${OMP:+-lgomp} -o "$OUT/gptoss_run_cuda"
     
   echo "built $OUT/gptoss_run_cuda"
@@ -30,7 +30,7 @@ if [ "$1" = "--cuda" ]; then
 fi
 
 FLAGS="-std=c++17 -O3 -Wall -Wextra $OMP ${GPTOSS_MARCH:+-march=$GPTOSS_MARCH} -Iinclude"
-SRC="$COMMON src/gpu.cpp"
+SRC="$COMMON src/gpu.cpp src/prefill_dev_stub.cpp"
 if [ ! -f tests/tiny/golden.txt ]; then python3 tools/tiny_gptoss.py tests/tiny; fi
 $CXX $FLAGS tests/test_gptoss_core.cpp $SRC -o "$OUT/test_gptoss_core"
 "$OUT/test_gptoss_core" tests/tiny
