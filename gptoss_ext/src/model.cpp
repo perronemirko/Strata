@@ -515,6 +515,11 @@ bool Model::Impl::gpu_setup(std::string& err) {
                 }
                 std::fprintf(stderr, "gptoss: device-resident prefill on (%.2f GiB of KV windows + scratch; the expert pool takes the rest)\n",
                              (double) pdev::reserved_bytes() / 1073741824.0);
+                {
+                    static const char* fn[] = { "e4m3", "f16", "f32" };
+                    std::fprintf(stderr, "gptoss: card KV formats K=%s V=%s (%zu/%zu bytes per element; the host cache and the checkpoint stay f32)\n",
+                                 fn[(int) o.key_format], fn[(int) o.value_format], get_kv_format_bytes(o.key_format), get_kv_format_bytes(o.value_format));
+                }
             } else {
                 pdev::shutdown();
                 std::fprintf(stderr, "gptoss: device-resident prefill off (a layer's dense weights are not all on the device): old prefill\n");
@@ -1195,6 +1200,9 @@ pdev::Cfg Model::Impl::pdev_cfg() const {
     pc.ctx = o.ctx; pc.window = c.window; pc.heads = c.heads; pc.kv_heads = c.kv_heads; pc.head_dim = c.head_dim;
     pc.eps = c.eps; pc.limit = c.swiglu_limit; pc.alpha = c.swiglu_alpha;
     pc.rope_pairs = o.rope_pairs; pc.glu_halves = o.glu_halves; pc.chunk_max = std::max(1, chunk_max);
+    // Asymmetric KV quantization of the CARD cache: -k / -v choose the two sides independently.
+    pc.k_fmt = (int) o.key_format; pc.v_fmt = (int) o.value_format;
+    pc.kv_limit = 448.0f;   // e4m3 max; the row scale is the power of two that keeps the row inside it
     return pc;
 }
 

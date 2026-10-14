@@ -17,6 +17,7 @@
 // (sink in the softmax denominator only, window or full) -> o -> residual -> post-LN -> router -> host routing
 // -> grouped experts -> scatter. Same fp32 order, double sums where the host has them.
 #include "gptoss/prefill_dev.hpp"
+#include "gptoss/kv_quant.hpp"   // KVFormat + pack/unpack: ONE definition, shared with src/gpu_cuda.cu
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
@@ -49,6 +50,13 @@ Cfg g_cfg;
 int g_chunk = 0, g_rmax = 0, g_qd = 0, g_kd = 0, g_half = 0, g_layers = 0;
 int g_cur_pos0 = 0, g_cur_T = 0;
 
+// Asymmetric KV formats (-k / -v): the card cache is packed per side, independently.
+int g_kfmt = 2, g_vfmt = 2;         // gptoss::gpu::KVFormat
+int g_kb = 4, g_vb = 4;             // bytes per element of the packed rows
+float g_klim = 0.0f, g_vlim = 0.0f; // e4m3 saturation (0 = no rescaling: f16/f32)
+float *g_KQ = nullptr, *g_VQ = nullptr;   // fp32 staging for the H2D upload (host bytes cannot be read by a kernel)
+int g_upmax = 0;                    // rows the staging can hold: max(chunk, window)
+
 float *g_X = nullptr, *g_HN = nullptr, *g_Q = nullptr, *g_KS = nullptr, *g_VS = nullptr;
 float *g_ATT = nullptr, *g_OB = nullptr, *g_GL = nullptr;
 float *g_GU = nullptr, *g_ACT = nullptr, *g_EB = nullptr;
@@ -64,8 +72,13 @@ struct LDev {
 };
 std::vector<LDev> g_L;
 
+// The card's K/V rows are PACKED (fp8 e4m3 = 1B, half = 2B, float = 4B), K and V independently: the
+// host cache and the KV checkpoint stay fp32, only the card's copy is compressed. The per-row scale
+// (one power of two per position, shared by that position's kv_heads) lives in kinv/vinv; the
+// attention kernels multiply the raw packed value by that inverse scale, in registers.
 struct KVDev {
-    float *K = nullptr, *V = nullptr;
+    void *K = nullptr, *V = nullptr;
+    float *kinv = nullptr, *vinv = nullptr;   // [cap] inverse scales, one per row
     int cap = 0;                    // rows held on the card
     bool ring = false;              // the HOST cache is a ring (banded layer)
     long long valid = 0;            // dense: leading rows already mirrored on the card
@@ -113,6 +126,156 @@ __device__ void bf16_body(const unsigned short* __restrict__ W, int rows, int co
     }
 }
 
+// ============================================================================
+// ON-THE-FLY DEQUANTIZATION: the card's K/V rows are PACKED (T_K for K, T_V for V,
+// chosen INDEPENDENTLY by -k / -v). The attention kernel reads the packed bytes and
+// dequantizes them into registers (unpack_target_to_fp32 from gptoss/kv_quant.hpp),
+// so the fp32 rows never exist in VRAM: the PCIe bus carries 1/4 (e4m3) or 1/2 (f16)
+// the bytes. The nine combinations are instantiated by the dispatch in run_layer.
+// ============================================================================
+
+// One row of the card cache, packed: row = position, KD elements per row.
+// The per-row inverse scale (one power of two per position, shared by its kv_heads)
+// lives in kinv/vinv; the host cache and the KV checkpoint stay fp32.
+__device__ __forceinline__ float kv_row_scale(float peak, float limit) {
+    if (!(peak > 0.0f) || !(limit > 0.0f)) return 1.0f;
+    const float s = exp2f(floorf(log2f(peak / limit)));
+    if (!(s > 1e-18f)) return 1.0f;
+    return (s > 1.0f) ? 1.0f : s;
+}
+
+__device__ __forceinline__ float kv_row_scale_inv(float scale) {
+    return (scale > 0.0f) ? 1.0f / scale : 1.0f;
+}
+
+template<typename T_K, typename T_V>
+__global__ void k_attn(
+    const float* __restrict__ q, const float* __restrict__ stage_k, const float* __restrict__ stage_v,
+    const T_K* __restrict__ cache_k, const T_V* __restrict__ cache_v,
+    const float* __restrict__ kinv, const float* __restrict__ vinv,
+    const float* __restrict__ sinks, float* __restrict__ att, int T, int pos0, int window, bool banded,
+    int QD, int KD, int D, int heads, int rep, int base) {
+    const int wid = blockIdx.x;
+    const int t = wid / heads, h = wid % heads;
+    if (t >= T) return;
+    const int pos = pos0 + t;
+    const int lo = banded ? max(0, pos - window + 1) : 0;
+    const int g = h / rep;
+    const float scale = 1.0f / sqrtf((float) D);
+    const float* qq = q + (size_t) t * QD + (size_t) h * D;
+    __shared__ float qv[MAXD];
+    __shared__ float vb[ATTN_THREADS * MAXD];
+    __shared__ float pw[ATTN_THREADS];
+    for (int j = threadIdx.x; j < D; j += ATTN_THREADS) qv[j] = qq[j];
+    __syncthreads();
+    const int d0 = threadIdx.x * 2, d1 = d0 + 1;
+    float o0 = 0.0f, o1 = 0.0f;
+    float m = sinks[h];
+    double z = 1.0;                       // the sink's own term, exp(sink - m) with m == sink at the start
+    for (int u0 = lo; u0 <= pos; u0 += ATTN_THREADS) {
+        const int u = u0 + threadIdx.x;
+        const bool live = (u <= pos);
+        float s = -1e30f;
+        if (live) {
+            s = 0.0f;
+            if (u >= pos0) {   // this chunk's keys: still fp32 in the stage, never packed
+                const float* kr = stage_k + (size_t) (u - pos0) * KD + (size_t) g * D;
+                for (int j = 0; j < D; ++j) s += qv[j] * kr[j];
+            } else {           // history: packed on the card, dequantized into registers
+                const int crow = banded ? u - base : u;
+                const T_K* kr = cache_k + (size_t) crow * KD + (size_t) g * D;
+                const float isc = kinv[crow];
+                for (int j = 0; j < D; ++j) s += qv[j] * gpu::unpack_target_to_fp32<T_K>(kr[j], isc);
+            }
+            s *= scale;
+        }
+        float mt = s;
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) mt = fmaxf(mt, __shfl_xor_sync(0xffffffffu, mt, o));
+        const float mn = fmaxf(m, mt);
+        const float resc = expf(m - mn);
+        const float p = live ? expf(s - mn) : 0.0f;
+        float tz = p;
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) tz += __shfl_xor_sync(0xffffffffu, tz, o);
+        if (live) {
+            if (u >= pos0) {
+                const float* vr = stage_v + (size_t) (u - pos0) * KD + (size_t) g * D;
+                for (int j = 0; j < D; ++j) vb[threadIdx.x * MAXD + j] = vr[j];
+            } else {
+                const int crow = banded ? u - base : u;
+                const T_V* vr = cache_v + (size_t) crow * KD + (size_t) g * D;
+                const float isc = vinv[crow];
+                for (int j = 0; j < D; ++j) vb[threadIdx.x * MAXD + j] = gpu::unpack_target_to_fp32<T_V>(vr[j], isc);
+            }
+        }
+        pw[threadIdx.x] = p;
+        z = z * (double) resc + (double) tz;
+        o0 *= resc;
+        o1 *= resc;
+        m = mn;
+        __syncthreads();
+        for (int i = 0; i < ATTN_THREADS; ++i) {
+            const float pi = pw[i];
+            if (pi > 0.0f) { o0 += pi * vb[i * MAXD + d0]; o1 += pi * vb[i * MAXD + d1]; }
+        }
+        __syncthreads();
+    }
+    const float zi = (float) (1.0 / z);
+    float* out = att + (size_t) t * QD + (size_t) h * D;
+    out[d0] = o0 * zi;
+    out[d1] = o1 * zi;
+}
+
+// amax of a row across the block, then the power-of-two scale that keeps it inside the format.
+__device__ __forceinline__ float block_amax(float v, float* __restrict__ red, int nt) {
+    for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, o));
+    const int w = threadIdx.x >> 5;
+    if ((threadIdx.x & 31) == 0) red[w] = v;
+    __syncthreads();
+    const int nw = nt >> 5;
+    float tot = 0.0f;
+    for (int i = 0; i < nw; ++i) tot = fmaxf(tot, red[i]);
+    __syncthreads();
+    return tot;
+}
+
+// Pack a run of fp32 rows into the card's format, writing the row's inverse scale too.
+template<typename T_OUT>
+__global__ void k_kv_pack(const float* __restrict__ src, T_OUT* __restrict__ dst, float* __restrict__ iscl,
+                          int rows, int kd, float limit) {
+    __shared__ float red[8];
+    const int r = blockIdx.x;
+    if (r >= rows) return;
+    const float* p = src + (size_t) r * kd;
+    float amax = 0.0f;
+    for (int i = threadIdx.x; i < kd; i += blockDim.x) amax = fmaxf(amax, fabsf(p[i]));
+    amax = block_amax(amax, red, (int) blockDim.x);
+    const float sc = kv_row_scale(amax, limit);
+    const float isc = kv_row_scale_inv(sc);
+    if (threadIdx.x == 0) iscl[r] = isc;
+    T_OUT* d = dst + (size_t) r * kd;
+    for (int i = threadIdx.x; i < kd; i += blockDim.x) d[i] = gpu::pack_fp32_to_target<T_OUT>(p[i], isc);
+}
+
+// Back to fp32: only the host cache / the checkpoint need it, the card never stores fp32 KV.
+template<typename T_IN>
+__global__ void k_kv_unpack(const T_IN* __restrict__ src, const float* __restrict__ iscl, float* __restrict__ dst,
+                            int rows, int kd) {
+    const int r = blockIdx.x;
+    if (r >= rows) return;
+    const float isc = iscl[r];
+    const T_IN* p = src + (size_t) r * kd;
+    float* d = dst + (size_t) r * kd;
+    for (int i = threadIdx.x; i < kd; i += blockDim.x) d[i] = gpu::unpack_target_to_fp32<T_IN>(p[i], isc);
+}
+
+__global__ void k_fill_one(float* d, int n) {
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) d[i] = 1.0f;
+}
+
+
+// ---------------------------------------------------------------- tensor-core GEMM (sm_80+): Y[N][rows] = X[N][cols] . W[rows][cols]^T
 // Grouped MXFP4 matmul over the row space: one block-column per expert, its rows reached through src[] when the
 // input is in token space (gate_up reads the post-LN activations), addressed directly when it is not (down reads
 // activations already produced in the row space). The expert's weights are streamed ONCE whatever the number of
@@ -268,72 +431,6 @@ __global__ void k_router_bias(float* gl, const float* rbias, int E, int T) {
         gl[idx] += rbias[idx % E];
 }
 
-// Attention: one block per (token, head). Online softmax over 32-key tiles; the sink joins the denominator only.
-// Keys of this chunk come from the stage (positions >= pos0); older keys from the card's KV cache, which for a
-// banded layer holds the linear window [base, base+cap) and for a dense layer is indexed by position.
-// Each thread owns one key of the tile for the score, and two output dimensions for the weighted sum.
-__global__ void k_attn(const float* q, const float* stage_k, const float* stage_v, const float* cache_k, const float* cache_v,
-                       const float* sinks, float* att, int T, int pos0, int window, bool banded,
-                       int QD, int KD, int D, int heads, int rep, int base) {
-    const int wid = blockIdx.x;
-    const int t = wid / heads, h = wid % heads;
-    if (t >= T) return;
-    const int pos = pos0 + t;
-    const int lo = banded ? max(0, pos - window + 1) : 0;
-    const int g = h / rep;
-    const float scale = 1.0f / sqrtf((float) D);
-    const float* qq = q + (size_t) t * QD + (size_t) h * D;
-    __shared__ float qv[MAXD];
-    __shared__ float vb[ATTN_THREADS * MAXD];
-    __shared__ float pw[ATTN_THREADS];
-    for (int j = threadIdx.x; j < D; j += ATTN_THREADS) qv[j] = qq[j];
-    __syncthreads();
-    const int d0 = threadIdx.x * 2, d1 = d0 + 1;
-    float o0 = 0.0f, o1 = 0.0f;
-    float m = sinks[h];
-    double z = 1.0;                       // the sink's own term, exp(sink - m) with m == sink at the start
-    for (int u0 = lo; u0 <= pos; u0 += ATTN_THREADS) {
-        const int u = u0 + threadIdx.x;
-        const bool live = (u <= pos);
-        float s = -1e30f;
-        if (live) {
-            const float* kr = (u >= pos0) ? stage_k + (size_t) (u - pos0) * KD + (size_t) g * D
-                                          : cache_k + (size_t) (banded ? u - base : u) * KD + (size_t) g * D;
-            s = 0.0f;
-            for (int j = 0; j < D; ++j) s += qv[j] * kr[j];
-            s *= scale;
-        }
-        float mt = s;
-#pragma unroll
-        for (int o = 16; o > 0; o >>= 1) mt = fmaxf(mt, __shfl_xor_sync(0xffffffffu, mt, o));
-        const float mn = fmaxf(m, mt);
-        const float resc = expf(m - mn);
-        const float p = live ? expf(s - mn) : 0.0f;
-        float tz = p;
-#pragma unroll
-        for (int o = 16; o > 0; o >>= 1) tz += __shfl_xor_sync(0xffffffffu, tz, o);
-        if (live) {
-            const float* vr = (u >= pos0) ? stage_v + (size_t) (u - pos0) * KD + (size_t) g * D
-                                          : cache_v + (size_t) (banded ? u - base : u) * KD + (size_t) g * D;
-            for (int j = 0; j < D; ++j) vb[threadIdx.x * MAXD + j] = vr[j];
-        }
-        pw[threadIdx.x] = p;
-        z = z * (double) resc + (double) tz;
-        o0 *= resc;
-        o1 *= resc;
-        m = mn;
-        __syncthreads();
-        for (int i = 0; i < ATTN_THREADS; ++i) {
-            const float pi = pw[i];
-            if (pi > 0.0f) { o0 += pi * vb[i * MAXD + d0]; o1 += pi * vb[i * MAXD + d1]; }
-        }
-        __syncthreads();
-    }
-    const float zi = (float) (1.0 / z);
-    float* out = att + (size_t) t * QD + (size_t) h * D;
-    out[d0] = o0 * zi;
-    out[d1] = o1 * zi;
-}
 
 template <bool MX>
 __device__ void gemm_body(const void* A, const uint8_t* S, int rows, int cols, const float* __restrict__ x, int N, float* __restrict__ y) {
@@ -419,23 +516,73 @@ bool malloc_(void** p, size_t n, const char* what) {
 
 // Move the KV rows of positions [lo, lo+n) between the host cache and the card cache. The host cache of a banded
 // layer is a ring (rows wrap at cap_host); the card cache is linear, so the host side is split into runs.
+// Move the KV rows of positions [lo, lo+n) between the host cache (fp32) and the card cache (packed).
+// The host side cannot be read by a kernel, so an upload goes through the fp32 staging: H2D of the raw
+// floats, then k_kv_pack writes the packed bytes + the row's inverse scale on the card. A download
+// (the emulated path only) runs k_kv_unpack back into the host cache.
+static bool kv_pack_run(int layer, const float* kq, const float* vq, int dst_row, int len, int kd) {
+    KVDev& kv = g_kv[(size_t) layer];
+    const int blk = std::min(len, 65535);
+    bool ok = true;
+    switch (g_kfmt) {
+        case 0: k_kv_pack<__nv_fp8_e4m3><<<blk, 256, 0, g_st>>>(kq, (__nv_fp8_e4m3*) kv.K + (size_t) dst_row * kd, kv.kinv + dst_row, len, kd, g_klim); break;
+        case 1: k_kv_pack<half><<<blk, 256, 0, g_st>>>(kq, (half*) kv.K + (size_t) dst_row * kd, kv.kinv + dst_row, len, kd, g_klim); break;
+        default: k_kv_pack<float><<<blk, 256, 0, g_st>>>(kq, (float*) kv.K + (size_t) dst_row * kd, kv.kinv + dst_row, len, kd, 0.0f); break;
+    }
+    ok = ok && !bad(cudaGetLastError(), "kv pack k");
+    switch (g_vfmt) {
+        case 0: k_kv_pack<__nv_fp8_e4m3><<<blk, 256, 0, g_st>>>(vq, (__nv_fp8_e4m3*) kv.V + (size_t) dst_row * kd, kv.vinv + dst_row, len, kd, g_vlim); break;
+        case 1: k_kv_pack<half><<<blk, 256, 0, g_st>>>(vq, (half*) kv.V + (size_t) dst_row * kd, kv.vinv + dst_row, len, kd, g_vlim); break;
+        default: k_kv_pack<float><<<blk, 256, 0, g_st>>>(vq, (float*) kv.V + (size_t) dst_row * kd, kv.vinv + dst_row, len, kd, 0.0f); break;
+    }
+    return ok && !bad(cudaGetLastError(), "kv pack v");
+}
+
 bool move_kv(int layer, const float* host_K, const float* host_V, int cap_host, bool ring, int lo, int n, cudaMemcpyKind kind) {
     if (g_bad || n <= 0) return !g_bad;
     KVDev& kv = g_kv[(size_t) layer];
     const int kd = g_kd;
+    if (kind == cudaMemcpyHostToDevice) {
+        for (int p = lo; p < lo + n;) {
+            int a = ring ? p % cap_host : p;
+            int len = lo + n - p;
+            if (ring) len = std::min(len, cap_host - a);
+            // the staging holds at most g_upmax rows: split longer runs
+            while (len > 0) {
+                const int take = std::min(len, g_upmax);
+                if (!copy_async(g_KQ, host_K + (size_t) a * kd * 4, (size_t) take * kd * 4, cudaMemcpyHostToDevice)) return false;
+                if (!copy_async(g_VQ, host_V + (size_t) a * kd * 4, (size_t) take * kd * 4, cudaMemcpyHostToDevice)) return false;
+                if (!kv_pack_run(layer, g_KQ, g_VQ, p - kv.base, take, kd)) return false;
+                a += take; len -= take; p += take;
+            }
+        }
+        return !bad(cudaStreamSynchronize(g_st), "kv sync");
+    }
+    // download: unpack on the card into the staging, then a plain D2H into the host cache
     for (int p = lo; p < lo + n;) {
-        const int a = ring ? p % cap_host : p;
+        int a = ring ? p % cap_host : p;
         int len = lo + n - p;
         if (ring) len = std::min(len, cap_host - a);
-        const size_t bytes = (size_t) len * kd * 4;
-        float* hk = (float*) (void*) host_K, *hv = (float*) (void*) host_V;
-        const bool ok = (kind == cudaMemcpyHostToDevice)
-            ? (!bad(cudaMemcpyAsync(kv.K + (size_t) (p - kv.base) * kd * 4, host_K + (size_t) a * kd * 4, bytes, kind, g_st), "kv h2d") &&
-               !bad(cudaMemcpyAsync(kv.V + (size_t) (p - kv.base) * kd * 4, host_V + (size_t) a * kd * 4, bytes, kind, g_st), "kv h2d v"))
-            : (!bad(cudaMemcpyAsync(hk + (size_t) a * kd * 4, kv.K + (size_t) (p - kv.base) * kd * 4, bytes, kind, g_st), "kv d2h") &&
-               !bad(cudaMemcpyAsync(hv + (size_t) a * kd * 4, kv.V + (size_t) (p - kv.base) * kd * 4, bytes, kind, g_st), "kv d2h v"));
-        if (!ok) return false;
-        p += len;
+        while (len > 0) {
+            const int take = std::min(len, g_upmax);
+            switch (g_kfmt) {
+                case 0: k_kv_unpack<__nv_fp8_e4m3><<<std::min(take, 65535), 256, 0, g_st>>>((__nv_fp8_e4m3*) kv.K + (size_t) (p - kv.base) * kd, kv.kinv + (p - kv.base), g_KQ, take, kd); break;
+                case 1: k_kv_unpack<half><<<std::min(take, 65535), 256, 0, g_st>>>((half*) kv.K + (size_t) (p - kv.base) * kd, kv.kinv + (p - kv.base), g_KQ, take, kd); break;
+                default: break;
+            }
+            if (g_kfmt != 2 && bad(cudaGetLastError(), "kv unpack k")) return false;
+            switch (g_vfmt) {
+                case 0: k_kv_unpack<__nv_fp8_e4m3><<<std::min(take, 65535), 256, 0, g_st>>>((__nv_fp8_e4m3*) kv.V + (size_t) (p - kv.base) * kd, kv.vinv + (p - kv.base), g_VQ, take, kd); break;
+                case 1: k_kv_unpack<half><<<std::min(take, 65535), 256, 0, g_st>>>((half*) kv.V + (size_t) (p - kv.base) * kd, kv.vinv + (p - kv.base), g_VQ, take, kd); break;
+                default: break;
+            }
+            if (g_vfmt != 2 && bad(cudaGetLastError(), "kv unpack v")) return false;
+            const size_t bytes = (size_t) take * kd * 4;
+            float* hk = (float*) (void*) host_K, *hv = (float*) (void*) host_V;
+            if (!bad(cudaMemcpyAsync(hk + (size_t) a * kd * 4, g_KQ, bytes, kind, g_st), "kv d2h")) return false;
+            if (!bad(cudaMemcpyAsync(hv + (size_t) a * kd * 4, g_VQ, bytes, kind, g_st), "kv d2h v")) return false;
+            a += take; len -= take; p += take;
+        }
     }
     return !bad(cudaStreamSynchronize(g_st), "kv sync");
 }
@@ -459,6 +606,8 @@ void free_all() {
     FR(g_PE)
     FR(g_rope_c)
     FR(g_rope_s)
+    FR(g_KQ)
+    FR(g_VQ)
 #undef FR
     for (size_t i = 0; i < g_L.size(); ++i) {
         LDev& d = g_L[i];
@@ -477,6 +626,8 @@ void free_all() {
 #define FR3(p) if ((p)) { cudaFree((void*) (p)); (p) = nullptr; }
         FR3(g_kv[i].K)
         FR3(g_kv[i].V)
+        FR3(g_kv[i].kinv)
+        FR3(g_kv[i].vinv)
 #undef FR3
     }
     g_L.clear();
@@ -491,6 +642,9 @@ size_t plan_bytes(const Cfg& c, const char* layer_sliding, int chunk, int dense_
     const int H = c.H, I = c.I, E = c.E, topk = c.topk, hd = c.head_dim;
     const int qd = c.heads * hd, kd = c.kv_heads * hd;
     const int T = std::max(1, chunk), R = T * topk;
+    const int kb = (c.k_fmt == 0) ? 1 : (c.k_fmt == 1) ? 2 : 4;
+    const int vb = (c.v_fmt == 0) ? 1 : (c.v_fmt == 1) ? 2 : 4;
+    const int up = std::max(T, std::max(1, c.window));   // rows the H2D staging must hold
     size_t s = 0;
     s += (size_t) T * (3 * H + 2 * qd + 2 * kd + E) * 4;
     s += (size_t) R * (2 * I + I + H) * 4;
@@ -499,8 +653,10 @@ size_t plan_bytes(const Cfg& c, const char* layer_sliding, int chunk, int dense_
     for (int l = 0; l < c.layers; ++l) {
         const bool sliding = layer_sliding[l] != 0;
         const size_t rows = sliding ? (size_t) (c.window + T) : (size_t) dense_rows;
-        s += (size_t) 2 * rows * kd * 4;
+        // the whole point of the task: the card holds PACKED rows, never fp32
+        s += (size_t) rows * (kd * (kb + vb) + 2 * 4);
     }
+    s += (size_t) 2 * up * kd * 4;   // the fp32 staging for the uploads
     s += (size_t) 2 * (size_t) c.ctx * (hd / 2) * 4;
     return s + ((size_t) 16 << 20);
 }
@@ -539,6 +695,14 @@ bool init(const Cfg& cfg, const char* layer_sliding, size_t budget_bytes) {
     g_chunk = T;
     g_rmax = T * topk;
     g_qd = qd; g_kd = kd; g_half = cfg.head_dim / 2; g_layers = layers;
+    // Asymmetric KV formats: K and V are packed INDEPENDENTLY (-k / -v).
+    g_kfmt = (cfg.k_fmt >= 0 && cfg.k_fmt <= 2) ? cfg.k_fmt : 2;
+    g_vfmt = (cfg.v_fmt >= 0 && cfg.v_fmt <= 2) ? cfg.v_fmt : 2;
+    g_kb = (g_kfmt == 0) ? 1 : (g_kfmt == 1) ? 2 : 4;
+    g_vb = (g_vfmt == 0) ? 1 : (g_vfmt == 1) ? 2 : 4;
+    g_klim = (g_kfmt == 0) ? cfg.kv_limit : 0.0f;
+    g_vlim = (g_vfmt == 0) ? cfg.kv_limit : 0.0f;
+    g_upmax = std::max(T, std::max(1, cfg.window));   // rows the H2D staging holds
     const float lut[16] = {0.f, .5f, 1.f, 1.5f, 2.f, 3.f, 4.f, 6.f, -0.f, -.5f, -1.f, -1.5f, -2.f, -3.f, -4.f, -6.f};
     if (bad(cudaMemcpyToSymbol(c_fp4, lut, sizeof lut), "fp4 table")) return false;
     if (bad(cudaStreamCreateWithFlags(&g_st, cudaStreamNonBlocking), "pdev stream")) return false;
@@ -565,6 +729,8 @@ bool init(const Cfg& cfg, const char* layer_sliding, size_t budget_bytes) {
     A(g_PE, (size_t) E * sizeof(ExpertPtrs))
     A(g_rope_c, (size_t) ctx * g_half * 4)
     A(g_rope_s, (size_t) ctx * g_half * 4)
+    A(g_KQ, (size_t) g_upmax * kd * 4)
+    A(g_VQ, (size_t) g_upmax * kd * 4)
 #undef A
     g_hro.assign((size_t) E + 1, 0);
     g_L.assign((size_t) layers, LDev());
@@ -578,8 +744,14 @@ bool init(const Cfg& cfg, const char* layer_sliding, size_t budget_bytes) {
         kv.base = 0;
         kv.cov_lo = 0;
         kv.cov_hi = 0;
-        if (!malloc_((void**) & kv.K, (size_t) kv.cap * kd * 4, "pdev kv alloc")) return false;
-        if (!malloc_((void**) & kv.V, (size_t) kv.cap * kd * 4, "pdev kv alloc")) return false;
+        if (!malloc_((void**) & kv.K, (size_t) kv.cap * kd * g_kb, "pdev kv alloc")) return false;
+        if (!malloc_((void**) & kv.V, (size_t) kv.cap * kd * g_vb, "pdev kv alloc")) return false;
+        if (!malloc_((void**) & kv.kinv, (size_t) kv.cap * 4, "pdev kv scale")) return false;
+        if (!malloc_((void**) & kv.vinv, (size_t) kv.cap * 4, "pdev kv scale")) return false;
+        // rows never uploaded must still read a defined scale: 1.0 = no rescaling
+        k_fill_one<<<(unsigned) std::min<size_t>(kv.cap, 65535), 256, 0, g_st>>>(kv.kinv, kv.cap);
+        k_fill_one<<<(unsigned) std::min<size_t>(kv.cap, 65535), 256, 0, g_st>>>(kv.vinv, kv.cap);
+        if (bad(cudaGetLastError(), "kv scale init")) return false;
     }
     return true;
 }
@@ -653,7 +825,7 @@ bool run_layer(const Cfg& cfg, int layer, const LayerIO& w, int T, int pos0, boo
     (void) w;
     if (g_bad) return false;
     const int H = cfg.H, E = cfg.E, hd = cfg.head_dim;
-    const int qd = g_qd, kd = g_kd, half = g_half, D = hd;
+    const int qd = g_qd, kd = g_kd, hdim2 = g_half, D = hd;
     const int heads = cfg.heads, kvh = cfg.kv_heads, rep = heads / kvh;
     const LDev& d = g_L[(size_t) layer];
     if (!d.in_ln) { g_err = "layer " + std::to_string(layer) + " was never uploaded (its dense weights are not on the card)"; return false; }
@@ -668,13 +840,26 @@ bool run_layer(const Cfg& cfg, int layer, const LayerIO& w, int T, int pos0, boo
         g_Q, g_KS, g_VS, d.bq, d.bk, d.bv, T, qd, kd);
     if (bad(cudaGetLastError(), "bias")) return false;
     k_rope<<<(unsigned) std::min<size_t>(((size_t) T * (qd + kd) / 2 + 255) / 256, 65535), 256, 0, g_st>>>(
-        g_Q, g_KS, g_rope_c, g_rope_s, T, pos0, qd, kd, D, half, heads, kvh, cfg.rope_pairs);
+        g_Q, g_KS, g_rope_c, g_rope_s, T, pos0, qd, kd, D, hdim2, heads, kvh, cfg.rope_pairs);
     if (bad(cudaGetLastError(), "rope")) return false;
     KVDev& kv = g_kv[(size_t) layer];
     // a dense layer reads the whole history: past what the card holds, this chunk is not device-resident
     if (!sliding && pos0 + T > kv.cap) { g_err = "prefill_dev: dense history past the card cache"; return false; }   // cannot happen: init keeps dense_rows == ctx
-    k_attn<<<(unsigned) (size_t) T * heads, ATTN_THREADS, 0, g_st>>>(
-        g_Q, g_KS, g_VS, kv.K, kv.V, d.sinks, g_ATT, T, pos0, cfg.window, sliding, qd, kd, D, heads, rep, kv.base);
+    // The nine (K,V) format combinations are instantiated by this dispatch: each kernel
+    // body exists exactly once, and the history rows are read PACKED and dequantized in registers.
+#define ATTN(KT, VT) k_attn<KT, VT><<<(unsigned) (size_t) T * heads, ATTN_THREADS, 0, g_st>>>( \
+    g_Q, g_KS, g_VS, (const KT*) kv.K, (const VT*) kv.V, kv.kinv, kv.vinv, d.sinks, g_ATT, \
+    T, pos0, cfg.window, sliding, qd, kd, D, heads, rep, kv.base)
+    if (g_kfmt == 0 && g_vfmt == 0) ATTN(__nv_fp8_e4m3, __nv_fp8_e4m3);
+    else if (g_kfmt == 0 && g_vfmt == 1) ATTN(__nv_fp8_e4m3, half);
+    else if (g_kfmt == 1 && g_vfmt == 0) ATTN(half, __nv_fp8_e4m3);
+    else if (g_kfmt == 1 && g_vfmt == 1) ATTN(half, half);
+    else if (g_kfmt == 0) ATTN(__nv_fp8_e4m3, float);
+    else if (g_kfmt == 1) ATTN(half, float);
+    else if (g_vfmt == 0) ATTN(float, __nv_fp8_e4m3);
+    else if (g_vfmt == 1) ATTN(float, half);
+    else ATTN(float, float);
+#undef ATTN
     if (bad(cudaGetLastError(), "attn")) return false;
     if (!dense_mm(d.dobj, H, qd, g_ATT, T, g_OB)) return false;
     k_resid<<<(unsigned) std::min<size_t>(((size_t) T * H + 255) / 256, 65535), 256, 0, g_st>>>(g_X, g_OB, d.bo, H, T);
@@ -725,7 +910,7 @@ void kv_store_back(int layer, float* host_K, float* host_V, int cap, bool slidin
     // The commit is per layer because the stage is reused by the next layer.
     const int kd = g_kd;
     for (int p = pos0; p < pos0 + T;) {
-        const int a = sliding ? p % cap : p;
+        int a = sliding ? p % cap : p;
         int len = pos0 + T - p;
         if (sliding) len = std::min(len, cap - a);
         const size_t bytes = (size_t) len * kd * 4;
@@ -735,8 +920,8 @@ void kv_store_back(int layer, float* host_K, float* host_V, int cap, bool slidin
         p += len;
     }
     KVDev& kv = g_kv[(size_t) layer];
-    if (!bad(cudaMemcpyAsync(kv.K + (size_t) (pos0 - kv.base) * kd * 4, g_KS, (size_t) T * kd * 4, cudaMemcpyDeviceToDevice, g_st), "kv stage d2d")) { g_bad = true; return; }
-    if (!bad(cudaMemcpyAsync(kv.V + (size_t) (pos0 - kv.base) * kd * 4, g_VS, (size_t) T * kd * 4, cudaMemcpyDeviceToDevice, g_st), "kv stage d2d v")) { g_bad = true; return; }
+    // the stage is already on the card: pack it straight into the card's format (no fp32 rows in VRAM)
+    if (!kv_pack_run(layer, g_KS, g_VS, pos0 - kv.base, T, kd)) { g_bad = true; return; }
     if (bad(cudaStreamSynchronize(g_st), "kv commit sync")) { g_bad = true; return; }
     if (!kv.ring) kv.valid = std::max<long long>(kv.valid, (long long) pos0 + T);
     else { kv.cov_lo = std::min(kv.cov_lo, kv.base); kv.cov_hi = std::max(kv.cov_hi, pos0 + T); }

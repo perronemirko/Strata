@@ -10,6 +10,7 @@
 #include <sstream>
 #include <string>
 #include <vector>
+#include <iostream>
 
 using namespace gptoss;
 
@@ -19,6 +20,8 @@ static void usage() {
         "       [--prompt-ids 1,2,3 --n-predict N [--temperature T --top-k K --top-p P --seed S]] | [--serve [--eos-ids 200002,200012]]\n"
         "       [--selfcheck] [--prefill-chunk N] [--kv-rollback N] [--kv-checkpoint FILE] [--kv-unified]\n"
         "       [--cuda [--cuda-device N] [--vram-pct P] [--vram-total-mib N] [--vram-reserve-mib N] [--gpu-slots N] [--expert-profile FILE] [--expert-profile-save FILE] [--expert-profile-save-every SEC] [--pin-pct P] [--expert-promote N] [--expert-lru-layered] [--profile-decay N] [--prefill-dev-pct P]]\n"
+        "         -k FMT / --key-format FMT, -v FMT / --value-format FMT: format of the CARD KV cache, K and V INDEPENDENTLY (e4m3 = 1B, f16 = 2B, f32 = 4B; default f32).\n"
+        "         e4m3 cuts the KV windows 4x, f16 2x; the host cache and the KV checkpoint stay f32, the attention dequantizes in registers (no fp32 rows in VRAM).\n"
         "         --prefill-dev-pct P: percent of the VRAM left for the device-resident prefill (its KV windows + chunk scratch); 0 = the old prefill (default 50)\n"
         "         expert cache, opt-in (0/off = the previous release): --expert-promote N pins an LRU expert after N decode hits and unpins the coldest pinned one;\n"
         "         --expert-lru-layered evicts inside the requesting layer first; --profile-decay N halves the usage profile past N routed activations\n"
@@ -48,6 +51,26 @@ int main(int argc, char** argv) {
         else if (a == "--kv-rollback") o.kv_rollback = std::atoi(val());
         else if (a == "--kv-checkpoint") o.kv_checkpoint = val();
         else if (a == "--kv-unified") {}      // accepted for llama.cpp parity: one sequence, one shared cache already
+        else if ((a == "-k" || a == "--key-format") && i + 1 < argc) {
+            std::string val = argv[++i];
+            if (val == "e4m3")  o.key_format = KVFormat::E4M3;
+            else if (val == "f16") o.key_format = KVFormat::F16;
+            else if (val == "f32") o.key_format = KVFormat::F32;
+            else {
+                std::cerr << "Formato Key non valido: " << val << " (usa e4m3, f16, f32)\n";
+                exit(1);
+            }
+        } 
+        else if ((a == "-v" || a == "--value-format") && i + 1 < argc) {
+            std::string val = argv[++i];
+            if (val == "e4m3")  o.value_format = KVFormat::E4M3;
+            else if (val == "f16") o.value_format = KVFormat::F16;
+            else if (val == "f32") o.value_format = KVFormat::F32;
+            else {
+                std::cerr << "Formato Value non valido: " << val << " (usa e4m3, f16, f32)\n";
+                exit(1);
+            }
+        }
         else if (a == "--cuda") o.cuda = true;
         else if (a == "--gpu-emu") { o.cuda = true; allow_emu = true; }     // tests only: the "device" is host memory
         else if (a == "--cuda-device") o.cuda_device = std::atoi(val());

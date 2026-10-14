@@ -26,6 +26,11 @@ struct Cfg {
     float eps = 1e-5f, limit = 7.0f, alpha = 1.702f;
     bool rope_pairs = false, glu_halves = false;    // the same layout switches the Model was built with
     int chunk_max = 1;                              // tokens per chunk; init() sizes the scratch for this
+    // Asymmetric KV quantization of the CARD cache (-k / -v on the command line). The host KV cache and the
+    // KV checkpoint stay fp32: the Model, the decode and the rollback read them. Only the card's copy is
+    // packed, and the attention kernels dequantize it into registers.
+    int k_fmt = 2, v_fmt = 2;                       // gptoss::gpu::KVFormat: E4M3 = 0, F16 = 1, F32 = 2
+    float kv_limit = 448.0f;                        // e4m3 saturation; the row scale is the power of two below
 };
 
 struct LayerIO {                                    // the layer's BF16 projections already on the device (null = on the host)

@@ -9,6 +9,12 @@
 
 namespace gptoss {
 
+enum class KVFormat {
+    E4M3,   // FP8 Ada Lovelace (1 Byte)
+    F16,    // Half/BF16 Precision (2 Byte)
+    F32     // Full Precision (4 Byte)
+};
+
 struct RunOpts {
     int ctx = 8192;                    // positions of the dense layers' KV cache (the model supports 131072; fp32 KV = 4 KiB/layer/token)
     int threads = 0;                   // 0 = every core
@@ -42,8 +48,17 @@ struct RunOpts {
     // --- VRAM budget: --vram-pct of the card (or of --vram-total-mib when given) minus the reserve. With cuda=false it is only a plan.
     double vram_pct = -1;
     long long vram_total_mib = 0, vram_reserve_mib = 1024;
+    KVFormat key_format = KVFormat::F32;   // Default originale per conservazione
+    KVFormat value_format = KVFormat::F32; // D
 };
-
+inline size_t get_kv_format_bytes(KVFormat format) {
+    switch (format) {
+        case KVFormat::E4M3: return 1;
+        case KVFormat::F16:  return 2;
+        case KVFormat::F32:  return 4;
+    }
+    return 4;
+}
 class Model {
 public:
     Model();
