@@ -27,6 +27,8 @@ struct RunOpts {
     std::string expert_profile_save;   // where the profile is written (default: the --expert-profile path)
     double expert_profile_save_every = 0;   // seconds between periodic saves while generating (0 = only after each request and at exit)
     double pin_pct = 80;               // % of the expert slots reserved for the most-used experts of the profile (the rest is LRU for the others)
+    bool preload = true;               // fill the expert slots in the background at startup (copy stream): pinned experts of the profile first, then the hottest, then layer order; --no-preload = pin synchronously, the rest fills on demand
+    bool preload_wait = false;         // load() returns only when the preload is finished (benchmarks)
     bool gpu_attn = true;              // device prefill keeps the activations and the KV cache in VRAM and runs attention there (needs every dense matmul on the device and the KV to fit); --no-gpu-attn turns it off
     int gpu_slots = -1;                // cap on the expert slots in VRAM (-1 = as many as the budget allows)
     // --- expert cache: three opt-in knobs that only move WHICH experts hold the slots, never how many slots there are.
@@ -64,6 +66,7 @@ public:
     bool save_profile(const std::string& path, std::string& err);   // with --profile-decay it also ages the in-memory counts it just wrote
     bool load_profile(const std::string& path, std::string& err);
     void decay_profile();             // call after every profile save: with --profile-decay 0 it does nothing
+    void preload_wait();                // blocks until the background expert preload has finished (returns at once without one)
     bool gpu_attention() const;         // true when the batched prefill runs attention + KV on the device
     std::string stats() const;          // slots / pinned / hits / misses / PCIe ("" without a device pool)
     /// Per-request decode counters, same fields as Strata's DONE line (hits, lookups, offloaded over PCIe).

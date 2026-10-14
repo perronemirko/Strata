@@ -135,6 +135,24 @@ int main(int argc, char** argv) {
         std::printf("%s device attention+KV chunk=%d rollback=%-4d: decode %.3g, re-prefill after decode %.3g, full prefill %.3g\n", ok ? "ok  " : "FAIL", chunk, rollback, w, w2, w3);
         CHECK(ok);
     }
+    // Background preload of the expert slots (emulated device): every slot is filled by the copy thread, published only when complete; afterwards no expert misses.
+    {
+        Model m; RunOpts o; o.ctx = 64; o.verbose = false; o.cuda = true; o.vram_total_mib = 512; o.vram_pct = 90; o.vram_reserve_mib = 0; o.prefill_chunk = 5; std::string err;
+        if (!m.load(dir, o, err)) return 2;
+        m.preload_wait();
+        std::string st = m.stats();
+        const bool done = st.find("(done)") != std::string::npos;
+        const bool all = st.find("experts: " + std::to_string(m.config().layers * m.config().n_exp) + " slots") != std::string::npos;   // every expert has a slot
+        std::vector<float> lg; m.prefill(ids.data(), 16, 0, nullptr);
+        double w = 0;
+        for (size_t t = 16; t < ids.size(); ++t) { m.forward(ids[t], (int) t, &lg); for (int j = 0; j < V; ++j) w = std::max(w, (double) std::fabs(ref[t * V + (size_t) j] - lg[(size_t) j])); }
+        st = m.stats();
+        // This branch's stats line counts "X of the Y routed experts read over PCIe, Z on the host": a completed
+        // preload means the decode found a slot for every expert, so both counters must be 0.
+        const bool nomiss = !all || (st.find("; 0 of the") != std::string::npos && st.find(", 0 on the host, oom") != std::string::npos);
+        std::printf("%s expert preload: %s | decode max|diff| %.3g\n", (done && nomiss && w < 1e-3) ? "ok  " : "FAIL", st.c_str(), w);
+        CHECK(done); CHECK(nomiss); CHECK(w < 1e-3);
+    }
     { SampleOpts so; Sampler sm(so); std::vector<float> l = {0.1f, 2.0f, -1.0f}; CHECK(sm.sample(l.data(), 3, {}) == 1); }
     std::printf(g_fail ? "FAILED (%d)\n" : "all ok\n", g_fail);
     return g_fail ? 1 : 0;
