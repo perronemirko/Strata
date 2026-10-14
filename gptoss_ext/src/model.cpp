@@ -413,6 +413,40 @@ bool Model::Impl::gpu_setup(std::string& err) {
         chunk_max = chunk;
         std::fprintf(stderr, "gptoss: prefill chunk %d -> %d so the dense scratch fits the VRAM left\n", want_chunk, chunk);
     }
+    // Device-resident prefill (prefill_dev) claims its share of the VRAM BEFORE the expert pool: a dense layer's
+    // attention reads the whole history, so its K/V must be on the card for the chunk to stay on the card. It gets
+    // --prefill-dev-pct % of what the dense weights and the chunk scratch left; the pool takes the rest. Whatever
+    // does not fit turns this path off for the session - the old prefill is still correct, just slower.
+    if (pdev::available() && o.prefill_dev_pct > 0) {
+        std::vector<char> sl((size_t) c.layers);
+        for (int l = 0; l < c.layers; ++l) sl[(size_t) l] = L[(size_t) l].sliding ? 1 : 0;
+        const size_t pdev_budget = (size_t) (std::max(0.0, budget) * std::min((double) o.prefill_dev_pct, 90.0) / 100.0);
+        if (pdev::init(pdev_cfg(), sl.data(), pdev_budget)) {
+            bool up_ok = true;
+            for (int l = 0; l < c.layers && up_ok; ++l) {
+                Layer& y = L[(size_t) l];
+                up_ok = pdev::upload_layer(l, y.sliding, y.in_ln.data(), y.post_ln.data(), y.sinks.data(), y.bq.data(), y.bk.data(),
+                                           y.bv.data(), y.bo.data(), y.rbias.data(), y.dq, y.dk, y.dv, y.dobj, y.drt);
+            }
+            if (up_ok) {
+                pdev::set_rope(rope_cos.data(), rope_sin.data(), o.ctx);
+                pdev_on = true;
+                budget -= (double) pdev::reserved_bytes();
+                const int got = pdev::chosen_chunk();
+                if (got > 0 && got != chunk_max) {
+                    chunk_max = got;
+                    std::fprintf(stderr, "gptoss: device-resident prefill chunk %d -> %d so the reservation fits\n", want_chunk, got);
+                }
+                std::fprintf(stderr, "gptoss: device-resident prefill on (%.2f GiB of KV windows + scratch; the expert pool takes the rest)\n",
+                             (double) pdev::reserved_bytes() / 1073741824.0);
+            } else {
+                pdev::shutdown();
+                std::fprintf(stderr, "gptoss: device-resident prefill off (a layer's dense weights are not all on the device): old prefill\n");
+            }
+        } else {
+            std::fprintf(stderr, "gptoss: device-resident prefill off (its KV windows + scratch do not fit its share of the VRAM left): old prefill\n");
+        }
+    }
     auto al = [](size_t v) { return (v + 255) & ~(size_t) 255; };
     const size_t s_gub = 2 * I * (H / 32) * 16, s_gus = 2 * I * (H / 32), s_dnb = H * (I / 32) * 16, s_dns = H * (I / 32);
     const size_t s_gubias = 2 * I * 2, s_dnbias = H * 2;   // the BF16 bias rows travel with the expert: the async pipeline has no host step to add them
@@ -446,31 +480,6 @@ bool Model::Impl::gpu_setup(std::string& err) {
         }
         std::fprintf(stderr, "gptoss: pinned %zu hot experts (%.1f%% of the routed activations in the profile); %zu slots stay LRU\n",
                      done, total ? 100.0 * (double) covered / (double) total : 0.0, pool.size() - done);
-    }
-    // Device-resident prefill (prefill_dev): its KV windows + scratch take VRAM from what is left AFTER the pool. If it
-    // does not fit, the old prefill stays on for the whole session - an honest fallback, no partial state.
-    if (pdev::available()) {
-        pdev::Cfg pc = pdev_cfg();
-        std::vector<char> sl((size_t) c.layers);
-        for (int l = 0; l < c.layers; ++l) sl[(size_t) l] = L[(size_t) l].sliding ? 1 : 0;
-        if (pdev::init(pc, sl.data(), budget > 0 ? (size_t) budget : 0)) {
-            bool up_ok = true;
-            for (int l = 0; l < c.layers && up_ok; ++l) {
-                Layer& y = L[(size_t) l];
-                up_ok = pdev::upload_layer(l, y.sliding, y.in_ln.data(), y.post_ln.data(), y.sinks.data(), y.bq.data(), y.bk.data(),
-                                           y.bv.data(), y.bo.data(), y.rbias.data(), y.dq, y.dk, y.dv, y.dobj, y.drt);
-            }
-            if (up_ok) {
-                pdev::set_rope(rope_cos.data(), rope_sin.data(), o.ctx);
-                pdev_on = true;
-                std::fprintf(stderr, "gptoss: device-resident prefill on (KV windows + scratch took the VRAM left after the pool)\n");
-            } else {
-                pdev::shutdown();
-                std::fprintf(stderr, "gptoss: device-resident prefill off (a layer's dense weights are not all on the device): old prefill\n");
-            }
-        } else {
-            std::fprintf(stderr, "gptoss: device-resident prefill off (its KV windows + scratch do not fit the VRAM left after the pool): old prefill\n");
-        }
     }
     gpu_on = true;
     std::fprintf(stderr, "gptoss: CUDA device '%s' (%s): dense weights %.2f GiB on device%s, %zu expert slots of %.2f MiB (%.0f%% of the %d experts)\n",
