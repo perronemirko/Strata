@@ -656,7 +656,7 @@ bool run_layer(const Cfg& cfg, int layer, const LayerIO& w, int T, int pos0, boo
     const int qd = g_qd, kd = g_kd, half = g_half, D = hd;
     const int heads = cfg.heads, kvh = cfg.kv_heads, rep = heads / kvh;
     const LDev& d = g_L[(size_t) layer];
-    if (!d.in_ln) return false;
+    if (!d.in_ln) { g_err = "layer " + std::to_string(layer) + " was never uploaded (its dense weights are not on the card)"; return false; }
     g_cur_pos0 = pos0;
     g_cur_T = T;
     k_rmsnorm<<<(unsigned) T, 256, 0, g_st>>>(g_X, d.in_ln, cfg.eps, H, T, g_HN);

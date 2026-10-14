@@ -31,6 +31,28 @@ for p in (str(STRATA_ROOT), str(STRATA_ROOT / "tools")):
         sys.path.insert(0, p)
 
 
+# Flags whose value is a path: the engine runs with cwd = EXT_ROOT (see cfg["cwd"] below), so a
+# relative path handed over through --engine-arg would be resolved against the wrong directory
+# ("gptoss_ext/profile.prof" -> "gptoss_ext/gptoss_ext/profile.prof": fopen fails, the profile
+# never saves and the engine spams "profile save FAILED" on every request). Absolutize them here.
+PATH_FLAGS = ("--expert-profile", "--expert-profile-save", "--kv-checkpoint")
+
+
+def absolutize_paths(tokens, cwd):
+    """Rewrite the value of every PATH_FLAGS token as an absolute path under cwd."""
+    out, i = [], 0
+    while i < len(tokens):
+        t = tokens[i]
+        out.append(t)
+        if t in PATH_FLAGS and i + 1 < len(tokens):
+            p = Path(tokens[i + 1])
+            out.append(str(p if p.is_absolute() else (Path(cwd) / p).resolve()))
+            i += 2
+            continue
+        i += 1
+    return out
+
+
 def _find_regex(node):
     """The Split regex of the HF pre_tokenizer (a Split, or a Sequence containing one)."""
     if not isinstance(node, dict):
@@ -158,6 +180,9 @@ def main() -> int:
             args.append(flag)
     for extra in a.engine_arg or []:
         args += extra.split()
+    # cwd is EXT_ROOT: any relative path flag inside --engine-arg must be resolved there, not where
+    # the shell happens to be (the user's typo "gptoss_ext/profile.prof" becomes EXT_ROOT/profile.prof).
+    args = absolutize_paths(args, str(EXT_ROOT))
     log = str(workdir / "gptoss_engine.log")
     cfg = {"exe": str(exe), "args": args, "cwd": str(EXT_ROOT), "log": log, "tokenizer": str(tdir), "model_name": a.model_name}
     env = dict(kv.partition("=")[::2] for kv in (a.engine_env or []) if "=" in kv)
