@@ -245,6 +245,37 @@ __global__ void k_exp_fin(const DDesc* d, const float* eb, float* y) {          
     }
 }
 
+// ---------------------------------------------------------------- async dense contexts (decode's q/k/v: ONE wait for the whole trio)
+struct DenseCtx {
+    cudaStream_t stream = nullptr;
+    cudaEvent_t ev = nullptr;
+    float *h_x = nullptr, *h_y = nullptr;
+    float *d_x = nullptr, *d_y = nullptr;
+    size_t cap_x = 0, cap_y = 0;                      // floats
+    int n = 0, count = 0;
+    size_t off[kDenseMaxOps + 1];                     // where each op's [N][rows] block lives inside d_y / h_y
+    int rows[kDenseMaxOps];
+};
+DenseCtx g_dc[kDenseCtxBatch];
+
+bool dense_ctx_reserve(DenseCtx& c, size_t nx, size_t ny) {
+    if (!c.stream && (!ck(cudaStreamCreateWithFlags(&c.stream, cudaStreamNonBlocking), "dense stream") ||
+                      !ck(cudaEventCreateWithFlags(&c.ev, cudaEventDisableTiming), "dense event"))) return false;
+    if (nx > c.cap_x) {
+        cudaFreeHost(c.h_x); cudaFree(c.d_x);
+        if (!ck(cudaMallocHost((void**) &c.h_x, nx * sizeof(float)), "dense h_x") ||
+            !ck(cudaMalloc((void**) &c.d_x, nx * sizeof(float)), "dense d_x")) return false;
+        c.cap_x = nx;
+    }
+    if (ny > c.cap_y) {
+        cudaFreeHost(c.h_y); cudaFree(c.d_y);
+        if (!ck(cudaMallocHost((void**) &c.h_y, ny * sizeof(float)), "dense h_y") ||
+            !ck(cudaMalloc((void**) &c.d_y, ny * sizeof(float)), "dense d_y")) return false;
+        c.cap_y = ny;
+    }
+    return true;
+}
+
 // ---------------------------------------------------------------- dense scratch (sync matmat API)
 float *g_dx = nullptr, *g_dy = nullptr, *g_hx = nullptr, *g_hy = nullptr;
 size_t g_cx = 0, g_cy = 0;
@@ -429,10 +460,59 @@ bool h2d(void* d, const void* h, size_t n) {            // complete when it retu
     return ck(cudaMemcpyAsync(d, h, n, cudaMemcpyHostToDevice, g_comp), "h2d") && ck(cudaStreamSynchronize(g_comp), "h2d sync");
 }
 
-bool reserve_scratch(size_t dense_x_floats, size_t dense_y_floats, int expert_batch_n, int H, int I) {
+// The decode's q/k/v of ONE layer: same x, so ONE upload, `count` kernels, ONE copy back and ONE wait.
+// The kernels write into one contiguous output buffer split by rows, so the host gets the blocks back by offset.
+bool dense_run_async(int ci, const float* hx, int N, const DenseOp* ops, int count) {
+    if (ci < 0 || ci >= kDenseCtxBatch || count <= 0 || count > kDenseMaxOps || N <= 0) return false;
+    DenseCtx& c = g_dc[ci];
+    size_t max_cols = 0, total = 0;
+    for (int j = 0; j < count; ++j) {
+        if (!ops[j].W || ops[j].rows <= 0 || ops[j].cols <= 0) return false;
+        if (j > 0 && ops[j].cols != ops[0].cols) return false;   // the ops read the SAME x: one row width
+        max_cols = std::max(max_cols, (size_t) ops[j].cols);
+        c.rows[j] = ops[j].rows;
+        c.off[j] = total;
+        total += (size_t) N * (size_t) ops[j].rows;
+    }
+    c.off[count] = total;
+    if (!dense_ctx_reserve(c, (size_t) N * max_cols, total)) return false;
+    std::memcpy(c.h_x, hx, (size_t) N * ops[0].cols * sizeof(float));
+    cudaStream_t st = c.stream;
+    if (!ck(cudaMemcpyAsync(c.d_x, c.h_x, (size_t) N * ops[0].cols * sizeof(float), cudaMemcpyHostToDevice, st), "dense x h2d")) return false;
+    for (int j = 0; j < count; ++j) {
+        float* dy = c.d_y + c.off[j];
+        if (use_gemm(N, ops[j].cols)) {
+            const dim3 grid((unsigned) ((ops[j].rows + 63) / 64), (unsigned) ((N + 63) / 64));
+            k_gemm_bf16<<<grid, 128, 0, st>>>((const unsigned short*) ops[j].W, ops[j].rows, ops[j].cols, c.d_x, N, dy);
+        } else {
+            const int blocks = (ops[j].rows + WARPS - 1) / WARPS;
+            k_bf16<<<blocks, WARPS * 32, 0, st>>>((const unsigned short*) ops[j].W, ops[j].rows, ops[j].cols, c.d_x, N, dy);
+        }
+        if (!ck(cudaGetLastError(), "dense launch")) return false;
+    }
+    if (!ck(cudaMemcpyAsync(c.h_y, c.d_y, total * sizeof(float), cudaMemcpyDeviceToHost, st), "dense y d2h")) return false;
+    c.n = N; c.count = count;
+    return ck(cudaEventRecord(c.ev, st), "dense event");
+}
+
+bool dense_collect(int ci, float* const* out) {
+    if (ci < 0 || ci >= kDenseCtxBatch) return false;
+    DenseCtx& c = g_dc[ci];
+    if (!ck(cudaEventSynchronize(c.ev), "dense wait")) return false;
+    for (int j = 0; j < c.count; ++j)
+        std::memcpy(out[j], c.h_y + c.off[j], (size_t) c.n * (size_t) c.rows[j] * sizeof(float));
+    return true;
+}
+
+bool reserve_scratch(size_t dense_x_floats, size_t dense_y_floats, int expert_batch_n, int H, int I, size_t dense_async_floats) {
     if (!scratch(dense_x_floats, dense_y_floats)) return false;
     for (int i = 0; i < kExpertCtxBatch; ++i) if (!ctx_reserve(g_ctx[i], 1, H, I)) return false;
-    return ctx_reserve(g_ctx[kExpertCtxBatch], std::max(1, expert_batch_n), H, I);
+    if (!ctx_reserve(g_ctx[kExpertCtxBatch], std::max(1, expert_batch_n), H, I)) return false;
+    if (dense_async_floats > 0) {
+        // the async dense context: its x holds the widest op's row (H for q/k/v), its y the whole batch of blocks
+        if (!dense_ctx_reserve(g_dc[0], (size_t) dense_async_floats, dense_async_floats)) return false;
+    }
+    return true;
 }
 
 bool matmat_bf16(const void* dW, int rows, int cols, const float* hx, int N, float* hy) { return run_matmat(false, dW, nullptr, rows, cols, hx, N, hy); }

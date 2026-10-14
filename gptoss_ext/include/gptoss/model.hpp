@@ -34,6 +34,7 @@ struct RunOpts {
     bool expert_lru_layered = false; // evict inside the requesting layer first, so a cold expert of one layer cannot push out a hot expert of another
     long long profile_decay = 0;     // 0 = off: halve every usage count after a save while their sum is above this, so the pinning follows the recent sessions
     bool device_graphs = true;       // CUDA graphs for the decode expert pipeline (gpu::set_options). false = the same kernels, enqueued one by one: the switch that isolates the graph from the stream/event ordering
+    bool async_dense = true;         // decode's q/k/v of a layer run as ONE async batch (one x upload, three kernels, one wait) instead of three full round-trips. false = the old per-projection path: the control arm for that change
     double prefill_dev_pct = 50;     // % of the VRAM left after the dense weights for the device-resident prefill (its KV windows + chunk scratch); 0 = the old prefill
     // --- VRAM budget: --vram-pct of the card (or of --vram-total-mib when given) minus the reserve. With cuda=false it is only a plan.
     double vram_pct = -1;

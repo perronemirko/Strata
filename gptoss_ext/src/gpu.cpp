@@ -13,6 +13,13 @@ namespace gpu {
 namespace {
 struct EmuCtx { std::vector<float> y; int N = 0, H = 0; };
 EmuCtx g_emu[5];
+struct EmuDenseCtx {
+    std::vector<float> y;
+    int n = 0, count = 0;
+    std::vector<size_t> off;
+    std::vector<int> rows;
+};
+EmuDenseCtx g_edc[kDenseCtxBatch];
 int g_events = 0;
 }  // namespace
 
@@ -24,7 +31,7 @@ void* alloc(size_t n) { return std::malloc(n ? n : 1); }
 void release(void* p) { std::free(p); }
 bool h2d(void* d, const void* h, size_t n) { std::memcpy(d, h, n); return true; }
 void set_options(bool) {}
-bool reserve_scratch(size_t, size_t, int, int, int) { return true; }
+bool reserve_scratch(size_t, size_t, int, int, int, size_t) { return true; }
 std::string last_error() { return ""; }
 bool last_oom() { return false; }
 
@@ -69,6 +76,33 @@ bool expert_collect(int ci, float* hy) {
     if (ci < 0 || ci > kExpertCtxBatch) return false;
     const EmuCtx& c = g_emu[ci];
     std::memcpy(hy, c.y.data(), c.y.size() * sizeof(float));
+    return true;
+}
+
+// The emulated device has no streams: the work executes at once, and dense_collect just hands it back. Same
+// results as the host path, so the tests that compare against the CPU path still pass.
+bool dense_run_async(int ci, const float* hx, int N, const DenseOp* ops, int count) {
+    if (ci < 0 || ci >= kDenseCtxBatch || count <= 0 || count > kDenseMaxOps || N <= 0) return false;
+    for (int j = 0; j < count; ++j) if (!ops[j].W || ops[j].rows <= 0 || ops[j].cols <= 0) return false;
+    EmuDenseCtx& c = g_edc[ci];
+    c.n = N; c.count = count;
+    c.off.assign((size_t) count + 1, 0);
+    c.rows.assign((size_t) count, 0);
+    size_t total = 0;
+    for (int j = 0; j < count; ++j) { c.rows[j] = ops[j].rows; c.off[(size_t) j] = total; total += (size_t) N * (size_t) ops[j].rows; }
+    c.off[(size_t) count] = total;
+    c.y.assign(total, 0.0f);
+    for (int j = 0; j < count; ++j) {
+        WView w; w.p = (const uint8_t*) ops[j].W; w.rows = ops[j].rows; w.cols = ops[j].cols; w.dt = DType::BF16;
+        gptoss::matmat(w, hx, N, c.y.data() + c.off[(size_t) j]);
+    }
+    return true;
+}
+
+bool dense_collect(int ci, float* const* out) {
+    if (ci < 0 || ci >= kDenseCtxBatch) return false;
+    const EmuDenseCtx& c = g_edc[ci];
+    for (int j = 0; j < c.count; ++j) std::memcpy(out[j], c.y.data() + c.off[(size_t) j], (size_t) c.n * (size_t) c.rows[j] * sizeof(float));
     return true;
 }
 

@@ -276,9 +276,28 @@ std::string Model::Impl::fingerprint() const {
 void Model::Impl::attn_in(Layer& y, Work& w, const float* x, int pos, const KvStage& st) {
     const int H = c.hidden, D = c.head_dim, half = D / 2, QD = c.q_dim(), KD = c.kv_dim();
     rmsnorm(x, y.in_ln.data(), c.eps, H, w.h.data());
-    mv(y.q, y.dq, w.h.data(), w.q.data());
-    mv(y.k, y.dk, w.h.data(), w.k.data());
-    mv(y.v, y.dv, w.h.data(), w.v.data());
+    // The three projections read the SAME x. On the device they run as ONE upload, three kernels and ONE wait
+    // instead of three full round-trips: the decode's per-token device calls drop from ~180 to ~108.
+    bool fused = false;
+    if (o.async_dense && gpu_on && y.dq && y.dk && y.dv && !in_parallel_region()) {
+        std::lock_guard<std::mutex> g(gmu);
+        gpu::DenseOp ops[3];
+        ops[0].W = y.dq; ops[0].rows = y.q.rows; ops[0].cols = y.q.cols;
+        ops[1].W = y.dk; ops[1].rows = y.k.rows; ops[1].cols = y.k.cols;
+        ops[2].W = y.dv; ops[2].rows = y.v.rows; ops[2].cols = y.v.cols;
+        if (gpu::dense_run_async(0, w.h.data(), 1, ops, 3)) {
+            float* out[3] = { w.q.data(), w.k.data(), w.v.data() };
+            fused = gpu::dense_collect(0, out);
+            if (!fused) gpu_fail(gpu::last_error());
+        } else {
+            gpu_fail(gpu::last_error());
+        }
+    }
+    if (!fused) {
+        mv(y.q, y.dq, w.h.data(), w.q.data());
+        mv(y.k, y.dk, w.h.data(), w.k.data());
+        mv(y.v, y.dv, w.h.data(), w.v.data());
+    }
     for (int i = 0; i < QD; ++i) w.q[(size_t) i] += y.bq[(size_t) i];
     for (int i = 0; i < KD; ++i) { w.k[(size_t) i] += y.bk[(size_t) i]; w.v[(size_t) i] += y.bv[(size_t) i]; }
     const float* cs = &rope_cos[(size_t) pos * half];
@@ -402,19 +421,29 @@ bool Model::Impl::gpu_setup(std::string& err) {
     size_t max_rows = (size_t) c.n_exp;                // rows of the projections that run batched: q, k, v, o, router
     for (const Layer& y : L) { max_rows = std::max(max_rows, std::max((size_t) y.q.rows, std::max((size_t) y.k.rows, std::max((size_t) y.v.rows, std::max((size_t) y.o.rows, (size_t) y.router.rows))))); }
     const double ctx_floats = 3.0 * (double) H + 3.0 * (double) I + 1.0;   // one expert context at N == 1 (d_x, d_wt, d_gu, d_act, d_eb, d_y)
+    // The async dense context (decode's fused q/k/v) is a FIXED cost, independent of the chunk: one row of x plus the
+    // three output blocks. Count it in the loop that halves the chunk, so the chunk that survives always leaves room
+    // for it: reserving it only after the loop would OOM at load and turn the whole device off.
+    // reserve_scratch sizes BOTH of its buffers at this number (the y blocks are the bigger one), so the budget counts
+    // exactly what is allocated: 2 * (QD + 2*KD) floats.
+    const double dense_async_bytes = o.async_dense
+        ? 8.0 * (double) ((size_t) c.q_dim() + 2 * (size_t) c.kv_dim())
+        : 0.0;
     const int want_chunk = std::max(1, chunk_max);
     int chunk = want_chunk;
     size_t nx = 0, ny = 0;
     for (;;) {
         nx = (size_t) chunk * H;
         ny = std::max((size_t) chunk * max_rows, (size_t) c.vocab);        // the lm_head/router mv() calls run at N == 1 over vocab rows
-        const double need = 4.0 * ((double) (nx + ny) + (double) (gpu::kExpertCtxBatch + 1) * ctx_floats);
+        const double need = 4.0 * ((double) (nx + ny) + (double) (gpu::kExpertCtxBatch + 1) * ctx_floats) + dense_async_bytes;
         if (need <= budget) break;
         if (chunk == 1) { std::fprintf(stderr, "gptoss:   the dense scratch does not fit the VRAM left: the device path stays off\n"); err = "dense scratch does not fit"; return false; }
         chunk /= 2;
     }
-    if (!gpu::reserve_scratch(nx, ny, 1, (int) H, (int) I)) { err = gpu::last_error(); return false; }
-    budget -= 4.0 * ((double) (nx + ny) + (double) (gpu::kExpertCtxBatch + 1) * ctx_floats);
+    // Reserve it with the rest of the scratch, BEFORE the slots take the VRAM: no cudaMalloc mid-generation.
+    const size_t dense_async_y = (size_t) c.q_dim() + 2 * (size_t) c.kv_dim();
+    if (!gpu::reserve_scratch(nx, ny, 1, (int) H, (int) I, o.async_dense ? dense_async_y : (size_t) 0)) { err = gpu::last_error(); return false; }
+    budget -= 4.0 * ((double) (nx + ny) + (double) (gpu::kExpertCtxBatch + 1) * ctx_floats) + dense_async_bytes;
     if (chunk < want_chunk) {
         chunk_max = chunk;
         std::fprintf(stderr, "gptoss: prefill chunk %d -> %d so the dense scratch fits the VRAM left\n", want_chunk, chunk);
