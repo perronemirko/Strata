@@ -78,6 +78,12 @@ struct AttnShape {
     bool sliding = false;
     int cap = 0;                             // positions held by the K/V cache of the layer: slot(pos) = sliding ? pos % cap : pos
     bool rope_pairs = false;
+    // Asymmetric KV quantization of the DEVICE cache (-k / -v on the command line). The host KV cache and
+    // the KV checkpoint stay fp32: only the card's copy is packed, and the attention kernel dequantizes
+    // it into registers. The emulated device ignores these (it is the fp32 spec the tests run against).
+    int k_fmt = 2, v_fmt = 2;                // gptoss::KVFormat: E4M3 = 0, F16 = 1, F32 = 2
+    float *dKinv = nullptr, *dVinv = nullptr; // device [cap] inverse scales, one per row (null = F32)
+    float kv_limit = 448.0f;                 // e4m3 saturation; the row scale is the power of two below
 };
 /// Tokens p0 .. p0+N-1. dq [N][heads*D] and dk [N][kv_heads*D] are the raw projections: adds the biases, applies RoPE (cos/sin tables [pos][D/2] on the device,
 /// indexed by ABSOLUTE position) IN PLACE, and writes the rotated K and the biased V of every token into the layer's device cache (dKc, dVc: [cap][kv_heads*D]).
@@ -85,6 +91,12 @@ bool qk_rope_kv(float* dq, float* dk, const float* dv, const float* dbq, const f
                 int N, int p0, const AttnShape& a, float* dKc, float* dVc);
 /// Attention of the N tokens over the device cache, sink in the softmax denominator only: dout [N][heads*D].
 bool attn_rows(const float* dq, const float* dKc, const float* dVc, const float* dsinks, int N, int p0, const AttnShape& a, float* dout);
+/// Move KV rows between the HOST cache (always fp32) and the card cache (packed: fmt = KVFormat, one
+/// power-of-two inverse scale per row in iscl). dst/iscl are addressed by SLOT (sliding ? pos % cap : pos),
+/// so a run that wraps a banded layer's ring lands in the right slots. The emulated device keeps fp32 and
+/// maps both to a plain copy; the Model never asks it for a packed format.
+bool kv_upload_rows(int fmt, const void* host, void* dst, float* iscl, int rows, int p0, int kd, int cap, bool sliding, float limit);
+bool kv_download_rows(int fmt, void* host, const void* src, const float* iscl, int rows, int p0, int kd, int cap, bool sliding);
 /// Can THIS backend run the attention kernels for this shape? The emulated device runs the host math and accepts any shape (it is the executable
 /// spec the tests run against); the CUDA kernel owns one dimension per lane, so it needs D % 32 == 0 and D <= 128. The Model asks before
 /// reserving anything, so an unsupported shape turns the path off with a printed reason instead of failing mid-prefill.
