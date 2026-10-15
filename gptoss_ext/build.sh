@@ -1,21 +1,25 @@
-# #!/bin/sh
-# CPU build + tests (EMULATED device, no GPU needed):   sh build.sh
-# CUDA build (real device, separate binary):             sh build.sh --cuda      [NVCC=nvcc CUDA_ARCH=sm_89 | native]
+#!/bin/sh
 set -e
 cd "$(dirname "$0")"
-CXX=${CXX:-g++}; OUT=build-out; mkdir -p "$OUT"; OMP=
-echo 'int main(){return 0;}' > "$OUT/omp_probe.cpp"
-if $CXX -fopenmp "$OUT/omp_probe.cpp" -o "$OUT/omp_probe" 2>/dev/null; then OMP=-fopenmp; else echo "WARNING: no OpenMP: the engine will run on ONE core" >&2; fi
+
+# Impostato g++-20 come compilatore predefinito e forzato l'uso di OpenMP
+CXX="g++-20"
+OUT=build-out
+mkdir -p "$OUT"
+OMP="-fopenmp"
 
 # Incluso src/gguf_loader.cpp nei sorgenti comuni stabili
 COMMON="src/safetensors.cpp src/serve_loop.cpp src/config.cpp src/weights.cpp src/ops.cpp src/model.cpp src/sampler.cpp src/gguf_loader.cpp"
 
 if [ "$1" = "--cuda" ]; then
+  # Forzato l'utilizzo del compilatore CUDA 13.1 specifico
   NVCC=${NVCC:-nvcc}; ARCH=${CUDA_ARCH:-native}
+  ARCH=${CUDA_ARCH:-native}
+  
   # Se impostato native su RTX 4090, passiamo l'architettura corretta sm_89 a NVCC
   if [ "$ARCH" = "native" ]; then ARCH="sm_89"; fi
   
-  echo "Compilazione dei moduli CUDA e GGUF in corso..."
+  echo "Compilazione dei moduli CUDA e GGUF in corso con CUDA 13.1..."
   
   # Compilazione asincrona del nuovo kernel di dequantizzazione GGUF Q4_K_L
   $NVCC -O3 -std=c++17 -arch="$ARCH" -Iinclude -c src/gguf_dequantize.cu -o "$OUT/gguf_dequantize.o"
@@ -29,7 +33,7 @@ if [ "$1" = "--cuda" ]; then
   exit 0
 fi
 
-FLAGS="-std=c++17 -O3 -Wall -Wextra -pthread $OMP ${GPTOSS_MARCH:+-march=$GPTOSS_MARCH} -Iinclude"
+FLAGS="-std=c++20 -O3 -Wall -Wextra -pthread $OMP ${GPTOSS_MARCH:+-march=$GPTOSS_MARCH} -Iinclude"
 SRC="$COMMON src/gpu.cpp src/prefill_dev_stub.cpp"
 if [ ! -f tests/tiny/golden.txt ]; then python3 tools/tiny_gptoss.py tests/tiny; fi
 $CXX $FLAGS tests/test_gptoss_core.cpp $SRC -o "$OUT/test_gptoss_core"

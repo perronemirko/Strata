@@ -94,6 +94,11 @@ struct Model::Impl {
     std::atomic<bool> pre_stop{false};
     std::atomic<size_t> pre_done{0};
     std::atomic<int> pre_state{0};                     // 0 off, 1 running, 2 done, 3 stopped on an error
+    // --- --pin-ram-gib: page-lock the expert tensors of the busiest layers so every copy out of them is a direct DMA
+    std::thread ram_th;
+    std::atomic<size_t> ram_layers{0};                 // layers registered so far
+    std::atomic<size_t> ram_bytes{0};
+    std::atomic<int> ram_state{0};                     // 0 off, 1 running, 2 done, 3 stopped on an error
     int dev_kv_pos = 0;                                // positions [0, dev_kv_pos) of the device KV are known to equal the host KV (decode writes the host only)
     int dev_kfmt = 2, dev_vfmt = 2;                        // formats the DEVICE KV cache is packed in (the emulated device keeps f32)
 
@@ -135,6 +140,8 @@ struct Model::Impl {
     void preload_start();
     void preload_join();
     void preload_wait();
+    void ram_pin_run();
+    void ram_pin_start();
 };
 
 Model::Model() : p_(new Impl) {}
@@ -572,6 +579,7 @@ bool Model::Impl::gpu_setup(std::string& err) {
                  gpu::device_name(), gpu::is_emulated() ? "EMULATED" : "real", dense_used / 1073741824.0, d_head ? "" : " (lm_head stays on the host: no room)",
                  pool.size(), (double) slot_bytes / 1048576.0, 100.0 * (double) pool.size() / ((double) c.layers * c.n_exp), c.layers * c.n_exp);
     preload_start();
+    ram_pin_start();
     if (o.preload_wait) {
         const auto t0 = std::chrono::steady_clock::now();
         preload_wait();
@@ -777,6 +785,47 @@ void Model::Impl::preload_start() {
 void Model::Impl::preload_join() {
     pre_stop.store(true);
     if (pre_th.joinable()) pre_th.join();
+    if (ram_th.joinable()) ram_th.join();
+}
+
+// Page-locks the four expert tensors (gate/up blocks+scales, down blocks+scales) of whole layers, the layers the profile
+// uses most first, until --pin-ram-gib is spent. WHOLE tensors, not single experts: gpu::h2d_copy_async only takes the
+// direct-DMA path when the copied range lies inside ONE registered range, and one expert's slice is not page aligned.
+// Registering reads the pages in (the weights are a file mapping), so it runs in the background; a copy that
+// finds its range not registered yet goes through the staging buffers as before.
+void Model::Impl::ram_pin_run() {
+    gpu::bind_thread();
+    const size_t H = (size_t) c.hidden, I = (size_t) c.moe_ff, G1 = H / 32, G2 = I / 32, NE = (size_t) c.n_exp;
+    const size_t sz[4] = { NE * 2 * I * G1 * 16, NE * 2 * I * G1, NE * H * G2 * 16, NE * H * G2 };
+    const size_t per_layer = sz[0] + sz[1] + sz[2] + sz[3];
+    const size_t budget = (size_t) (o.pin_ram_gib * 1073741824.0);
+    std::vector<std::pair<uint64_t, int>> order;
+    for (int l = 0; l < c.layers; ++l) {
+        uint64_t u = 0;
+        for (size_t e = 0; e < NE; ++e) u += usage[(size_t) l * NE + e];
+        order.push_back({u, l});
+    }
+    std::stable_sort(order.begin(), order.end(), [](const std::pair<uint64_t, int>& a, const std::pair<uint64_t, int>& b) { return a.first > b.first; });
+    bool failed = false;
+    size_t used = 0, n = 0;
+    for (const auto& pr : order) {
+        if (pre_stop.load() || used + per_layer > budget) break;
+        const Layer& y = L[(size_t) pr.second];
+        const void* p[4] = { y.gu.blocks, y.gu.scales, y.dn.blocks, y.dn.scales };
+        for (int k = 0; k < 4 && !failed; ++k) failed = !gpu::host_register(p[k], sz[k]);
+        if (failed) break;
+        used += per_layer; ++n;
+        ram_layers.store(n); ram_bytes.store(used);
+    }
+    if (failed) std::fprintf(stderr, "gptoss: page-locking stopped after %zu layers (%.1f GiB): %s\n", n, (double) used / 1073741824.0, gpu::last_error().c_str());
+    else std::fprintf(stderr, "gptoss: page-locked the experts of %zu layers (%.1f GiB of RAM): their copies are direct DMA\n", n, (double) used / 1073741824.0);
+    ram_state.store(failed ? 3 : 2);
+}
+
+void Model::Impl::ram_pin_start() {
+    if (!(o.pin_ram_gib > 0) || !gpu_on) return;
+    ram_state.store(1);
+    ram_th = std::thread([this] { ram_pin_run(); });
 }
 
 void Model::Impl::preload_wait() {
@@ -1237,6 +1286,7 @@ pdev::Cfg Model::Impl::pdev_cfg() const {
 int Model::Impl::prefill_pdev(const int* tokens, int n, int start_pos, std::vector<float>* logits_last) {
     const int H = c.hidden, E = c.n_exp, K = c.topk;
     std::vector<float> X, Gl;
+    preload_wait();   // the background preload holds every slot busy until it is done: starting now, no slot can take an expert and the device prefill gives up
     std::vector<int32_t> IDX;
     std::vector<float> WT;
     for (int c0 = 0; c0 < n && pdev_on; c0 += chunk_max) {
@@ -1245,6 +1295,32 @@ int Model::Impl::prefill_pdev(const int* tokens, int n, int start_pos, std::vect
         IDX.assign((size_t) T * K, 0); WT.assign((size_t) T * K, 0.0f);
 #pragma omp parallel for schedule(static)
         for (int t = 0; t < T; ++t) for (int i = 0; i < H; ++i) X[(size_t) t * H + i] = bf16_to_f32(((const uint16_t*) embed.p)[(size_t) tokens[c0 + t] * H + i]);
+        // A device failure in the middle of a chunk leaves the banded layers' rings half overwritten with this chunk's rows
+        // (kv_store_back already ran for layers < l), and the host fallback recomputes the chunk from the OLD window in those
+        // rings: it would read newer rows where it needs older ones. Snapshot the old window; restore it on any early return.
+        struct RingSnap { Layer* y; std::vector<float> k, v; };
+        std::vector<RingSnap> snap;
+        const int w0 = std::max(0, p0 - c.window + 1);
+        if (p0 > w0) for (auto& yy : L) if (yy.sliding) {
+            RingSnap r; r.y = &yy;
+            const size_t KDn = (size_t) c.kv_dim();
+            r.k.resize((size_t) (p0 - w0) * KDn); r.v.resize(r.k.size());
+            for (int u = w0; u < p0; ++u) {
+                std::memcpy(&r.k[(size_t) (u - w0) * KDn], &yy.K[yy.slot(u) * KDn], sizeof(float) * KDn);
+                std::memcpy(&r.v[(size_t) (u - w0) * KDn], &yy.V[yy.slot(u) * KDn], sizeof(float) * KDn);
+            }
+            snap.push_back(std::move(r));
+        }
+        struct SnapGuard {
+            std::vector<RingSnap>& sn; int w0, p0, KD; bool ok = false;
+            ~SnapGuard() {
+                if (ok) return;
+                for (auto& r : sn) for (int u = w0; u < p0; ++u) {
+                    std::memcpy(&r.y->K[r.y->slot(u) * (size_t) KD], &r.k[(size_t) (u - w0) * (size_t) KD], sizeof(float) * (size_t) KD);
+                    std::memcpy(&r.y->V[r.y->slot(u) * (size_t) KD], &r.v[(size_t) (u - w0) * (size_t) KD], sizeof(float) * (size_t) KD);
+                }
+            }
+        } guard{snap, w0, p0, c.kv_dim()};
         if (!pdev::x_upload(X.data(), T)) { pdev_fail_("x upload"); return c0; }
         for (int l = 0; l < c.layers && pdev_on; ++l) {
             Layer& y = L[(size_t) l];
@@ -1294,6 +1370,7 @@ int Model::Impl::prefill_pdev(const int* tokens, int n, int start_pos, std::vect
         pdev::advance(T);
         if (!pdev::x_download(X.data(), T)) { pdev_fail_("x download"); return c0; }
         if (!pdev::sync_all()) { pdev_fail_("sync"); return c0; }   // the K/V rows are back in the host cache before anything reads it
+        guard.ok = true;
         if ((int) cached.size() > p0) cached.resize((size_t) p0);
         for (int t = 0; t < T; ++t) if ((int) cached.size() == p0 + t) cached.push_back(tokens[c0 + t]);
         if (logits_last && c0 + T == n) {
@@ -1557,6 +1634,11 @@ std::string Model::stats() const {
     if (s.pre_state.load() != 0) {
         const char* st[] = {"off", "running", "done", "stopped on an error"};
         std::snprintf(b, sizeof b, ", preload %zu/%zu (%s)", s.pre_done.load(), s.pre_targets.size(), st[s.pre_state.load()]);
+        r += b;
+    }
+    if (s.ram_state.load() != 0) {
+        const char* st[] = {"off", "running", "done", "stopped on an error"};
+        std::snprintf(b, sizeof b, ", page-locked %zu layers %.1f GiB (%s)", s.ram_layers.load(), (double) s.ram_bytes.load() / 1073741824.0, st[s.ram_state.load()]);
         r += b;
     }
     return r;
