@@ -78,6 +78,7 @@ int main(int argc, char** argv) {
         else if (a == "--no-gpu-attn") o.gpu_attn = false;
         else if (a == "--no-preload") o.preload = false;
         else if (a == "--preload-wait") o.preload_wait = true;
+        else if (a == "--pin-ram-gib") o.pin_ram_gib = std::atof(val());
         else if (a == "--expert-profile") o.expert_profile = val();
         else if (a == "--expert-profile-save") o.expert_profile_save = val();
         else if (a == "--expert-profile-save-every") o.expert_profile_save_every = std::atof(val());
