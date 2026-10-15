@@ -95,10 +95,11 @@ struct Model::Impl {
     std::atomic<size_t> pre_done{0};
     std::atomic<int> pre_state{0};                     // 0 off, 1 running, 2 done, 3 stopped on an error
     // --- --pin-ram-gib: page-lock the expert tensors of the busiest layers so every copy out of them is a direct DMA
-    std::thread ram_th;
+    std::vector<void*> ram_blocks;                     // page-locked copies of whole layers' expert tensors (freed at exit)
     std::atomic<size_t> ram_layers{0};                 // layers registered so far
     std::atomic<size_t> ram_bytes{0};
     std::atomic<int> ram_state{0};                     // 0 off, 1 running, 2 done, 3 stopped on an error
+    int pdev_kv_pos = 0;                               // the same watermark for the pdev (prefill_dev.cu) mirror, which is separate from attn_dev's
     int dev_kv_pos = 0;                                // positions [0, dev_kv_pos) of the device KV are known to equal the host KV (decode writes the host only)
     int dev_kfmt = 2, dev_vfmt = 2;                        // formats the DEVICE KV cache is packed in (the emulated device keeps f32)
 
@@ -140,7 +141,6 @@ struct Model::Impl {
     void preload_start();
     void preload_join();
     void preload_wait();
-    void ram_pin_run();
     void ram_pin_start();
 };
 
@@ -152,6 +152,7 @@ Model::~Model() {
     if (s.hits + s.host_served + s.pcie_served) std::fprintf(stderr, "gptoss: expert slots (%zu): %llu hits, %llu over PCIe, %llu on the host\n", s.pool.size(),
                    (unsigned long long) s.hits, (unsigned long long) s.pcie_served, (unsigned long long) s.host_served);
     pdev::shutdown();                                // its buffers are separate allocations; free them before the process exits
+    for (void* b : s.ram_blocks) gpu::host_free(b);
     for (auto& sl : s.pool) gpu::release(sl.base);
     for (auto& y : s.L) { gpu::release(y.dq); gpu::release(y.dk); gpu::release(y.dv); gpu::release(y.dobj); gpu::release(y.drt); }
     gpu::release(s.d_head);
@@ -159,7 +160,7 @@ Model::~Model() {
 }
 const GptConfig& Model::config() const { return p_->c; }
 uint64_t Model::weight_bytes() const { return p_->st.total_bytes(); }
-void Model::reset() { p_->cached.clear(); p_->dev_kv_pos = 0; }
+void Model::reset() { p_->cached.clear(); p_->dev_kv_pos = 0; p_->pdev_kv_pos = 0; }
 void Model::preload_wait() { p_->preload_wait(); }
 bool Model::gpu_attention() const { return p_->attn_dev && p_->gpu_on; }
 int Model::cached_len() const { return (int) p_->cached.size(); }
@@ -578,8 +579,8 @@ bool Model::Impl::gpu_setup(std::string& err) {
     std::fprintf(stderr, "gptoss: CUDA device '%s' (%s): dense weights %.2f GiB on device%s, %zu expert slots of %.2f MiB (%.0f%% of the %d experts)\n",
                  gpu::device_name(), gpu::is_emulated() ? "EMULATED" : "real", dense_used / 1073741824.0, d_head ? "" : " (lm_head stays on the host: no room)",
                  pool.size(), (double) slot_bytes / 1048576.0, 100.0 * (double) pool.size() / ((double) c.layers * c.n_exp), c.layers * c.n_exp);
+    ram_pin_start();   // before the preload: it then reads the pinned copies
     preload_start();
-    ram_pin_start();
     if (o.preload_wait) {
         const auto t0 = std::chrono::steady_clock::now();
         preload_wait();
@@ -785,16 +786,15 @@ void Model::Impl::preload_start() {
 void Model::Impl::preload_join() {
     pre_stop.store(true);
     if (pre_th.joinable()) pre_th.join();
-    if (ram_th.joinable()) ram_th.join();
 }
 
-// Page-locks the four expert tensors (gate/up blocks+scales, down blocks+scales) of whole layers, the layers the profile
-// uses most first, until --pin-ram-gib is spent. WHOLE tensors, not single experts: gpu::h2d_copy_async only takes the
-// direct-DMA path when the copied range lies inside ONE registered range, and one expert's slice is not page aligned.
-// Registering reads the pages in (the weights are a file mapping), so it runs in the background; a copy that
-// finds its range not registered yet goes through the staging buffers as before.
-void Model::Impl::ram_pin_run() {
-    gpu::bind_thread();
+// --pin-ram-gib: copies the expert tensors of whole layers (the layers the profile uses most first) into page-locked host
+// memory and points the layer at the copy, until the budget is spent. This is the way that works on every card: registering the
+// weights' file mapping in place (cudaHostRegister) needs the read-only flag that GeForce drivers often refuse. It runs at load,
+// BEFORE the preload and before any request, so nothing reads the old pointers while they move. Copies out of the pinned blocks
+// are direct DMA, and the CPU kernels read them as before.
+void Model::Impl::ram_pin_start() {
+    if (!(o.pin_ram_gib > 0) || !gpu_on) return;
     const size_t H = (size_t) c.hidden, I = (size_t) c.moe_ff, G1 = H / 32, G2 = I / 32, NE = (size_t) c.n_exp;
     const size_t sz[4] = { NE * 2 * I * G1 * 16, NE * 2 * I * G1, NE * H * G2 * 16, NE * H * G2 };
     const size_t per_layer = sz[0] + sz[1] + sz[2] + sz[3];
@@ -806,26 +806,26 @@ void Model::Impl::ram_pin_run() {
         order.push_back({u, l});
     }
     std::stable_sort(order.begin(), order.end(), [](const std::pair<uint64_t, int>& a, const std::pair<uint64_t, int>& b) { return a.first > b.first; });
-    bool failed = false;
+    ram_state.store(1);
+    const auto t0 = std::chrono::steady_clock::now();
     size_t used = 0, n = 0;
+    bool failed = false;
     for (const auto& pr : order) {
-        if (pre_stop.load() || used + per_layer > budget) break;
-        const Layer& y = L[(size_t) pr.second];
-        const void* p[4] = { y.gu.blocks, y.gu.scales, y.dn.blocks, y.dn.scales };
-        for (int k = 0; k < 4 && !failed; ++k) failed = !gpu::host_register(p[k], sz[k]);
-        if (failed) break;
+        if (used + per_layer > budget) break;
+        uint8_t* buf = (uint8_t*) gpu::host_alloc(per_layer);
+        if (!buf) { failed = true; break; }
+        Layer& y = L[(size_t) pr.second];
+        const uint8_t* src[4] = { y.gu.blocks, y.gu.scales, y.dn.blocks, y.dn.scales };
+        size_t off = 0;
+        for (int k = 0; k < 4; ++k) { std::memcpy(buf + off, src[k], sz[k]); off += sz[k]; }
+        y.gu.blocks = buf; y.gu.scales = buf + sz[0]; y.dn.blocks = buf + sz[0] + sz[1]; y.dn.scales = buf + sz[0] + sz[1] + sz[2];
+        ram_blocks.push_back(buf);
         used += per_layer; ++n;
         ram_layers.store(n); ram_bytes.store(used);
     }
-    if (failed) std::fprintf(stderr, "gptoss: page-locking stopped after %zu layers (%.1f GiB): %s\n", n, (double) used / 1073741824.0, gpu::last_error().c_str());
-    else std::fprintf(stderr, "gptoss: page-locked the experts of %zu layers (%.1f GiB of RAM): their copies are direct DMA\n", n, (double) used / 1073741824.0);
-    ram_state.store(failed ? 3 : 2);
-}
-
-void Model::Impl::ram_pin_start() {
-    if (!(o.pin_ram_gib > 0) || !gpu_on) return;
-    ram_state.store(1);
-    ram_th = std::thread([this] { ram_pin_run(); });
+    std::fprintf(stderr, "gptoss: %zu layers of experts in page-locked RAM (%.1f GiB, %.0f s)%s: their copies to the card are direct DMA\n", n, (double) used / 1073741824.0,
+                 std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(), failed ? "; the system would not give more pinned memory" : "");
+    ram_state.store(failed && n == 0 ? 3 : 2);
 }
 
 void Model::Impl::preload_wait() {
@@ -1286,6 +1286,7 @@ pdev::Cfg Model::Impl::pdev_cfg() const {
 int Model::Impl::prefill_pdev(const int* tokens, int n, int start_pos, std::vector<float>* logits_last) {
     const int H = c.hidden, E = c.n_exp, K = c.topk;
     std::vector<float> X, Gl;
+    pdev::kv_trim(pdev_kv_pos);   // what the decode / a checkpoint wrote into the host KV since the last device prefill is not on the card
     preload_wait();   // the background preload holds every slot busy until it is done: starting now, no slot can take an expert and the device prefill gives up
     std::vector<int32_t> IDX;
     std::vector<float> WT;
@@ -1371,6 +1372,7 @@ int Model::Impl::prefill_pdev(const int* tokens, int n, int start_pos, std::vect
         if (!pdev::x_download(X.data(), T)) { pdev_fail_("x download"); return c0; }
         if (!pdev::sync_all()) { pdev_fail_("sync"); return c0; }   // the K/V rows are back in the host cache before anything reads it
         guard.ok = true;
+        pdev_kv_pos = p0 + T;
         if ((int) cached.size() > p0) cached.resize((size_t) p0);
         for (int t = 0; t < T; ++t) if ((int) cached.size() == p0 + t) cached.push_back(tokens[c0 + t]);
         if (logits_last && c0 + T == n) {
@@ -1391,6 +1393,7 @@ void Model::forward(int token, int pos, std::vector<float>* logits_out) {
     std::vector<float> x((size_t) H), acc((size_t) H);
     for (int i = 0; i < H; ++i) x[(size_t) i] = bf16_to_f32(((const uint16_t*) s.embed.p)[(size_t) token * H + i]);
     Work& w = s.works[0];
+    if (s.pdev_kv_pos > pos) s.pdev_kv_pos = pos;
     if (s.dev_kv_pos > pos) s.dev_kv_pos = pos;            // decode writes the host KV only: the device copy is valid up to here
     for (int l = 0; l < c.layers; ++l) {
         Layer& L = s.L[(size_t) l];
@@ -1546,6 +1549,7 @@ bool Model::load_kv(const std::string& path, std::string& err) {
     std::fclose(f);
     if (!ok) { s.cached.clear(); err = "truncated checkpoint"; return false; }
     s.cached = std::move(toks);
+    s.pdev_kv_pos = 0;
     s.dev_kv_pos = 0;                                  // the host KV was replaced: the device copy is re-uploaded at the next prefill
     return true;
 }

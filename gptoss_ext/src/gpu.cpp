@@ -192,6 +192,8 @@ bool event_sync(int) { return true; }
 bool h2d_copy_async(void* d, const void* h, size_t n) { std::memcpy(d, h, n); return true; }
 bool event_record_copy(int) { return true; }
 bool host_register(const void*, size_t) { return true; }
+void* host_alloc(size_t n) { return std::malloc(n ? n : 1); }
+void host_free(void* p) { std::free(p); }
 
 }  // namespace gpu
 }  // namespace gptoss

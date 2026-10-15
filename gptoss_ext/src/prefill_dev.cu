@@ -84,6 +84,7 @@ struct KVDev {
     long long valid = 0;            // dense: leading rows already mirrored on the card
     int base = 0;                   // banded: the card holds the linear window [base, base+cap)
     int cov_lo = 0, cov_hi = 0;     // positions already mirrored (banded), to skip needless uploads
+    int cbase = 0;                  // banded: the `base` the rows now on the card were written with (a row sits at p - cbase)
 };
 std::vector<KVDev> g_kv;
 
@@ -806,6 +807,9 @@ bool kv_prefetch(int layer, const float* host_K, const float* host_V, int cap, b
         if (base > lo) base = lo;
         if (base < 0) base = 0;
         kv.base = base;
+        // The card rows of a banded layer sit at (p - base). When the window moved (base changed since the rows were written)
+        // every mirrored row is at the wrong index: forget the coverage so the window is rebuilt from the host cache below.
+        if (base != kv.cbase) { kv.cbase = base; kv.cov_lo = kv.cov_hi = base; }
         const int n = pos0 - base;
         if (n <= 0) return true;
         if (base >= kv.cov_lo && pos0 <= kv.cov_hi) return true;   // already mirrored
@@ -814,11 +818,24 @@ bool kv_prefetch(int layer, const float* host_K, const float* host_V, int cap, b
         kv.cov_hi = std::max(kv.cov_hi, pos0);
         return true;
     }
+    if (kv.valid > pos0) kv.valid = pos0;   // a rewind: rows from pos0 on are about to be rewritten, none of them is trusted any more
     if ((long long) pos0 > kv.valid) {
         if (!move_kv(layer, host_K, host_V, cap, false, (int) kv.valid, pos0 - (int) kv.valid, cudaMemcpyHostToDevice)) return false;
         kv.valid = pos0;
     }
     return true;
+}
+
+// The host cache was written by the decode (or replaced by a checkpoint) from position `pos` on: whatever the card mirrors
+// at or past it is stale. Dense layers lower their watermark; banded layers shorten the covered range, so the next
+// prefetch rebuilds the window from the host cache.
+void kv_trim(int pos) {
+    if (pos < 0) pos = 0;
+    for (KVDev& kv : g_kv) {
+        if (kv.valid > pos) kv.valid = pos;
+        if (kv.cov_hi > pos) kv.cov_hi = pos;
+        if (kv.cov_lo > kv.cov_hi) kv.cov_lo = kv.cov_hi;
+    }
 }
 
 bool run_layer(const Cfg& cfg, int layer, const LayerIO& w, int T, int pos0, bool sliding, float* router_logits) {

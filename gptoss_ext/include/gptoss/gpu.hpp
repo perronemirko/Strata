@@ -62,6 +62,8 @@ bool event_sync(int ev);                     // host waits for the event
 bool h2d_copy_async(void* dev, const void* host, size_t n);   // on the copy stream; direct DMA if the host range was registered, else through pinned staging
 bool event_record_copy(int ev);              // records `ev` after every copy issued so far on the copy stream
 bool host_register(const void* p, size_t n); // page-locks a host range (read-only) so copies from it are true DMA; pages inside only
+void* host_alloc(size_t n);                  // page-locked host memory (cudaMallocHost); nullptr when it cannot be had. Never touches last_error()
+void host_free(void* p);
 
 // ---- device-resident activations (batched prefill with ATTENTION on the device). Every pointer here is a DEVICE pointer (gpu::alloc) unless named h*.
 // The calls are ordered on the compute stream; d2h waits. A failure sets last_error() and returns false.

@@ -55,6 +55,7 @@ bool x_upload(const float* hx, int T);              // chunk's residual stream u
 bool x_download(float* hx, int T);                  // and back down, after the layer loop
 
 bool kv_prefetch(int layer, const float* host_K, const float* host_V, int cap, bool sliding, int pos0);
+void kv_trim(int pos);                              // the host KV changed from `pos` on (decode, checkpoint): the card's mirror is stale from there
 bool run_layer(const Cfg& cfg, int layer, const LayerIO& w, int T, int pos0, bool sliding, float* router_logits);
 void kv_store_back(int layer, float* host_K, float* host_V, int cap, bool sliding, int T, int pos0);
 
