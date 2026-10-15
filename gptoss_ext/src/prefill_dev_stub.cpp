@@ -19,6 +19,7 @@ bool x_download(float*, int) { return false; }
 bool kv_prefetch(int, const float*, const float*, int, bool, int) { return false; }
 bool run_layer(const Cfg&, int, const LayerIO&, int, int, bool, float*) { return false; }
 void kv_store_back(int, float*, float*, int, bool, int, int) {}
+void kv_trim(int) {}
 bool run_experts(const Cfg&, int, const ExpertPtrs*, const int*, const int*, const float*, const int32_t*) { return false; }
 void advance(int) {}
 bool sync_all() { return false; }
