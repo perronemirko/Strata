@@ -457,7 +457,9 @@ namespace gptoss
                     X[i] += (A ? A[i] : 0.0f) + (b ? b[i % (size_t)H] : 0.0f);
             }
 
-            // bias + RoPE, in place, on the heads of q (hh < heads) and k (hh >= heads); the rotated k is also written to the K cache slot of its position.
+            // bias + RoPE, in place, on the heads of q (hh < heads) and k (hh >= heads). The rotated k stays in the
+            // fp32 stage: qk_rope_kv packs it into the card's KV format right after, so no fp32 row is ever written
+            // to the cache. Kc == nullptr keeps the stage only.
             __global__ void k_qk_rope(float *__restrict__ q, float *__restrict__ k, const float *__restrict__ bq, const float *__restrict__ bk, const float *__restrict__ cs,
                                       const float *__restrict__ sn, int N, int p0, int heads, int kv_heads, int D, int sliding, int cap, int pairs, float *__restrict__ Kc)
             {
@@ -480,7 +482,7 @@ namespace gptoss
                     const float r1 = pairs ? a * s + b * c : b * c + a * s;
                     p[ia] = r0;
                     p[ib] = r1;
-                    if (!isq)
+                    if (!isq && Kc)
                     {
                         const size_t slot = sliding ? (size_t)(pos % cap) : (size_t)pos;
                         float *kc = Kc + slot * kv_heads * D + (size_t)kh * D;
@@ -490,21 +492,99 @@ namespace gptoss
                 }
             }
 
-            __global__ void k_v_write(const float *__restrict__ v, const float *__restrict__ bv, int N, int p0, int KD, int sliding, int cap, float *__restrict__ Vc)
+            // The v bias lands in the fp32 stage (in place); qk_rope_kv then packs that stage into the card's
+            // V format. v == dst: each element is touched exactly once, so the in-place add is safe.
+            __global__ void k_v_bias(float *__restrict__ v, const float *__restrict__ bv, int N, int KD)
             {
                 const size_t total = (size_t)N * KD;
                 for (size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x; idx < total; idx += (size_t)gridDim.x * blockDim.x)
-                {
-                    const int t = (int)(idx / KD), j = (int)(idx % KD);
-                    const int pos = p0 + t;
-                    const size_t slot = sliding ? (size_t)(pos % cap) : (size_t)pos;
-                    Vc[slot * KD + j] = v[idx] + bv[j];
-                }
+                    v[idx] += bv[idx % KD];
             }
 
-            // One warp per (token, head): online softmax over the visible keys (the sink starts the running max / denominator, it has no value), so no score buffer
-            // is needed and any context length works. Lane l owns dimensions l, l+32, ... (D % 32 == 0, D <= 128).
-            __global__ void k_attn(const float *__restrict__ q, const float *__restrict__ Kc, const float *__restrict__ Vc, const float *__restrict__ sinks, int p0, int heads,
+            // ---- KV pack / unpack on the card: rows of an fp32 stage -> the packed cache, one power-of-two
+            // scale per row (shared by that row's kv_heads). dst/iscl are addressed by SLOT, so a banded
+            // layer's run that wraps the ring still lands in the right slots.
+            __device__ __forceinline__ float kv_row_scale(float peak, float limit)
+            {
+                if (!(peak > 0.0f) || !(limit > 0.0f))
+                    return 1.0f;
+                const float s = exp2f(floorf(log2f(peak / limit)));
+                if (!(s > 1e-18f))
+                    return 1.0f;
+                return (s > 1.0f) ? 1.0f : s;
+            }
+
+            __device__ __forceinline__ float kv_row_scale_inv(float scale)
+            {
+                return (scale > 0.0f) ? 1.0f / scale : 1.0f;
+            }
+
+            __device__ __forceinline__ float block_amax(float v, float *__restrict__ red, int nt)
+            {
+                for (int o = 16; o > 0; o >>= 1)
+                    v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, o));
+                const int w = threadIdx.x >> 5;
+                if ((threadIdx.x & 31) == 0)
+                    red[w] = v;
+                __syncthreads();
+                const int nw = nt >> 5;
+                float tot = 0.0f;
+                for (int i = 0; i < nw; ++i)
+                    tot = fmaxf(tot, red[i]);
+                __syncthreads();
+                return tot;
+            }
+
+            template <typename T_OUT>
+            __global__ void k_kv_pack_at(const float *__restrict__ stage, T_OUT *__restrict__ dst, float *__restrict__ iscl,
+                                         int rows, int p0, int kd, int cap, int sliding, float limit)
+            {
+                __shared__ float red[8];
+                const int r = blockIdx.x;
+                if (r >= rows)
+                    return;
+                const int slot = sliding ? (p0 + r) % cap : p0 + r;
+                const float *p = stage + (size_t)r * kd;
+                float amax = 0.0f;
+                for (int i = threadIdx.x; i < kd; i += blockDim.x)
+                    amax = fmaxf(amax, fabsf(p[i]));
+                amax = block_amax(amax, red, (int)blockDim.x);
+                const float sc = kv_row_scale(amax, limit);
+                const float isc = kv_row_scale_inv(sc);
+                if (threadIdx.x == 0 && iscl)
+                    iscl[slot] = isc;
+                T_OUT *d = dst + (size_t)slot * kd;
+                for (int i = threadIdx.x; i < kd; i += blockDim.x)
+                    d[i] = gpu::pack_fp32_to_target<T_OUT>(p[i], isc);
+            }
+
+            template <typename T_IN>
+            __global__ void k_kv_unpack_at(const T_IN *__restrict__ src, const float *__restrict__ iscl, float *__restrict__ dst,
+                                           int rows, int p0, int kd, int cap, int sliding)
+            {
+                const int r = blockIdx.x;
+                if (r >= rows)
+                    return;
+                const int slot = sliding ? (p0 + r) % cap : p0 + r;
+                const float isc = iscl ? iscl[slot] : 1.0f;
+                const T_IN *p = src + (size_t)slot * kd;
+                float *d = dst + (size_t)r * kd;
+                for (int i = threadIdx.x; i < kd; i += blockDim.x)
+                    d[i] = gpu::unpack_target_to_fp32<T_IN>(p[i], isc);
+            }
+
+            // One warp per (token, head): online softmax over the visible keys (the sink starts the running max /
+            // denominator, it has no value), so no score buffer is needed and any context length works. Lane l owns
+            // dimensions l, l+32, ... (D % 32 == 0, D <= 128).
+            //
+            // ON-THE-FLY DEQUANTIZATION: T_K / T_V are the formats chosen INDEPENDENTLY by -k / -v. The cache rows
+            // are PACKED (e4m3 = 1B, half = 2B, float = 4B); the kernel reads those bytes and converts them into
+            // registers, so the fp32 rows never exist in VRAM and the PCIe bus carries 1/4 or 1/2 the bytes.
+            // kinv/vinv hold one power-of-two inverse scale per row (null = 1.0, the F32 case).
+            template <typename T_K, typename T_V>
+            __global__ void k_attn(const float *__restrict__ q, const T_K *__restrict__ Kc, const T_V *__restrict__ Vc,
+                                   const float *__restrict__ kinv, const float *__restrict__ vinv,
+                                   const float *__restrict__ sinks, int p0, int heads,
                                    int kv_heads, int D, int window, int cap, int sliding, float scale, float *__restrict__ out)
             {
                 const int t = blockIdx.x, hd = blockIdx.y, lane = threadIdx.x;
@@ -522,24 +602,25 @@ namespace gptoss
                 for (int u = lo; u <= pos; ++u)
                 {
                     const size_t slot = sliding ? (size_t)(u % cap) : (size_t)u;
-                    const float *kr = Kc + slot * KD + (size_t)g * D;
+                    const T_K *kr = Kc + slot * KD + (size_t)g * D;
+                    const float kisc = kinv ? kinv[slot] : 1.0f;
                     float s = 0.0f;
 #pragma unroll
                     for (int i = 0; i < 4; ++i)
                         if (i < nv)
-                            s += qv[i] * kr[lane + 32 * i];
+                            s += qv[i] * gpu::unpack_target_to_fp32<T_K>(kr[lane + 32 * i], kisc);
 #pragma unroll
                     for (int o = 16; o > 0; o >>= 1)
                         s += __shfl_xor_sync(0xffffffffu, s, o);
                     s *= scale;
-                    const float mn = fmaxf(m, s);
-                    const float a = expf(m - mn), p = expf(s - mn);
+                    const float mn = fmaxf(m, s), a = expf(m - mn), p = expf(s - mn);
                     l = l * a + p;
-                    const float *vr = Vc + slot * KD + (size_t)g * D;
+                    const T_V *vr = Vc + slot * KD + (size_t)g * D;
+                    const float visc = vinv ? vinv[slot] : 1.0f;
 #pragma unroll
                     for (int i = 0; i < 4; ++i)
                         if (i < nv)
-                            acc[i] = acc[i] * a + p * vr[lane + 32 * i];
+                            acc[i] = acc[i] * a + p * gpu::unpack_target_to_fp32<T_V>(vr[lane + 32 * i], visc);
                     m = mn;
                 }
                 const float inv = 1.0f / l;
@@ -548,6 +629,23 @@ namespace gptoss
                     if (i < nv)
                         out[(size_t)t * QD + (size_t)hd * D + lane + 32 * i] = acc[i] * inv;
             }
+
+        void *g_kv_scratch = nullptr;   // device staging for the host<->card KV rows (grown on demand)
+        size_t g_kv_scratch_n = 0;      // bytes held
+
+        static bool kv_ensure_scratch(size_t bytes)
+        {
+            if (bytes <= g_kv_scratch_n)
+                return true;
+            if (g_kv_scratch)
+                cudaFree(g_kv_scratch);
+            g_kv_scratch = nullptr;
+            if (!ck(cudaMalloc(&g_kv_scratch, bytes), "kv scratch"))
+                return false;
+            g_kv_scratch_n = bytes;
+            return true;
+        }
+
 
             unsigned grid1d(size_t total, int block) { return (unsigned)std::min<size_t>((total + block - 1) / block, 65535); }
 
@@ -958,6 +1056,9 @@ namespace gptoss
 
         bool attn_supported(const AttnShape &a) { return a.D % 32 == 0 && a.D <= 128 && a.heads % a.kv_heads == 0 && a.cap > 0; }
 
+        // The rotated k and the biased v stay in the fp32 stage (dk / dv, in place); this call then packs those
+        // rows into the card's formats (a.k_fmt / a.v_fmt, chosen INDEPENDENTLY by -k / -v) and writes the row's
+        // inverse scale. With F32 the pack is skipped and the stage IS the cache, exactly as before.
         bool qk_rope_kv(float *dq, float *dk, const float *dv, const float *dbq, const float *dbk, const float *dbv, const float *dcos, const float *dsin,
                         int N, int p0, const AttnShape &a, float *dKc, float *dVc)
         {
@@ -969,12 +1070,57 @@ namespace gptoss
                 g_err = "qk_rope_kv: unsupported shape";
                 return false;
             }
+            const int KD = a.kv_heads * a.D;
             const size_t items = (size_t)N * (a.heads + a.kv_heads) * (a.D / 2);
-            k_qk_rope<<<grid1d(items, 256), 256, 0, g_comp>>>(dq, dk, dbq, dbk, dcos, dsin, N, p0, a.heads, a.kv_heads, a.D, a.sliding ? 1 : 0, a.cap, a.rope_pairs ? 1 : 0, dKc);
+            k_qk_rope<<<grid1d(items, 256), 256, 0, g_comp>>>((float *)dq, (float *)dk, dbq, dbk, dcos, dsin, N, p0, a.heads, a.kv_heads, a.D, a.sliding ? 1 : 0, a.cap, a.rope_pairs ? 1 : 0, nullptr);
             if (!ck(cudaGetLastError(), "k_qk_rope launch"))
                 return false;
-            k_v_write<<<grid1d((size_t)N * a.kv_heads * a.D, 256), 256, 0, g_comp>>>(dv, dbv, N, p0, a.kv_heads * a.D, a.sliding ? 1 : 0, a.cap, dVc);
-            return ck(cudaGetLastError(), "k_v_write launch");
+            k_v_bias<<<grid1d((size_t)N * KD, 256), 256, 0, g_comp>>>((float *)dv, dbv, N, KD);
+            if (!ck(cudaGetLastError(), "k_v_bias launch"))
+                return false;
+            // F32 on one side still needs the rows copied into that side's cache: with the stage being a_K / a_V
+            // and the cache a separate buffer, the copy is the pack with fmt = F32 (a plain row copy).
+            auto pack = [&](int fmt, const float *stage, void *dst, float *iscl, float limit) {
+                if (fmt == 0) k_kv_pack_at<__nv_fp8_e4m3><<<(unsigned)std::min(N, 65535), 256, 0, g_comp>>>(stage, (__nv_fp8_e4m3 *)dst, iscl, N, p0, KD, a.cap, a.sliding ? 1 : 0, limit);
+                else if (fmt == 1) k_kv_pack_at<half><<<(unsigned)std::min(N, 65535), 256, 0, g_comp>>>(stage, (half *)dst, iscl, N, p0, KD, a.cap, a.sliding ? 1 : 0, limit);
+                else k_kv_pack_at<float><<<(unsigned)std::min(N, 65535), 256, 0, g_comp>>>(stage, (float *)dst, nullptr, N, p0, KD, a.cap, a.sliding ? 1 : 0, 0.0f);
+                return ck(cudaGetLastError(), "kv pack");
+            };
+            if (!pack(a.k_fmt, dk, dKc, a.dKinv, a.kv_limit))
+                return false;
+            return pack(a.v_fmt, dv, dVc, a.dVinv, a.kv_limit);
+        }
+
+        // Host fp32 rows -> the card's packed cache (what decode wrote since the last device prefill).
+        bool kv_upload_rows(int fmt, const void *host, void *dst, float *iscl, int rows, int p0, int kd, int cap, bool sliding, float limit)
+        {
+            if (!kv_ensure_scratch((size_t)rows * kd * 4)) return false;
+            if (rows <= 0)
+                return true;
+            if (!ck(cudaMemcpyAsync(g_kv_scratch, host, (size_t)rows * kd * 4, cudaMemcpyHostToDevice, g_comp), "kv stage h2d"))
+                return false;
+            if (fmt == 0) k_kv_pack_at<__nv_fp8_e4m3><<<(unsigned)std::min(rows, 65535), 256, 0, g_comp>>>((const float *)g_kv_scratch, (__nv_fp8_e4m3 *)dst, iscl, rows, p0, kd, cap, sliding ? 1 : 0, limit);
+            else if (fmt == 1) k_kv_pack_at<half><<<(unsigned)std::min(rows, 65535), 256, 0, g_comp>>>((const float *)g_kv_scratch, (half *)dst, iscl, rows, p0, kd, cap, sliding ? 1 : 0, limit);
+            else if (!ck(cudaMemcpy2DAsync(dst, (size_t)kd * 4, host, (size_t)kd * 4, (size_t)kd * 4, rows, cudaMemcpyHostToDevice, g_comp), "kv f32 h2d"))
+                return false;
+            return ck(cudaGetLastError(), "kv upload");
+        }
+
+        // The card's packed rows -> the host fp32 cache (the host copy is what decode / checkpoints / reuse read).
+        bool kv_download_rows(int fmt, void *host, const void *src, const float *iscl, int rows, int p0, int kd, int cap, bool sliding)
+        {
+            if (!kv_ensure_scratch((size_t)rows * kd * 4)) return false;
+            if (rows <= 0)
+                return true;
+            if (fmt == 0) k_kv_unpack_at<__nv_fp8_e4m3><<<(unsigned)std::min(rows, 65535), 256, 0, g_comp>>>((__nv_fp8_e4m3 *)src, iscl, (float *)g_kv_scratch, rows, p0, kd, cap, sliding ? 1 : 0);
+            else if (fmt == 1) k_kv_unpack_at<half><<<(unsigned)std::min(rows, 65535), 256, 0, g_comp>>>((half *)src, iscl, (float *)g_kv_scratch, rows, p0, kd, cap, sliding ? 1 : 0);
+            else if (!ck(cudaMemcpy2DAsync(host, (size_t)kd * 4, src, (size_t)kd * 4, (size_t)kd * 4, rows, cudaMemcpyDeviceToHost, g_comp), "kv f32 d2h"))
+                return true;
+            if (!ck(cudaGetLastError(), "kv unpack"))
+                return false;
+            if (fmt == 2)
+                return true;
+            return ck(cudaMemcpyAsync(host, g_kv_scratch, (size_t)rows * kd * 4, cudaMemcpyDeviceToHost, g_comp), "kv d2h");
         }
 
         bool attn_rows(const float *dq, const float *dKc, const float *dVc, const float *dsinks, int N, int p0, const AttnShape &a, float *dout)
@@ -987,8 +1133,19 @@ namespace gptoss
                 g_err = "attn_rows: unsupported shape";
                 return false;
             }
-            k_attn<<<dim3((unsigned)N, (unsigned)a.heads), 32, 0, g_comp>>>(dq, dKc, dVc, dsinks, p0, a.heads, a.kv_heads, a.D, a.window, a.cap, a.sliding ? 1 : 0,
-                                                                            1.0f / sqrtf((float)a.D), dout);
+            const float scale = 1.0f / sqrtf((float)a.D);
+#define ATTN(KT, VT) k_attn<KT, VT><<<dim3((unsigned)N, (unsigned)a.heads), 32, 0, g_comp>>>( \
+    dq, (const KT *)dKc, (const VT *)dVc, a.dKinv, a.dVinv, dsinks, p0, a.heads, a.kv_heads, a.D, a.window, a.cap, a.sliding ? 1 : 0, scale, dout)
+            if (a.k_fmt == 0 && a.v_fmt == 0) ATTN(__nv_fp8_e4m3, __nv_fp8_e4m3);
+            else if (a.k_fmt == 0 && a.v_fmt == 1) ATTN(__nv_fp8_e4m3, half);
+            else if (a.k_fmt == 1 && a.v_fmt == 0) ATTN(half, __nv_fp8_e4m3);
+            else if (a.k_fmt == 1 && a.v_fmt == 1) ATTN(half, half);
+            else if (a.k_fmt == 0) ATTN(__nv_fp8_e4m3, float);
+            else if (a.k_fmt == 1) ATTN(half, float);
+            else if (a.v_fmt == 0) ATTN(float, __nv_fp8_e4m3);
+            else if (a.v_fmt == 1) ATTN(float, half);
+            else ATTN(float, float);
+#undef ATTN
             return ck(cudaGetLastError(), "k_attn launch");
         }
 

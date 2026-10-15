@@ -143,6 +143,23 @@ bool attn_rows(const float* dq, const float* Kc, const float* Vc, const float* s
     return true;
 }
 
+// The emulated device keeps the KV cache in fp32 (it is the executable spec the tests run against): the
+// movers are plain strided copies and the Model never asks it for a packed format.
+bool kv_upload_rows(int, const void* host, void* dst, float*, int rows, int p0, int kd, int cap, bool sliding, float) {
+    for (int r = 0; r < rows; ++r) {
+        const size_t slot = sliding ? (size_t) (p0 + r) % (size_t) cap : (size_t) (p0 + r);
+        std::memcpy((char*) dst + slot * (size_t) kd * 4, (const float*) host + (size_t) r * kd, (size_t) kd * 4);
+    }
+    return true;
+}
+bool kv_download_rows(int, void* host, const void* src, const float*, int rows, int p0, int kd, int cap, bool sliding) {
+    for (int r = 0; r < rows; ++r) {
+        const size_t slot = sliding ? (size_t) (p0 + r) % (size_t) cap : (size_t) (p0 + r);
+        std::memcpy((float*) host + (size_t) r * kd, (const char*) src + slot * (size_t) kd * 4, (size_t) kd * 4);
+    }
+    return true;
+}
+
 // The emulated device has no streams: the work executes at once, and dense_collect just hands it back. Same
 // results as the host path, so the tests that compare against the CPU path still pass.
 bool dense_run_async(int ci, const float* hx, int N, const DenseOp* ops, int count) {
