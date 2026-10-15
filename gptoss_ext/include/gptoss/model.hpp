@@ -35,6 +35,7 @@ struct RunOpts {
     double pin_pct = 80;               // % of the expert slots reserved for the most-used experts of the profile (the rest is LRU for the others)
     bool preload = true;               // fill the expert slots in the background at startup (copy stream): pinned experts of the profile first, then the hottest, then layer order; --no-preload = pin synchronously, the rest fills on demand
     bool preload_wait = false;         // load() returns only when the preload is finished (benchmarks)
+    double pin_ram_gib = 0;            // GiB of expert weights to page-lock in RAM (0 = off)
     bool gpu_attn = true;              // device prefill keeps the activations and the KV cache in VRAM and runs attention there (needs every dense matmul on the device and the KV to fit); --no-gpu-attn turns it off
     int gpu_slots = -1;                // cap on the expert slots in VRAM (-1 = as many as the budget allows)
     // --- expert cache: three opt-in knobs that only move WHICH experts hold the slots, never how many slots there are.
