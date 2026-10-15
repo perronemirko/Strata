@@ -31,7 +31,8 @@ struct Layer {
     std::vector<float> K, V;                           // [cap][kv_dim]
     void *dq = nullptr, *dk = nullptr, *dv = nullptr, *dobj = nullptr, *drt = nullptr;   // device copies of the BF16 projections (null = host)
     float *d_in_ln = nullptr, *d_post_ln = nullptr, *d_bq = nullptr, *d_bk = nullptr, *d_bv = nullptr, *d_bo = nullptr, *d_sinks = nullptr;   // device copies (attention on the device)
-    float *dKc = nullptr, *dVc = nullptr;              // device KV cache of the layer, [cap][kv_dim] fp32, same slots as K / V (the host copy is kept in sync)
+    void *dKc = nullptr, *dVc = nullptr;              // device KV cache of the layer, [cap][kv_dim] PACKED by -k / -v (e4m3 = 1B, f16 = 2B, f32 = 4B); same slots as K / V
+    float *dKinv = nullptr, *dVinv = nullptr;         // device [cap] inverse scales, one power of two per row (null = f32, no rescaling)
     size_t slot(int pos) const { return sliding ? (size_t) pos % (size_t) cap : (size_t) pos; }
 };
 struct Work { std::vector<float> h, q, k, v, att, tmp, glog, y, gu, act, eb, sc, part; };   // part: [topk][H] per-expert contributions of one decode layer
@@ -94,6 +95,7 @@ struct Model::Impl {
     std::atomic<size_t> pre_done{0};
     std::atomic<int> pre_state{0};                     // 0 off, 1 running, 2 done, 3 stopped on an error
     int dev_kv_pos = 0;                                // positions [0, dev_kv_pos) of the device KV are known to equal the host KV (decode writes the host only)
+    int dev_kfmt = 2, dev_vfmt = 2;                        // formats the DEVICE KV cache is packed in (the emulated device keeps f32)
 
     void init_work(Work& w) const;
     Work& my_work();
@@ -612,8 +614,20 @@ bool Model::Impl::setup_attn_dev(double& budget) {
     probe.heads = c.heads; probe.kv_heads = c.kv_heads; probe.D = c.head_dim; probe.window = c.window; probe.cap = 1;
     if (!gpu::attn_supported(probe)) return no("the attention kernel needs head_dim a multiple of 32, at most 128");
     for (const auto& y : L) if (!y.dq || !y.dk || !y.dv || !y.dobj || !y.drt) return no("a dense matmul did not fit on the device");
+    // Dynamic byte math for the card's KV cache: the format comes from -k / -v, K and V INDEPENDENTLY.
+    const bool emu = gpu::is_emulated();
+    dev_kfmt = emu ? 2 : (int) o.key_format;
+    dev_vfmt = emu ? 2 : (int) o.value_format;
+    const size_t kb = get_kv_format_bytes((gptoss::KVFormat) dev_kfmt), vb = get_kv_format_bytes((gptoss::KVFormat) dev_vfmt);
+    const size_t single_layer_elements = (size_t) o.ctx * KD;   // ctx x kv_heads x head_dim
+    const size_t total_k_bytes = single_layer_elements * (size_t) c.layers * kb;
+    const size_t total_v_bytes = single_layer_elements * (size_t) c.layers * vb;
+    (void) total_k_bytes; (void) total_v_bytes;   // the same math a raw cudaMalloc pair would use
     double kvb = 0;
-    for (const auto& y : L) kvb += 2.0 * (double) y.cap * (double) KD * 4.0;
+    for (const auto& y : L) {
+        kvb += (double) y.cap * (double) KD * (double) (kb + vb);   // packed rows, not fp32
+        kvb += 2.0 * (double) y.cap * 4.0;                          // the two per-row scale arrays
+    }
     const double small = (double) c.layers * (double) (2 * H + QD + 2 * KD + H + (size_t) c.heads) * 4.0 + 2.0 * (double) o.ctx * (double) (D / 2) * 4.0;
     const double ppt = (double) (4 * H + 2 * QD + 2 * KD + E) * 4.0;                       // device bytes per token of the chunk
     const double room = budget * 0.45 - kvb - small;
@@ -633,7 +647,13 @@ bool Model::Impl::setup_attn_dev(double& budget) {
     for (auto& y : L) {
         upf(y.in_ln.data(), H, y.d_in_ln); upf(y.post_ln.data(), H, y.d_post_ln); upf(y.bq.data(), QD, y.d_bq); upf(y.bk.data(), KD, y.d_bk);
         upf(y.bv.data(), KD, y.d_bv); upf(y.bo.data(), H, y.d_bo); upf(y.sinks.data(), (size_t) c.heads, y.d_sinks);
-        buf((size_t) y.cap * KD, y.dKc); buf((size_t) y.cap * KD, y.dVc);
+        auto pbufV = [&](size_t n, void*& d) { if (!ok) return; d = gpu::alloc(n); if (!d) ok = false; };
+        pbufV((size_t) y.cap * KD * kb, y.dKc); pbufV((size_t) y.cap * KD * vb, y.dVc);
+        if (kb < 4) { auto f = [&](size_t n, float*& d) { if (!ok) return; d = (float*) gpu::alloc(n); if (!d) ok = false; }; f((size_t) y.cap * 4, y.dKinv); }
+        if (vb < 4) { auto f = [&](size_t n, float*& d) { if (!ok) return; d = (float*) gpu::alloc(n); if (!d) ok = false; }; f((size_t) y.cap * 4, y.dVinv); }
+        // rows never uploaded must still read a defined scale: 1.0 = no rescaling
+        if (kb < 4) { std::vector<float> one((size_t) y.cap, 1.0f); if (!gpu::h2d(y.dKinv, one.data(), (size_t) y.cap * 4)) ok = false; }
+        if (vb < 4) { std::vector<float> one((size_t) y.cap, 1.0f); if (!gpu::h2d(y.dVinv, one.data(), (size_t) y.cap * 4)) ok = false; }
     }
     upf(rope_cos.data(), rope_cos.size(), d_cos); upf(rope_sin.data(), rope_sin.size(), d_sin);
     const size_t T = (size_t) chunk_max;
@@ -648,8 +668,10 @@ bool Model::Impl::setup_attn_dev(double& budget) {
 
 void Model::Impl::release_attn() {
     for (auto& y : L) {
-        float** v[] = {&y.d_in_ln, &y.d_post_ln, &y.d_bq, &y.d_bk, &y.d_bv, &y.d_bo, &y.d_sinks, &y.dKc, &y.dVc};
+        float** v[] = {&y.d_in_ln, &y.d_post_ln, &y.d_bq, &y.d_bk, &y.d_bv, &y.d_bo, &y.d_sinks, &y.dKinv, &y.dVinv};
         for (float** p : v) { gpu::release(*p); *p = nullptr; }
+        void** w[] = {&y.dKc, &y.dVc};
+        for (void** p : w) { gpu::release(*p); *p = nullptr; }
     }
     float** g[] = {&d_cos, &d_sin, &a_X, &a_Hn, &a_Q, &a_K, &a_V, &a_Att, &a_Ob, &a_Gl, &a_Y};
     for (float** p : g) { gpu::release(*p); *p = nullptr; }
@@ -664,7 +686,8 @@ bool Model::Impl::kv_sync_to_dev(int upto) {
         for (int pos = a; pos < upto;) {
             const size_t slot = y.slot(pos);
             const int run = y.sliding ? std::min(upto - pos, y.cap - (int) slot) : upto - pos;
-            if (!gpu::h2d(y.dKc + slot * KD, &y.K[slot * KD], (size_t) run * KD * 4) || !gpu::h2d(y.dVc + slot * KD, &y.V[slot * KD], (size_t) run * KD * 4)) return false;
+            if (!gpu::kv_upload_rows(dev_kfmt, &y.K[slot * KD], y.dKc, y.dKinv, run, pos, (int) KD, y.cap, y.sliding, 448.0f) ||
+                !gpu::kv_upload_rows(dev_vfmt, &y.V[slot * KD], y.dVc, y.dVinv, run, pos, (int) KD, y.cap, y.sliding, 448.0f)) return false;
             pos += run;
         }
     }
@@ -1079,17 +1102,19 @@ bool Model::Impl::chunk_dev(int T, int p0, const float* X0, float* Xlast) {
         Layer& y = L[(size_t) l];
         gpu::AttnShape a;
         a.heads = c.heads; a.kv_heads = c.kv_heads; a.D = c.head_dim; a.window = c.window; a.sliding = y.sliding; a.cap = y.cap; a.rope_pairs = o.rope_pairs;
+        a.k_fmt = dev_kfmt; a.v_fmt = dev_vfmt; a.dKinv = y.dKinv; a.dVinv = y.dVinv; a.kv_limit = 448.0f;
         {
             std::lock_guard<std::mutex> g(gmu);
             bool ok = gpu::rms_rows(a_X, y.d_in_ln, c.eps, T, H, a_Hn) && gpu::dmm_bf16(y.dq, QD, H, a_Hn, T, a_Q) && gpu::dmm_bf16(y.dk, KD, H, a_Hn, T, a_K) &&
-                      gpu::dmm_bf16(y.dv, KD, H, a_Hn, T, a_V) && gpu::qk_rope_kv(a_Q, a_K, a_V, y.d_bq, y.d_bk, y.d_bv, d_cos, d_sin, T, p0, a, y.dKc, y.dVc) &&
-                      gpu::attn_rows(a_Q, y.dKc, y.dVc, y.d_sinks, T, p0, a, a_Att) && gpu::dmm_bf16(y.dobj, H, QD, a_Att, T, a_Ob) && gpu::add_rows(a_X, a_Ob, y.d_bo, T, H) &&
+                      gpu::dmm_bf16(y.dv, KD, H, a_Hn, T, a_V) && gpu::qk_rope_kv(a_Q, a_K, a_V, y.d_bq, y.d_bk, y.d_bv, d_cos, d_sin, T, p0, a, (float*)y.dKc, (float*)y.dVc) &&
+                      gpu::attn_rows(a_Q, (const float*)y.dKc, (const float*)y.dVc, y.d_sinks, T, p0, a, a_Att) && gpu::dmm_bf16(y.dobj, H, QD, a_Att, T, a_Ob) && gpu::add_rows(a_X, a_Ob, y.d_bo, T, H) &&
                       gpu::rms_rows(a_X, y.d_post_ln, c.eps, T, H, a_Hn) && gpu::dmm_bf16(y.drt, E, H, a_Hn, T, a_Gl) &&
                       gpu::d2h(Hn.data(), a_Hn, (size_t) T * H * 4) && gpu::d2h(Gl.data(), a_Gl, (size_t) T * E * 4);
             for (int pos = p0; ok && pos < p0 + T;) {                          // K/V rows of the chunk -> host cache (one segment, two if the ring wraps)
                 const size_t slot = y.slot(pos);
                 const int run = y.sliding ? std::min(p0 + T - pos, y.cap - (int) slot) : p0 + T - pos;
-                ok = gpu::d2h(&y.K[slot * KD], y.dKc + slot * KD, (size_t) run * KD * 4) && gpu::d2h(&y.V[slot * KD], y.dVc + slot * KD, (size_t) run * KD * 4);
+                ok = gpu::kv_download_rows(dev_kfmt, &y.K[slot * KD], y.dKc, y.dKinv, run, pos, (int) KD, y.cap, y.sliding) &&
+                     gpu::kv_download_rows(dev_vfmt, &y.V[slot * KD], y.dVc, y.dVinv, run, pos, (int) KD, y.cap, y.sliding);
                 pos += run;
             }
             if (!ok) return bad();
