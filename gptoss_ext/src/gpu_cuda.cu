@@ -1228,5 +1228,22 @@ namespace gptoss
             g_reg.push_back({a, (size_t)(b - a)});
             return true;
         }
+
+        void *host_alloc(size_t n)
+        {
+            void *p = nullptr;
+            if (cudaMallocHost(&p, n ? n : 1) != cudaSuccess)
+            {
+                cudaGetLastError(); // a refusal is not a failed call of the session: no g_err
+                return nullptr;
+            }
+            return p;
+        }
+
+        void host_free(void *p)
+        {
+            if (p)
+                cudaFreeHost(p);
+        }
     } // namespace gpu
 } // namespace gptoss
