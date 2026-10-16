@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <atomic>
 #include <chrono>
@@ -99,6 +100,7 @@ struct Model::Impl {
     std::atomic<size_t> ram_layers{0};                 // layers registered so far
     std::atomic<size_t> ram_bytes{0};
     std::atomic<int> ram_state{0};                     // 0 off, 1 running, 2 done, 3 stopped on an error
+    bool in_check = false;                             // GPTOSS_CHECK_PREFILL: inside the device-vs-CPU comparison
     int pdev_kv_pos = 0;                               // the same watermark for the pdev (prefill_dev.cu) mirror, which is separate from attn_dev's
     int dev_kv_pos = 0;                                // positions [0, dev_kv_pos) of the device KV are known to equal the host KV (decode writes the host only)
     int dev_kfmt = 2, dev_vfmt = 2;                        // formats the DEVICE KV cache is packed in (the emulated device keeps f32)
@@ -1424,6 +1426,58 @@ void Model::prefill(const int* tokens, int n, int start_pos, std::vector<float>*
     bool bad = start_pos < 0 || start_pos + n > s.o.ctx;
     for (int i = 0; i < n && !bad; ++i) bad = tokens[i] < 0 || tokens[i] >= c.vocab;
     if (bad) { if (logits_last) logits_last->assign((size_t) c.vocab, 0.0f); return; }
+    static const bool chk = std::getenv("GPTOSS_CHECK_PREFILL") != nullptr;
+    if (chk && s.gpu_on && !s.in_check) {
+        // The device prefill as in production, then the plain CPU path over the same tokens. The CPU result is kept (logits and K/V rows),
+        // the comparison goes to the log.
+        s.in_check = true;
+        std::vector<float> ld, lc;
+        prefill(tokens, n, start_pos, &ld);
+        const bool snap = n <= 1024;
+        std::vector<std::vector<float>> sk, sv;
+        if (snap) for (auto& y : s.L) {
+            if (y.sliding && n > y.cap) { sk.emplace_back(); sv.emplace_back(); continue; }
+            std::vector<float> a((size_t) n * KD), b((size_t) n * KD);
+            for (int t = 0; t < n; ++t) {
+                std::memcpy(&a[(size_t) t * KD], &y.K[y.slot(start_pos + t) * KD], sizeof(float) * (size_t) KD);
+                std::memcpy(&b[(size_t) t * KD], &y.V[y.slot(start_pos + t) * KD], sizeof(float) * (size_t) KD);
+            }
+            sk.push_back(std::move(a)); sv.push_back(std::move(b));
+        }
+        const bool g = s.gpu_on;
+        s.gpu_on = false;
+        prefill(tokens, n, start_pos, &lc);
+        s.gpu_on = g;
+        s.dev_kv_pos = 0; s.pdev_kv_pos = 0;                // the CPU rewrote the host rows: the card's mirrors are stale
+        s.in_check = false;
+        double md = 0; size_t a1 = 0, a2 = 0;
+        for (size_t i = 0; i < lc.size() && i < ld.size(); ++i) {
+            md = std::max(md, (double) std::fabs(ld[i] - lc[i]));
+            if (ld[i] > ld[a1]) a1 = i;
+            if (lc[i] > lc[a2]) a2 = i;
+        }
+        std::fprintf(stderr, "check: prefill start %d n %d: logits max|dev-cpu| %.4g, top1 dev %zu cpu %zu -> %s\n", start_pos, n, md, a1, a2, a1 == a2 && md < 1.0 ? "ok" : "MISMATCH");
+        if (snap) {
+            int shown = 0, badl = 0;
+            for (int l = 0; l < c.layers; ++l) {
+                if (sk[(size_t) l].empty()) continue;
+                Layer& y = s.L[(size_t) l];
+                double dk = 0, dv = 0, mk = 0, mv2 = 0; int first_t = -1;
+                for (int t = 0; t < n; ++t) for (int j = 0; j < KD; ++j) {
+                    const float ck = y.K[y.slot(start_pos + t) * KD + j], cv = y.V[y.slot(start_pos + t) * KD + j];
+                    const double ek = std::fabs(sk[(size_t) l][(size_t) t * KD + j] - ck), ev = std::fabs(sv[(size_t) l][(size_t) t * KD + j] - cv);
+                    if (ek > dk) { dk = ek; if (first_t < 0 && ek > 0.05 * (mk + 1e-3)) first_t = t; }
+                    dv = std::max(dv, ev); mk = std::max(mk, (double) std::fabs(ck)); mv2 = std::max(mv2, (double) std::fabs(cv));
+                }
+                const bool mis = dk > 0.05 * (mk + 1e-6) || dv > 0.05 * (mv2 + 1e-6);
+                badl += mis ? 1 : 0;
+                if (mis && shown < 6) { ++shown; std::fprintf(stderr, "check:   layer %d (%s): K max diff %.4g (of %.4g), V max diff %.4g (of %.4g), first bad token %d\n", l, y.sliding ? "banded" : "dense", dk, mk, dv, mv2, first_t); }
+            }
+            std::fprintf(stderr, "check: K/V rows of the chunk: %d of %d layers differ from the CPU's\n", badl, c.layers);
+        }
+        if (logits_last) *logits_last = lc;
+        return;
+    }
     if (s.gpu_on && s.pdev_on) {
         const int done = s.prefill_pdev(tokens, n, start_pos, logits_last);   // a device failure stops it: the host cache is consistent up to `done`
         if (done == n) return;
