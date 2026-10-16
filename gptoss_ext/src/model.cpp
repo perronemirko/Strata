@@ -8,6 +8,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstdlib>
 #include <cstring>
 #include <atomic>
 #include <chrono>
@@ -119,7 +120,13 @@ struct Model::Impl {
     void pdev_fail_(const std::string& why);             // the device-resident prefill turns itself off: the device stays on, the old prefill continues
     bool upload_expert(Slot& sl, int li, int e);
     void count_use(int li, const int32_t* idx);
-    Slot* resident(int layer, int e);                  // expert -> slot (upload on miss = PCIe, LRU eviction); nullptr when there is no pool or the expert runs on the host
+    Slot* resident(int layer, int e, bool hit_only = false);   // hit_only: never uploads, never evicts (nullptr on a miss)
+    int pick_victim(int li);                           // the slot a miss in layer li would take (free, else LRU); -1 if none
+    void expert_cpu(Layer& y, Work& w, const float* h, int e, float wt, float* acc);   // pure host expert: never touches the device
+    void experts_decode_miss(Layer& y, Work& w, const float* h, const int32_t* idx, const float* wt, float* acc);
+    int up_ev = -1;                                    // event of the decode-side background uploads (copy stream)
+    uint64_t cpu_served = 0;                           // misses computed on the CPU while the upload ran (--engine-env GPTOSS_CPU_MISS=1)
+    bool cpu_miss = std::getenv("GPTOSS_CPU_MISS") && std::getenv("GPTOSS_CPU_MISS")[0] == '1';                  // expert -> slot (upload on miss = PCIe, LRU eviction); nullptr when there is no pool or the expert runs on the host
     int victim_slot(int li);                           // slot to evict for a miss in layer li: this layer first (--expert-lru-layered), then the whole pool
     void promote_locked(int li, int e, int slot_idx);  // an LRU expert that keeps being used takes the place of the least-used pinned one
     void begin_request_stats();
@@ -838,7 +845,7 @@ void Model::Impl::count_use(int li, const int32_t* idx) {
     for (int k = 0; k < c.topk; ++k) __atomic_fetch_add(&usage[(size_t) li * (size_t) c.n_exp + (size_t) idx[k]], (uint64_t) 1, __ATOMIC_RELAXED);
 }
 
-Slot* Model::Impl::resident(int li, int e) {
+Slot* Model::Impl::resident(int li, int e, bool hit_only) {
     // The counters are the decode's, per request: only Model::forward sets `counting`, so a prefill that walks
     // every expert of a chunk does not dilute the hit rate the DONE line reports.
     const bool count = counting;
@@ -861,6 +868,7 @@ Slot* Model::Impl::resident(int li, int e) {
         hit.tick = tick;
         return &pool[(size_t) it->second];
     }
+    if (hit_only) return nullptr;
     // A miss: the bytes go to the card over PCIe if a slot can take them; otherwise this expert runs on the host.
     int v = -1;
     for (size_t i = 0; i < pool.size() && v < 0; ++i) if (pool[i].layer < 0 && !pool[i].busy) v = (int) i;   // a slot being filled by the preload thread is not free
@@ -948,6 +956,110 @@ void Model::Impl::mm(const WView& w, const void* dW, const float* x, int N, floa
     for (int n = 0; n < N; ++n) matvec(w, x + (size_t) n * w.cols, y + (size_t) n * w.rows);
 }
 
+int Model::Impl::pick_victim(int li) {
+    int v = -1;
+    for (size_t i = 0; i < pool.size() && v < 0; ++i) if (pool[i].layer < 0 && !pool[i].busy) v = (int) i;
+    if (v < 0) v = o.expert_lru_layered ? victim_slot(li) : -1;
+    if (v < 0) {
+        uint64_t best = ~(uint64_t) 0;
+        for (size_t i = 0; i < pool.size(); ++i) if (!pool[i].pinned && !pool[i].busy && pool[i].tick < best) { best = pool[i].tick; v = (int) i; }
+    }
+    return v;
+}
+
+// The same arithmetic as expert_add, entirely on the host (no resident(), no device call).
+void Model::Impl::expert_cpu(Layer& y, Work& w, const float* h, int e, float wt, float* acc) {
+    const int H = c.hidden, I = c.moe_ff, G1 = H / 32, G2 = I / 32;
+    MxView gu = y.gu; gu.blocks += (size_t) e * 2 * I * G1 * 16; gu.scales += (size_t) e * 2 * I * G1;
+    matvec_mx(gu, h, w.gu.data());
+    const uint16_t* gb = y.gu_bias + (size_t) e * 2 * I;
+    for (int i = 0; i < 2 * I; ++i) w.gu[(size_t) i] += bf16_to_f32(gb[i]);
+    for (int i = 0; i < I; ++i) {
+        const float g = o.glu_halves ? w.gu[(size_t) i] : w.gu[(size_t) 2 * i];
+        const float u = o.glu_halves ? w.gu[(size_t) I + i] : w.gu[(size_t) 2 * i + 1];
+        w.act[(size_t) i] = swiglu(g, u, c.swiglu_limit, c.swiglu_alpha);
+    }
+    MxView dn = y.dn; dn.blocks += (size_t) e * H * G2 * 16; dn.scales += (size_t) e * H * G2;
+    matvec_mx(dn, w.act.data(), w.eb.data());
+    const uint16_t* db = y.dn_bias + (size_t) e * H;
+    for (int i = 0; i < H; ++i) acc[i] += wt * (w.eb[(size_t) i] + bf16_to_f32(db[i]));
+}
+
+// Decode with GPTOSS_CPU_MISS=1. The experts already in VRAM go to the card exactly as before. An expert that is NOT resident no longer waits for
+// its upload: the CPU computes it right away (host weights) while (a) the card works on the hits and (b) the miss's bytes travel over PCIe into a slot
+// reserved for it, so the NEXT token finds it resident. The upload is waited for only at the end of the layer, after the CPU share and the collect.
+void Model::Impl::experts_decode_miss(Layer& y, Work& w, const float* h, const int32_t* idx, const float* wt, float* acc) {
+    static bool announced = false;
+    if (!announced) { announced = true; std::fprintf(stderr, "gptoss: decode: experts outside the VRAM run on the CPU while the card works and their upload runs in the background (GPTOSS_CPU_MISS=1)\n"); }
+    const int H = c.hidden, I = c.moe_ff, K = c.topk, li = (int) (&y - L.data());
+    const size_t G1 = (size_t) H / 32, G2 = (size_t) I / 32;
+    Slot* fly[gpu::kExpertCtxBatch] = {};
+    bool miss[gpu::kExpertCtxBatch] = {};
+    struct Fill { int slot, e; };
+    Fill fill[gpu::kExpertCtxBatch];
+    int nfill = 0;
+    {
+        std::lock_guard<std::mutex> g(gmu);
+        if (up_ev < 0) up_ev = gpu::event_create();
+        for (int k = 0; k < K; ++k) {
+            Slot* sl = gpu_on ? resident(li, idx[k], true) : nullptr;
+            if (!sl) { miss[k] = true; continue; }
+            gpu::ExpertDesc d;
+            d.gu_b = sl->gu_b; d.gu_s = sl->gu_s; d.gu_bias = sl->gu_bias;
+            d.dn_b = sl->dn_b; d.dn_s = sl->dn_s; d.dn_bias = sl->dn_bias;
+            d.H = H; d.I = I; d.halves = o.glu_halves ? 1 : 0; d.limit = c.swiglu_limit; d.alpha = c.swiglu_alpha;
+            sl->busy = true;
+            if (gpu::expert_run_async(k, d, h, &wt[k], 1)) fly[k] = sl;
+            else { sl->busy = false; miss[k] = true; gpu_fail(gpu::last_error()); }
+        }
+        for (int k = 0; k < K && gpu_on && up_ev >= 0; ++k) {            // reserve a slot per miss and start its copy (no wait)
+            if (!miss[k] || fly[k]) continue;
+            const int v = pick_victim(li);
+            if (v < 0) { if (counting) ++host_served; continue; }          // every slot pinned or in flight: CPU only, nothing to cache
+            Slot& sl = pool[(size_t) v];
+            if (sl.layer >= 0) where.erase((long long) sl.layer * c.n_exp + sl.exp);
+            sl.layer = -1; sl.busy = true;
+            const size_t e = (size_t) idx[k];
+            const bool ok = gpu::h2d_copy_async(sl.gu_b, y.gu.blocks + e * 2 * I * G1 * 16, 2 * I * G1 * 16) && gpu::h2d_copy_async(sl.gu_s, y.gu.scales + e * 2 * I * G1, 2 * I * G1) &&
+                            gpu::h2d_copy_async(sl.dn_b, y.dn.blocks + e * H * G2 * 16, H * G2 * 16) && gpu::h2d_copy_async(sl.dn_s, y.dn.scales + e * H * G2, H * G2) &&
+                            gpu::h2d_copy_async(sl.gu_bias, y.gu_bias + e * 2 * I, (size_t) 2 * I * 2) && gpu::h2d_copy_async(sl.dn_bias, y.dn_bias + e * H, (size_t) H * 2);
+            fill[nfill++] = {v, idx[k]};                                   // even on failure: the finish below waits, then frees the slot
+            if (!ok) { gpu_fail(gpu::last_error()); break; }
+        }
+        if (nfill) gpu::event_record_copy(up_ev);
+    }
+    float* part = w.part.data();
+    for (int k = 0; k < K; ++k) {                                          // the CPU share: overlaps the card (hits) and the PCIe copies
+        if (!miss[k]) continue;
+        float* pk = part + (size_t) k * H;
+        std::fill(pk, pk + H, 0.0f);
+        expert_cpu(y, w, h, idx[k], wt[k], pk);
+        if (counting) ++cpu_served;
+    }
+    for (int k = 0; k < K; ++k) {                                          // collect the hits: the device applied wt[k] and the down bias
+        if (!fly[k]) continue;
+        float* pk = part + (size_t) k * H;
+        bool ok;
+        { std::lock_guard<std::mutex> g(gmu); ok = gpu::expert_collect(k, pk); fly[k]->busy = false; if (!ok) gpu_fail(gpu::last_error()); }
+        if (!ok) { std::fill(pk, pk + H, 0.0f); expert_cpu(y, w, h, idx[k], wt[k], pk); }
+    }
+    if (nfill) {                                                           // the uploads are complete: publish the slots
+        std::lock_guard<std::mutex> g(gmu);
+        const bool ok = gpu::event_sync(up_ev);
+        if (!ok) gpu_fail(gpu::last_error());
+        for (int j = 0; j < nfill; ++j) {
+            Slot& sl = pool[(size_t) fill[j].slot];
+            if (ok && where.find((long long) li * c.n_exp + fill[j].e) == where.end()) {
+                sl.layer = li; sl.exp = fill[j].e; sl.tick = ++tick;
+                where[(long long) li * c.n_exp + fill[j].e] = fill[j].slot;
+                if (counting) ++pcie_served;
+            } else sl.layer = -1;
+            sl.busy = false;
+        }
+    }
+    for (int k = 0; k < K; ++k) { const float* pk = part + (size_t) k * H; for (int i = 0; i < H; ++i) acc[i] += pk[i]; }
+}
+
 void Model::Impl::expert_add(Layer& y, Work& w, const float* h, int e, float wt, float* acc) {
     const int H = c.hidden, I = c.moe_ff, G1 = H / 32, G2 = I / 32;
     Slot* sl = nullptr;
@@ -989,6 +1101,7 @@ void Model::Impl::expert_add(Layer& y, Work& w, const float* h, int e, float wt,
 // while the device works. The sum into acc stays in k order.
 void Model::Impl::experts_decode(Layer& y, Work& w, const float* h, const int32_t* idx, const float* wt, float* acc) {
     const int H = c.hidden, I = c.moe_ff, K = c.topk, li = (int) (&y - L.data());
+    if (cpu_miss && gpu_on && !pool.empty() && !in_parallel_region() && K <= gpu::kExpertCtxBatch) { experts_decode_miss(y, w, h, idx, wt, acc); return; }
     Slot* fly[gpu::kExpertCtxBatch] = {};
     if (gpu_on && !pool.empty() && !in_parallel_region()) {
         std::lock_guard<std::mutex> g(gmu);
