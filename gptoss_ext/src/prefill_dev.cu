@@ -140,9 +140,9 @@ __device__ void bf16_body(const unsigned short* __restrict__ W, int rows, int co
 // lives in kinv/vinv; the host cache and the KV checkpoint stay fp32.
 __device__ __forceinline__ float kv_row_scale(float peak, float limit) {
     if (!(peak > 0.0f) || !(limit > 0.0f)) return 1.0f;
-    const float s = exp2f(floorf(log2f(peak / limit)));
+    const float s = exp2f(ceilf(log2f(peak / limit)));   // CEIL: peak / s must stay <= limit (floor let the row's largest values saturate)
     if (!(s > 1e-18f)) return 1.0f;
-    return (s > 1.0f) ? 1.0f : s;
+    return s;                                              // s > 1 (a row whose peak is above the format's range) scales DOWN: no clamp to 1
 }
 
 __device__ __forceinline__ float kv_row_scale_inv(float scale) {
@@ -254,7 +254,9 @@ __global__ void k_kv_pack(const float* __restrict__ src, T_OUT* __restrict__ dst
     amax = block_amax(amax, red, (int) blockDim.x);
     const float sc = kv_row_scale(amax, limit);
     const float isc = kv_row_scale_inv(sc);
-    if (threadIdx.x == 0) iscl[r] = isc;
+    // The packed value is x * isc (isc = 1/sc); the attention and the unpack MULTIPLY by what is stored here, so it must be the
+    // dequantization factor sc, not isc (storing isc made every dequantized row come out x * isc^2).
+    if (threadIdx.x == 0) iscl[r] = sc;
     T_OUT* d = dst + (size_t) r * kd;
     for (int i = threadIdx.x; i < kd; i += blockDim.x) d[i] = gpu::pack_fp32_to_target<T_OUT>(p[i], isc);
 }
