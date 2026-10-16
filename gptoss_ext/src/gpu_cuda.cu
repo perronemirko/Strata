@@ -508,10 +508,10 @@ namespace gptoss
             {
                 if (!(peak > 0.0f) || !(limit > 0.0f))
                     return 1.0f;
-                const float s = exp2f(floorf(log2f(peak / limit)));
+                const float s = exp2f(ceilf(log2f(peak / limit)));   // CEIL: peak / s <= limit
                 if (!(s > 1e-18f))
                     return 1.0f;
-                return (s > 1.0f) ? 1.0f : s;
+                return s;
             }
 
             __device__ __forceinline__ float kv_row_scale_inv(float scale)
@@ -552,7 +552,7 @@ namespace gptoss
                 const float sc = kv_row_scale(amax, limit);
                 const float isc = kv_row_scale_inv(sc);
                 if (threadIdx.x == 0 && iscl)
-                    iscl[slot] = isc;
+                    iscl[slot] = sc; // the packed value is x * isc; the readers MULTIPLY by this, so it is the dequant factor sc
                 T_OUT *d = dst + (size_t)slot * kd;
                 for (int i = threadIdx.x; i < kd; i += blockDim.x)
                     d[i] = gpu::pack_fp32_to_target<T_OUT>(p[i], isc);
@@ -1091,6 +1091,27 @@ namespace gptoss
             return pack(a.v_fmt, dv, dVc, a.dVinv, a.kv_limit);
         }
 
+        // F32 rows between the host cache and the card cache, at the slot of each position (p % cap on a banded layer, p on a dense one),
+        // split where the ring wraps. (The 2D copies this replaces ignored the slot: they always used cache rows 0..rows-1.)
+        static bool f32_rows(bool upload, void *dev, void *hostp, int rows, int p0, int kd, int cap, bool sliding)
+        {
+            for (int done = 0; done < rows;)
+            {
+                const int pos = p0 + done;
+                const size_t slot = sliding ? (size_t)(pos % cap) : (size_t)pos;
+                const int run = sliding ? std::min(rows - done, cap - (int)slot) : rows - done;
+                uint8_t *d = (uint8_t *)dev + slot * (size_t)kd * 4;
+                uint8_t *h = (uint8_t *)hostp + (size_t)done * (size_t)kd * 4;
+                const size_t n = (size_t)run * (size_t)kd * 4;
+                const bool ok = upload ? ck(cudaMemcpyAsync(d, h, n, cudaMemcpyHostToDevice, g_comp), "kv f32 h2d")
+                                       : ck(cudaMemcpyAsync(h, d, n, cudaMemcpyDeviceToHost, g_comp), "kv f32 d2h");
+                if (!ok)
+                    return false;
+                done += run;
+            }
+            return ck(cudaStreamSynchronize(g_comp), "kv f32 sync");
+        }
+
         // Host fp32 rows -> the card's packed cache (what decode wrote since the last device prefill).
         bool kv_upload_rows(int fmt, const void *host, void *dst, float *iscl, int rows, int p0, int kd, int cap, bool sliding, float limit)
         {
@@ -1101,7 +1122,7 @@ namespace gptoss
                 return false;
             if (fmt == 0) k_kv_pack_at<__nv_fp8_e4m3><<<(unsigned)std::min(rows, 65535), 256, 0, g_comp>>>((const float *)g_kv_scratch, (__nv_fp8_e4m3 *)dst, iscl, rows, p0, kd, cap, sliding ? 1 : 0, limit);
             else if (fmt == 1) k_kv_pack_at<half><<<(unsigned)std::min(rows, 65535), 256, 0, g_comp>>>((const float *)g_kv_scratch, (half *)dst, iscl, rows, p0, kd, cap, sliding ? 1 : 0, limit);
-            else if (!ck(cudaMemcpy2DAsync(dst, (size_t)kd * 4, host, (size_t)kd * 4, (size_t)kd * 4, rows, cudaMemcpyHostToDevice, g_comp), "kv f32 h2d"))
+            else if (!f32_rows(true, dst, const_cast<void *>(host), rows, p0, kd, cap, sliding))
                 return false;
             return ck(cudaGetLastError(), "kv upload");
         }
@@ -1114,8 +1135,8 @@ namespace gptoss
                 return true;
             if (fmt == 0) k_kv_unpack_at<__nv_fp8_e4m3><<<(unsigned)std::min(rows, 65535), 256, 0, g_comp>>>((__nv_fp8_e4m3 *)src, iscl, (float *)g_kv_scratch, rows, p0, kd, cap, sliding ? 1 : 0);
             else if (fmt == 1) k_kv_unpack_at<half><<<(unsigned)std::min(rows, 65535), 256, 0, g_comp>>>((half *)src, iscl, (float *)g_kv_scratch, rows, p0, kd, cap, sliding ? 1 : 0);
-            else if (!ck(cudaMemcpy2DAsync(host, (size_t)kd * 4, src, (size_t)kd * 4, (size_t)kd * 4, rows, cudaMemcpyDeviceToHost, g_comp), "kv f32 d2h"))
-                return true;
+            else if (!f32_rows(false, const_cast<void *>(src), host, rows, p0, kd, cap, sliding))
+                return false;
             if (!ck(cudaGetLastError(), "kv unpack"))
                 return false;
             if (fmt == 2)
