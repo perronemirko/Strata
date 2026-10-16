@@ -553,8 +553,8 @@ bool move_kv(int layer, const float* host_K, const float* host_V, int cap_host, 
             // the staging holds at most g_upmax rows: split longer runs
             while (len > 0) {
                 const int take = std::min(len, g_upmax);
-                if (!copy_async(g_KQ, host_K + (size_t) a * kd * 4, (size_t) take * kd * 4, cudaMemcpyHostToDevice)) return false;
-                if (!copy_async(g_VQ, host_V + (size_t) a * kd * 4, (size_t) take * kd * 4, cudaMemcpyHostToDevice)) return false;
+                if (!copy_async(g_KQ, host_K + (size_t) a * kd, (size_t) take * kd * 4, cudaMemcpyHostToDevice)) return false;
+                if (!copy_async(g_VQ, host_V + (size_t) a * kd, (size_t) take * kd * 4, cudaMemcpyHostToDevice)) return false;
                 if (!kv_pack_run(layer, g_KQ, g_VQ, p - kv.base, take, kd)) return false;
                 a += take; len -= take; p += take;
             }
@@ -582,8 +582,8 @@ bool move_kv(int layer, const float* host_K, const float* host_V, int cap_host, 
             if (g_vfmt != 2 && bad(cudaGetLastError(), "kv unpack v")) return false;
             const size_t bytes = (size_t) take * kd * 4;
             float* hk = (float*) (void*) host_K, *hv = (float*) (void*) host_V;
-            if (!bad(cudaMemcpyAsync(hk + (size_t) a * kd * 4, g_KQ, bytes, kind, g_st), "kv d2h")) return false;
-            if (!bad(cudaMemcpyAsync(hv + (size_t) a * kd * 4, g_VQ, bytes, kind, g_st), "kv d2h v")) return false;
+            if (!bad(cudaMemcpyAsync(hk + (size_t) a * kd, g_KQ, bytes, kind, g_st), "kv d2h")) return false;
+            if (!bad(cudaMemcpyAsync(hv + (size_t) a * kd, g_VQ, bytes, kind, g_st), "kv d2h v")) return false;
             a += take; len -= take; p += take;
         }
     }
@@ -933,8 +933,8 @@ void kv_store_back(int layer, float* host_K, float* host_V, int cap, bool slidin
         int len = pos0 + T - p;
         if (sliding) len = std::min(len, cap - a);
         const size_t bytes = (size_t) len * kd * 4;
-        const bool ok = !bad(cudaMemcpyAsync(host_K + (size_t) a * kd * 4, g_KS + (size_t) (p - pos0) * kd * 4, bytes, cudaMemcpyDeviceToHost, g_st), "kv stage d2h") &&
-                        !bad(cudaMemcpyAsync(host_V + (size_t) a * kd * 4, g_VS + (size_t) (p - pos0) * kd * 4, bytes, cudaMemcpyDeviceToHost, g_st), "kv stage d2h v");
+        const bool ok = !bad(cudaMemcpyAsync(host_K + (size_t) a * kd, g_KS + (size_t) (p - pos0) * kd, bytes, cudaMemcpyDeviceToHost, g_st), "kv stage d2h") &&
+                        !bad(cudaMemcpyAsync(host_V + (size_t) a * kd, g_VS + (size_t) (p - pos0) * kd, bytes, cudaMemcpyDeviceToHost, g_st), "kv stage d2h v");
         if (!ok) { g_bad = true; return; }
         p += len;
     }

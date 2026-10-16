@@ -1333,8 +1333,7 @@ int Model::Impl::prefill_pdev(const int* tokens, int n, int start_pos, std::vect
 #pragma omp parallel for schedule(static)
             for (int t = 0; t < T; ++t) {
                 float* g = &Gl[(size_t) t * E];
-                for (int e = 0; e < E; ++e) g[e] += y.rbias[(size_t) e];
-                route(g, E, K, &IDX[(size_t) t * K], &WT[(size_t) t * K]);
+                route(g, E, K, &IDX[(size_t) t * K], &WT[(size_t) t * K]);   // the router bias is already added on the card (k_router_bias)
                 count_use(l, &IDX[(size_t) t * K]);
             }
             // group the routed rows by expert (index order), resolve every touched expert's slot, upload the tables
