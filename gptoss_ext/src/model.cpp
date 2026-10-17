@@ -134,6 +134,12 @@ struct Model::Impl {
     int pdev_kv_pos = 0;                               // the same watermark for the pdev (prefill_dev.cu) mirror, which is separate from attn_dev's
     int dev_kv_pos = 0;                                // positions [0, dev_kv_pos) of the device KV are known to equal the host KV (decode writes the host only)
     int dev_kfmt = 2, dev_vfmt = 2;                        // formats the DEVICE KV cache is packed in (the emulated device keeps f32)
+    // --- decode attention on the card (dense layers only, punto 7b): persistent packed KV + the split-K kernel; dev_kv_pos is its watermark too
+    bool dd_on = false, dd_cur = false, dd_check = false;   // dd_cur: THIS token's dense layers run on the card
+    int dd_min = 512, dd_cap = 0;                          // first position that uses it / positions held per dense layer
+    float *dd_q = nullptr, *dd_out = nullptr, *dd_ws = nullptr;
+    uint64_t dd_calls = 0, dd_chk_n = 0;
+    double dd_chk_max = 0, dd_chk_ref = 0;
 
     void init_work(Work& w) const;
     Work& my_work();
@@ -172,6 +178,9 @@ struct Model::Impl {
     void moe_prefill_layer(int l, int T, const float* Hn, const int32_t* IDX, const float* WT, float* Y);   // routed experts of one layer for a chunk (Y = sum, zeroed here)
     bool chunk_dev(int T, int p0, const float* X0, float* Xlast);   // one chunk, whole stack on the device; false = redo it on the host
     bool kv_sync_to_dev(int upto);
+    bool setup_decode_attn(double& budget);
+    bool dd_sync(int upto);
+    bool attn_heads_dev(Layer& y, Work& w, int pos);
     bool setup_attn_dev(double& budget);
     void release_attn();
     void preload_plan();
@@ -181,6 +190,13 @@ struct Model::Impl {
     void preload_wait();
     void ram_pin_start();
 };
+
+// Decode attention on the card (punto 7b). The real definitions live in gpu_cuda.cu; the emulated device has none, so these WEAK ones
+// answer "not supported" and the Model keeps the host attention. A strong definition at link time replaces them.
+namespace gpu {
+__attribute__((weak)) bool attn_decode_supported(const AttnShape&) { return false; }
+__attribute__((weak)) bool attn_decode(const float*, const void*, const void*, const float*, int, const AttnShape&, float*, float*) { return false; }
+}  // namespace gpu
 
 Model::Model() : p_(new Impl) {}
 Model::~Model() {
@@ -444,7 +460,27 @@ void Model::Impl::attn_heads(Layer& y, Work& w, int pos, const KvStage& st) {
 }
 
 void Model::Impl::attn_out(Layer& y, Work& w, float* x, int pos, const KvStage& st) {
-    attn_heads(y, w, pos, st);
+    bool done = false;
+    if (dd_cur && !st.K && !y.sliding && y.dKc) {         // decode, dense layer: the history is attended on the card
+        if (dd_check) {
+            attn_heads(y, w, pos, st);                    // GPTOSS_CHECK_DECODE_ATTN: the HOST result is the one the model uses
+            const size_t QD = (size_t) c.q_dim();
+            const std::vector<float> ref(w.att.data(), w.att.data() + QD);
+            if (attn_heads_dev(y, w, pos)) {
+                double md = 0, mr = 0;
+                for (size_t i = 0; i < QD; ++i) { md = std::max(md, (double) std::fabs(w.att[i] - ref[i])); mr = std::max(mr, (double) std::fabs(ref[i])); }
+                ++dd_chk_n; dd_chk_max = std::max(dd_chk_max, md); dd_chk_ref = std::max(dd_chk_ref, mr);
+                if (dd_chk_n == 1 || dd_chk_n % 2000 == 0)
+                    std::fprintf(stderr, "gptoss: check decode attention: %llu comparisons, max |card - host| = %.3e (largest |host| value %.3e), position %d\n",
+                                 (unsigned long long) dd_chk_n, dd_chk_max, dd_chk_ref, pos);
+            }
+            std::copy(ref.begin(), ref.end(), w.att.begin());
+            done = true;
+        } else {
+            done = attn_heads_dev(y, w, pos);
+        }
+    }
+    if (!done) attn_heads(y, w, pos, st);
     mv(y.o, y.dobj, w.att.data(), w.tmp.data());
     for (int i = 0; i < c.hidden; ++i) x[i] += w.tmp[(size_t) i] + y.bo[(size_t) i];
 }
@@ -653,6 +689,7 @@ bool Model::Impl::gpu_setup(std::string& err) {
     // Attention on the device is for the batched prefill only; the device-resident prefill (prefill_dev) keeps the whole
     // chunk on the card already and runs instead of it, so when that one is on there is nothing to reserve.
     if (o.gpu_attn && !pdev_on) setup_attn_dev(budget);
+    if (!attn_dev) setup_decode_attn(budget);   // before the expert pool takes what is left
     auto al = [](size_t v) { return (v + 255) & ~(size_t) 255; };
     const size_t s_gub = 2 * I * (H / 32) * 16, s_gus = 2 * I * (H / 32), s_dnb = H * (I / 32) * 16, s_dns = H * (I / 32);
     const size_t s_gubias = 2 * I * 2, s_dnbias = H * 2;   // the BF16 bias rows travel with the expert: the async pipeline has no host step to add them
@@ -796,7 +833,130 @@ void Model::Impl::release_attn() {
     }
     float** g[] = {&d_cos, &d_sin, &a_X, &a_Hn, &a_Q, &a_K, &a_V, &a_Att, &a_Ob, &a_Gl, &a_Y};
     for (float** p : g) { gpu::release(*p); *p = nullptr; }
+    float** dd[] = {&dd_q, &dd_out, &dd_ws};
+    for (float** p : dd) { gpu::release(*p); *p = nullptr; }
+    dd_on = false; dd_cur = false;
     attn_dev = false;
+}
+
+// Decode attention on the card: the dense layers' K/V also live in VRAM (packed as -k / -v), so one token reads them there instead of the fp32 host
+// cache. Banded layers (128 keys) stay on the host. Reserved BEFORE the expert pool, out of the same budget; at most 40% of what is left.
+bool Model::Impl::setup_decode_attn(double& budget) {
+    dd_on = false; dd_cur = false;
+    if (const char* e = std::getenv("GPTOSS_ATTN_DEC")) if (std::atoi(e) == 0) return false;
+    const size_t KD = (size_t) c.kv_dim(), QD = (size_t) c.q_dim(), D = (size_t) c.head_dim;
+    gpu::AttnShape probe;
+    probe.heads = c.heads; probe.kv_heads = c.kv_heads; probe.D = c.head_dim; probe.window = c.window; probe.cap = 1;
+    if (!gpu::attn_decode_supported(probe)) return false;   // emulated device, or a head size the kernel does not take
+    dd_check = std::getenv("GPTOSS_CHECK_DECODE_ATTN") != nullptr;
+    dd_min = 512;
+    if (const char* e = std::getenv("GPTOSS_ATTN_DEC_MIN")) dd_min = std::max(0, std::atoi(e));
+    long long cap = std::min<long long>(o.ctx, 65536);   // default: 65536 positions per dense layer; GPTOSS_ATTN_DEC_CTX raises it up to --ctx
+    if (const char* e = std::getenv("GPTOSS_ATTN_DEC_CTX")) { const long long v = std::atoll(e); if (v > 0) cap = std::min<long long>((long long) o.ctx, v); }
+    const bool emu = gpu::is_emulated();
+    dev_kfmt = emu ? 2 : (int) o.key_format;
+    dev_vfmt = emu ? 2 : (int) o.value_format;
+    const size_t kb = get_kv_format_bytes((gptoss::KVFormat) dev_kfmt), vb = get_kv_format_bytes((gptoss::KVFormat) dev_vfmt);
+    int nd = 0;
+    for (const auto& y : L) nd += y.sliding ? 0 : 1;
+    if (nd == 0) return false;
+    const double fixed = (double) nd * (double) c.heads * 4.0 + 2.0 * (double) QD * 4.0 + (double) c.heads * (double) gpu::kAttnDecMaxSplit * (double) (D + 2) * 4.0;
+    const double per_pos = (double) nd * ((double) KD * (double) (kb + vb) + (kb < 4 ? 4.0 : 0.0) + (vb < 4 ? 4.0 : 0.0));
+    const double room = budget * 0.40 - fixed;
+    if (room <= 0 || per_pos <= 0) { std::fprintf(stderr, "gptoss: decode attention stays on the host (no VRAM left for it)\n"); return false; }
+    const long long fit = (long long) (room / per_pos);
+    if (fit < cap) {
+        std::fprintf(stderr, "gptoss: decode attention on the card: %lld positions per dense layer fit (asked %lld)\n", fit, cap);
+        cap = fit;
+    }
+    if (cap < 1024) { std::fprintf(stderr, "gptoss: decode attention stays on the host (the card cache would hold only %lld positions)\n", cap); return false; }
+    bool ok = true;
+    for (auto& y : L) {
+        if (y.sliding) continue;
+        y.dKc = gpu::alloc((size_t) cap * KD * kb);
+        y.dVc = gpu::alloc((size_t) cap * KD * vb);
+        if (!y.dKc || !y.dVc) { ok = false; break; }
+        if (kb < 4) { y.dKinv = (float*) gpu::alloc((size_t) cap * 4); if (!y.dKinv) { ok = false; break; } }
+        if (vb < 4) { y.dVinv = (float*) gpu::alloc((size_t) cap * 4); if (!y.dVinv) { ok = false; break; } }
+        y.d_sinks = (float*) gpu::alloc((size_t) c.heads * 4);
+        if (!y.d_sinks || !gpu::h2d(y.d_sinks, y.sinks.data(), (size_t) c.heads * 4)) { ok = false; break; }
+    }
+    if (ok) {
+        dd_q = (float*) gpu::alloc(QD * 4);
+        dd_out = (float*) gpu::alloc(QD * 4);
+        dd_ws = (float*) gpu::alloc((size_t) c.heads * (size_t) gpu::kAttnDecMaxSplit * (D + 2) * 4);
+        ok = dd_q && dd_out && dd_ws;
+    }
+    if (!ok) { release_attn(); std::fprintf(stderr, "gptoss: decode attention stays on the host (device allocation failed)\n"); return false; }
+    // The staging buffer of kv_upload_rows grows with cudaMalloc on demand; once the expert pool has the VRAM that fails. Size it NOW for the biggest run
+    // dd_sync uses (2048 rows). The rows written here are placeholders: dev_kv_pos stays 0, so the first sync overwrites them.
+    {
+        const int rows = (int) std::min<long long>(2048, cap);
+        const std::vector<float> filler((size_t) rows * KD, 1.0f);
+        Layer* first = nullptr;
+        for (auto& y : L) if (!y.sliding) { first = &y; break; }
+        if (!first || !gpu::kv_upload_rows(dev_kfmt, filler.data(), first->dKc, first->dKinv, rows, 0, (int) KD, first->cap, false, 448.0f)) {
+            release_attn();
+            std::fprintf(stderr, "gptoss: decode attention stays on the host (staging buffer: %s)\n", gpu::last_error().c_str());
+            return false;
+        }
+    }
+    budget -= per_pos * (double) cap + fixed;
+    dd_cap = (int) cap;
+    dd_on = true;
+    dev_kv_pos = 0;
+    std::fprintf(stderr, "gptoss: decode attention on the card for the %d dense layers: KV for %d positions (%.2f GiB), from position %d on%s\n", nd, dd_cap,
+                 (per_pos * (double) cap + fixed) / 1073741824.0, dd_min, dd_check ? " [CHECK: the host result is used, the difference is logged]" : "");
+    return true;
+}
+
+// Host KV -> card KV of the dense layers for positions [dev_kv_pos, upto), in runs of 2048 rows so the staging buffer stays small.
+bool Model::Impl::dd_sync(int upto) {
+    if (dev_kv_pos >= upto) return true;
+    const size_t KD = (size_t) c.kv_dim();
+    const int from = dev_kv_pos;
+    const auto t0 = std::chrono::steady_clock::now();
+    std::lock_guard<std::mutex> g(gmu);
+    for (auto& y : L) {
+        if (y.sliding || !y.dKc) continue;
+        for (int pos = from; pos < upto;) {
+            const int run = std::min(2048, upto - pos);
+            if (!gpu::kv_upload_rows(dev_kfmt, &y.K[y.slot(pos) * KD], y.dKc, y.dKinv, run, pos, (int) KD, y.cap, false, 448.0f) ||
+                !gpu::kv_upload_rows(dev_vfmt, &y.V[y.slot(pos) * KD], y.dVc, y.dVinv, run, pos, (int) KD, y.cap, false, 448.0f)) {
+                std::fprintf(stderr, "gptoss: decode attention on the card off (KV sync: %s): the host attention continues\n", gpu::last_error().c_str());
+                dd_on = false;
+                return false;
+            }
+            pos += run;
+        }
+    }
+    dev_kv_pos = upto;
+    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    if (ms > 300.0) std::fprintf(stderr, "gptoss: decode attention: %d KV positions copied to the card in %.0f ms\n", upto - from, ms);
+    return true;
+}
+
+// ONE dense layer of ONE decode token on the card: this token's K/V row (already in the host ring) is packed into the card cache, q goes up, the
+// split-K kernel runs, the attention output [heads*D] comes back into w.att. On any failure the path is switched off for the session and the
+// caller runs the host attention for this layer (the host state is untouched).
+bool Model::Impl::attn_heads_dev(Layer& y, Work& w, int pos) {
+    const size_t KD = (size_t) c.kv_dim(), QD = (size_t) c.q_dim();
+    gpu::AttnShape a;
+    a.heads = c.heads; a.kv_heads = c.kv_heads; a.D = c.head_dim; a.window = c.window; a.sliding = false; a.cap = y.cap;
+    a.k_fmt = dev_kfmt; a.v_fmt = dev_vfmt; a.dKinv = y.dKinv; a.dVinv = y.dVinv;
+    std::lock_guard<std::mutex> g(gmu);
+    const bool ok = gpu::kv_upload_rows(dev_kfmt, &y.K[y.slot(pos) * KD], y.dKc, y.dKinv, 1, pos, (int) KD, y.cap, false, 448.0f) &&
+                    gpu::kv_upload_rows(dev_vfmt, &y.V[y.slot(pos) * KD], y.dVc, y.dVinv, 1, pos, (int) KD, y.cap, false, 448.0f) &&
+                    gpu::h2d(dd_q, w.q.data(), QD * 4) &&
+                    gpu::attn_decode(dd_q, y.dKc, y.dVc, y.d_sinks, pos, a, dd_ws, dd_out) &&
+                    gpu::d2h(w.att.data(), dd_out, QD * 4);
+    if (!ok) {
+        std::fprintf(stderr, "gptoss: decode attention on the card off (%s): the host attention continues\n", gpu::last_error().c_str());
+        dd_on = false; dd_cur = false;
+        return false;
+    }
+    ++dd_calls;
+    return true;
 }
 
 // Host KV -> device KV for positions [dev_kv_pos, upto) (what decode wrote since the last device prefill); banded layers only need the last `cap` of them.
@@ -1634,6 +1794,7 @@ void Model::forward(int token, int pos, std::vector<float>* logits_out) {
     Work& w = s.works[0];
     if (s.pdev_kv_pos > pos) s.pdev_kv_pos = pos;
     if (s.dev_kv_pos > pos) s.dev_kv_pos = pos;            // decode writes the host KV only: the device copy is valid up to here
+    s.dd_cur = s.dd_on && pos >= s.dd_min && pos < s.dd_cap && s.dd_sync(pos);   // the dense layers' history is on the card up to pos - 1
     for (int l = 0; l < c.layers; ++l) {
         Layer& L = s.L[(size_t) l];
         const auto t_a = std::chrono::steady_clock::now();
@@ -1655,6 +1816,7 @@ void Model::forward(int token, int pos, std::vector<float>* logits_out) {
             s.pr_exp += std::chrono::duration<double, std::milli>(t_d - t_c).count();
         }
     }
+    if (s.dd_cur) { s.dev_kv_pos = pos + 1; s.dd_cur = false; }   // every dense layer packed this token's row into the card cache
     if ((int) s.cached.size() > pos) s.cached.resize((size_t) pos);
     if ((int) s.cached.size() == pos) s.cached.push_back(token);
     if (logits_out) {
@@ -1676,6 +1838,7 @@ void Model::prefill(const int* tokens, int n, int start_pos, std::vector<float>*
     bool bad = start_pos < 0 || start_pos + n > s.o.ctx;
     for (int i = 0; i < n && !bad; ++i) bad = tokens[i] < 0 || tokens[i] >= c.vocab;
     if (bad) { if (logits_last) logits_last->assign((size_t) c.vocab, 0.0f); return; }
+    if (s.dev_kv_pos > start_pos) s.dev_kv_pos = start_pos;   // the host rows from start_pos on are rewritten: the card's copy of them is stale
     static const bool chk = std::getenv("GPTOSS_CHECK_PREFILL") != nullptr;
     if (chk && s.gpu_on && !s.in_check) {
         // The device prefill as in production, then the plain CPU path over the same tokens. The CPU result is kept (logits and K/V rows),
@@ -2030,6 +2193,11 @@ std::string Model::stats() const {
         char rb[200];
         std::snprintf(rb, sizeof rb, " [expert_run_async: %llu ok, %llu refused]", (unsigned long long) s.pr_runok, (unsigned long long) s.pr_runfail);
         r += rb;
+        if (s.dd_on || s.dd_calls) {
+            char db[160];
+            std::snprintf(db, sizeof db, " [decode attention on the card: %llu dense-layer calls]", (unsigned long long) s.dd_calls);
+            r += db;
+        }
     }
     if (s.pre_state.load() != 0) {
         const char* st[] = {"off", "running", "done", "stopped on an error"};

@@ -630,6 +630,119 @@ namespace gptoss
                         out[(size_t)t * QD + (size_t)hd * D + lane + 32 * i] = acc[i] * inv;
             }
 
+            // ---- DECODE attention of ONE token over the card's cache (flash-decoding). k_attn above gives each (token, head) ONE warp that walks every
+            // key in series: right for a prefill chunk, hopeless for one token over a long history (64 warps with 100k keys each). Here the keys of a head
+            // are cut into `nsplit` runs, one block of 4 warps per run. Each warp keeps the same online softmax as k_attn over its share of the run (keys
+            // u = a + warp, +4, ...), the block merges its 4 warps and writes (m, l, acc[D]) to the workspace, and k_attn_dec_merge combines the runs.
+            // The sink enters the softmax exactly once (run 0, warp 0). A warp or a run with no key keeps m = -1e30, l = 0, acc = 0, which the merge ignores.
+            template <typename T_K, typename T_V>
+            __global__ void k_attn_dec(const float *__restrict__ q, const T_K *__restrict__ Kc, const T_V *__restrict__ Vc,
+                                       const float *__restrict__ kinv, const float *__restrict__ vinv, const float *__restrict__ sinks,
+                                       int pos, int heads, int kv_heads, int D, int window, int cap, int sliding, float scale,
+                                       int chunk, int maxsplit, float *__restrict__ ws)
+            {
+                const int s = blockIdx.x, hd = blockIdx.y, lane = threadIdx.x & 31, wp = threadIdx.x >> 5;
+                const int KD = kv_heads * D, g = hd / (heads / kv_heads), nv = D >> 5;
+                const int lo = sliding ? max(0, pos - window + 1) : 0;
+                const int a0 = lo + s * chunk;
+                const int b0 = min(pos + 1, a0 + chunk);
+                float qv[4], acc[4];
+#pragma unroll
+                for (int i = 0; i < 4; ++i)
+                {
+                    qv[i] = i < nv ? q[(size_t)hd * D + lane + 32 * i] : 0.0f;
+                    acc[i] = 0.0f;
+                }
+                float m = (s == 0) ? sinks[hd] : -1e30f;
+                float l = (s == 0 && wp == 0) ? 1.0f : 0.0f;
+                for (int u = a0 + wp; u < b0; u += 4)
+                {
+                    const size_t slot = sliding ? (size_t)(u % cap) : (size_t)u;
+                    const T_K *kr = Kc + slot * KD + (size_t)g * D;
+                    const float kisc = kinv ? kinv[slot] : 1.0f;
+                    float sc = 0.0f;
+#pragma unroll
+                    for (int i = 0; i < 4; ++i)
+                        if (i < nv)
+                            sc += qv[i] * gpu::unpack_target_to_fp32<T_K>(kr[lane + 32 * i], kisc);
+#pragma unroll
+                    for (int o = 16; o > 0; o >>= 1)
+                        sc += __shfl_xor_sync(0xffffffffu, sc, o);
+                    sc *= scale;
+                    const float mn = fmaxf(m, sc), al = expf(m - mn), p = expf(sc - mn);
+                    l = l * al + p;
+                    const T_V *vr = Vc + slot * KD + (size_t)g * D;
+                    const float visc = vinv ? vinv[slot] : 1.0f;
+#pragma unroll
+                    for (int i = 0; i < 4; ++i)
+                        if (i < nv)
+                            acc[i] = acc[i] * al + p * gpu::unpack_target_to_fp32<T_V>(vr[lane + 32 * i], visc);
+                    m = mn;
+                }
+                __shared__ float sm[4], sl[4], sacc[4][128];
+                if (lane == 0)
+                {
+                    sm[wp] = m;
+                    sl[wp] = l;
+                }
+#pragma unroll
+                for (int i = 0; i < 4; ++i)
+                    if (i < nv)
+                        sacc[wp][lane + 32 * i] = acc[i];
+                __syncthreads();
+                if (wp == 0)
+                {
+                    const float M = fmaxf(fmaxf(sm[0], sm[1]), fmaxf(sm[2], sm[3]));
+                    float L = 0.0f, ov[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+#pragma unroll
+                    for (int w2 = 0; w2 < 4; ++w2)
+                    {
+                        const float f = expf(sm[w2] - M);
+                        L += sl[w2] * f;
+#pragma unroll
+                        for (int i = 0; i < 4; ++i)
+                            if (i < nv)
+                                ov[i] += sacc[w2][lane + 32 * i] * f;
+                    }
+                    float *pw = ws + ((size_t)hd * maxsplit + s) * (D + 2);
+                    if (lane == 0)
+                    {
+                        pw[0] = M;
+                        pw[1] = L;
+                    }
+#pragma unroll
+                    for (int i = 0; i < 4; ++i)
+                        if (i < nv)
+                            pw[2 + lane + 32 * i] = ov[i];
+                }
+            }
+
+            // One warp per head: combines the `nsplit` runs of k_attn_dec into the attention output.
+            __global__ void k_attn_dec_merge(const float *__restrict__ ws, int nsplit, int maxsplit, int D, float *__restrict__ out)
+            {
+                const int hd = blockIdx.x, lane = threadIdx.x, nv = D >> 5;
+                const float *base = ws + (size_t)hd * maxsplit * (D + 2);
+                float M = -1e30f;
+                for (int s = 0; s < nsplit; ++s)
+                    M = fmaxf(M, base[(size_t)s * (D + 2)]);
+                float L = 0.0f, ov[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+                for (int s = 0; s < nsplit; ++s)
+                {
+                    const float *pw = base + (size_t)s * (D + 2);
+                    const float f = expf(pw[0] - M);
+                    L += pw[1] * f;
+#pragma unroll
+                    for (int i = 0; i < 4; ++i)
+                        if (i < nv)
+                            ov[i] += pw[2 + lane + 32 * i] * f;
+                }
+                const float inv = 1.0f / L;
+#pragma unroll
+                for (int i = 0; i < 4; ++i)
+                    if (i < nv)
+                        out[(size_t)hd * D + lane + 32 * i] = ov[i] * inv;
+            }
+
         void *g_kv_scratch = nullptr;   // device staging for the host<->card KV rows (grown on demand)
         size_t g_kv_scratch_n = 0;      // bytes held
 
@@ -640,6 +753,7 @@ namespace gptoss
             if (g_kv_scratch)
                 cudaFree(g_kv_scratch);
             g_kv_scratch = nullptr;
+            g_kv_scratch_n = 0;   // a failed cudaMalloc below must not leave the old size next to a null pointer
             if (!ck(cudaMalloc(&g_kv_scratch, bytes), "kv scratch"))
                 return false;
             g_kv_scratch_n = bytes;
@@ -1168,6 +1282,42 @@ namespace gptoss
             else ATTN(float, float);
 #undef ATTN
             return ck(cudaGetLastError(), "k_attn launch");
+        }
+
+        bool attn_decode_supported(const AttnShape &a)
+        {
+            return a.D > 0 && a.D % 32 == 0 && a.D <= 128 && a.heads > 0 && a.kv_heads > 0 && a.heads % a.kv_heads == 0;
+        }
+
+        bool attn_decode(const float *dq, const void *dKc, const void *dVc, const float *dsinks, int pos, const AttnShape &a, float *dws, float *dout)
+        {
+            if (!attn_decode_supported(a) || !dws || pos < 0)
+            {
+                std::lock_guard<std::mutex> lk(g_err_mu);
+                g_err = "attn_decode: unsupported shape";
+                return false;
+            }
+            const int lo = a.sliding ? std::max(0, pos - a.window + 1) : 0;
+            const int nkeys = pos - lo + 1;
+            const int chunk = std::max(256, (nkeys + kAttnDecMaxSplit - 1) / kAttnDecMaxSplit);
+            const int nsplit = (nkeys + chunk - 1) / chunk;
+            const float scale = 1.0f / sqrtf((float)a.D);
+#define ATTN_DEC(KT, VT) k_attn_dec<KT, VT><<<dim3((unsigned)nsplit, (unsigned)a.heads), 128, 0, g_comp>>>( \
+    dq, (const KT *)dKc, (const VT *)dVc, a.dKinv, a.dVinv, dsinks, pos, a.heads, a.kv_heads, a.D, a.window, a.cap, a.sliding ? 1 : 0, scale, chunk, kAttnDecMaxSplit, dws)
+            if (a.k_fmt == 0 && a.v_fmt == 0) ATTN_DEC(__nv_fp8_e4m3, __nv_fp8_e4m3);
+            else if (a.k_fmt == 0 && a.v_fmt == 1) ATTN_DEC(__nv_fp8_e4m3, half);
+            else if (a.k_fmt == 1 && a.v_fmt == 0) ATTN_DEC(half, __nv_fp8_e4m3);
+            else if (a.k_fmt == 1 && a.v_fmt == 1) ATTN_DEC(half, half);
+            else if (a.k_fmt == 0) ATTN_DEC(__nv_fp8_e4m3, float);
+            else if (a.k_fmt == 1) ATTN_DEC(half, float);
+            else if (a.v_fmt == 0) ATTN_DEC(float, __nv_fp8_e4m3);
+            else if (a.v_fmt == 1) ATTN_DEC(float, half);
+            else ATTN_DEC(float, float);
+#undef ATTN_DEC
+            if (!ck(cudaGetLastError(), "k_attn_dec launch"))
+                return false;
+            k_attn_dec_merge<<<(unsigned)a.heads, 32, 0, g_comp>>>(dws, nsplit, kAttnDecMaxSplit, a.D, dout);
+            return ck(cudaGetLastError(), "k_attn_dec_merge launch");
         }
 
         int event_create()
