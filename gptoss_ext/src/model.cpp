@@ -109,6 +109,8 @@ struct Model::Impl {
     uint64_t base_hits = 0, base_lookups = 0, base_pcie = 0;   // counters at the start of the request, for the per-request line
     std::vector<uint64_t> usage;                       // [layer*E + expert]: times routed to (the profile)
     std::vector<uint64_t> lru_hits;                    // [layer*E + expert]: decode hits on an LRU slot, for --expert-promote
+    std::vector<uint32_t> recent;                      // [layer*E + expert]: routed to lately (halved every 512 decode tokens), for --expert-promote
+    uint64_t recent_tick = 0;
     uint64_t promotions = 0;                           // LRU <-> pinned swaps done by --expert-promote
     std::mutex gmu;                                    // every device call is serialised
 
@@ -290,6 +292,7 @@ bool Model::load(const std::string& dir, const RunOpts& opts, std::string& err) 
     }
     s.usage.assign((size_t) c.layers * (size_t) c.n_exp, 0);
     s.lru_hits.assign((size_t) c.layers * (size_t) c.n_exp, 0);
+    s.recent.assign((size_t) c.layers * (size_t) c.n_exp, 0);
     if (!opts.expert_profile.empty()) {
         if (FILE* fp = std::fopen(opts.expert_profile.c_str(), "rb")) {
             std::fclose(fp);
@@ -942,13 +945,19 @@ void Model::Impl::preload_wait() {
 }
 
 void Model::Impl::count_use(int li, const int32_t* idx) {
-    for (int k = 0; k < c.topk; ++k) __atomic_fetch_add(&usage[(size_t) li * (size_t) c.n_exp + (size_t) idx[k]], (uint64_t) 1, __ATOMIC_RELAXED);
+    for (int k = 0; k < c.topk; ++k) {
+        __atomic_fetch_add(&usage[(size_t) li * (size_t) c.n_exp + (size_t) idx[k]], (uint64_t) 1, __ATOMIC_RELAXED);
+        __atomic_fetch_add(&recent[(size_t) li * (size_t) c.n_exp + (size_t) idx[k]], (uint32_t) 1, __ATOMIC_RELAXED);
+    }
 }
 
 Slot* Model::Impl::resident(int li, int e, bool hit_only) {
     // The counters are the decode's, per request: only Model::forward sets `counting`, so a prefill that walks
     // every expert of a chunk does not dilute the hit rate the DONE line reports.
     const bool count = counting;
+    // 512 decode tokens = 512 * 36 layers * 4 experts lookups: the recent counters halve, so they follow the topic of the conversation
+    if (count && o.expert_promote > 0 && ++recent_tick % ((uint64_t) 512 * (uint64_t) c.layers * (uint64_t) c.topk) == 0)
+        for (uint32_t& v : recent) v >>= 1;
     if (pool.empty()) { if (count) ++host_served; return nullptr; }
     const long long key = (long long) li * c.n_exp + e;
     ++tick;
@@ -1006,7 +1015,7 @@ int Model::Impl::victim_slot(int li) {
 // is re-uploaded only if it is routed again.
 void Model::Impl::promote_locked(int li, int e, int slot_idx) {
     const long long key = (long long) li * c.n_exp + e;
-    const uint64_t mine = usage[(size_t) key];
+    const uint64_t mine = recent[(size_t) key];
     // The pinned set stays the size --pin-pct asked for: below that cap a promoted expert only pins, at the cap
     // it trades with the coldest pinned one. With --pin-pct 0 the cap is 0 and this flag does nothing, which is
     // what a pure-LRU run wants: there is no pinned set to correct.
@@ -1019,13 +1028,13 @@ void Model::Impl::promote_locked(int li, int e, int slot_idx) {
     } else {
         uint64_t worst = ~(uint64_t) 0;
         for (size_t i = 0; i < pool.size(); ++i)
-            if (pool[i].pinned && !pool[i].busy && usage[(size_t) pool[i].layer * (size_t) c.n_exp + (size_t) pool[i].exp] < worst) {
-                worst = usage[(size_t) pool[i].layer * (size_t) c.n_exp + (size_t) pool[i].exp];
+            if (pool[i].pinned && !pool[i].busy && pool[i].layer >= 0 && recent[(size_t) pool[i].layer * (size_t) c.n_exp + (size_t) pool[i].exp] < worst) {
+                worst = recent[(size_t) pool[i].layer * (size_t) c.n_exp + (size_t) pool[i].exp];
                 w = (int) i;
             }
         // Only trade if the demoted pinned expert really is colder than the one being promoted: this is what
         // stops two experts of the same rank from changing places on every token.
-        if (w < 0 || worst >= mine) { lru_hits[(size_t) key] = 0; return; }
+        if (w < 0 || worst + 4 > mine) { lru_hits[(size_t) key] = 0; return; }   // margin 4: two experts of the same rank never trade places
         if (pool[(size_t) w].layer < 0) { lru_hits[(size_t) key] = 0; return; }
         pool[(size_t) w].pinned = false;
         lru_hits[(size_t) pool[(size_t) w].layer * (size_t) c.n_exp + (size_t) pool[(size_t) w].exp] = 0;
