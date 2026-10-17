@@ -104,6 +104,14 @@ bool kv_download_rows(int fmt, void* host, const void* src, const float* iscl, i
 /// reserving anything, so an unsupported shape turns the path off with a printed reason instead of failing mid-prefill.
 bool attn_supported(const AttnShape& a);
 
+/// DECODE attention of ONE token at position `pos` over the card's packed cache (dKc / dVc, formats and per-row scales as in `a`), flash-decoding style:
+/// the keys of a head are split over up to kAttnDecMaxSplit blocks and merged, so a long history does not run on one warp per head. dq [heads*D] is the
+/// rotated query (device), the sink enters the softmax denominator once, dout [heads*D]. dws is a device workspace of heads * kAttnDecMaxSplit * (D + 2) floats.
+/// Banded layers (a.sliding) read keys pos-window+1 .. pos. The emulated device has no such kernel: attn_decode_supported() is false there.
+constexpr int kAttnDecMaxSplit = 128;
+bool attn_decode_supported(const AttnShape& a);
+bool attn_decode(const float* dq, const void* dKc, const void* dVc, const float* dsinks, int pos, const AttnShape& a, float* dws, float* dout);
+
 std::string last_error();
 bool last_oom();                       // true if the last failure was an allocation that did not fit (not a poisoned context: the host can shrink and retry)
 
