@@ -69,6 +69,15 @@ struct Model::Impl {
     std::vector<float> final_norm, rope_cos, rope_sin, lastn;
     std::vector<Work> works;
     std::vector<int> cached;
+    // --- RAM snapshots of the KV (GPTOSS_KV_SLOTS, default 2): the live KV of a conversation a request is about to abandon
+    struct KvSnap { std::vector<int> toks; std::string blob; uint64_t clock = 0; };
+    std::vector<KvSnap> snaps;
+    uint64_t snap_clock = 0;
+    int snap_slots = std::getenv("GPTOSS_KV_SLOTS") ? std::atoi(std::getenv("GPTOSS_KV_SLOTS")) : 2;
+    double snap_cap_gib = std::getenv("GPTOSS_KV_SLOTS_GIB") ? std::atof(std::getenv("GPTOSS_KV_SLOTS_GIB")) : 8.0;
+    void snap_stash();
+    bool snap_restore(size_t i);
+    void snap_consider(const std::vector<int>& ids);
     int chunk_max = 1;
     uint64_t oom_fallbacks = 0;                        // device calls that found the scratch/slot allocation did not fit: host fallback, device stays on
     // --- device state (empty/false unless RunOpts::cuda)
@@ -1651,8 +1660,86 @@ void Model::prefill(const int* tokens, int n, int start_pos, std::vector<float>*
     }
 }
 
+// ---- RAM snapshots of the KV. The live cache (`cached` + the K/V rows) is ONE conversation. A client that interleaves requests (an agent's
+// main chat and its side calls) used to wipe it at every switch and prefill the whole context again. Now the live state is copied into RAM
+// before a request throws most of it away, and a request that comes back to a stored prefix gets it back with a memcpy.
+void Model::Impl::snap_stash() {
+    const int n = (int) cached.size(), KD = c.kv_dim();
+    if (n < 64 || snap_slots <= 0) return;
+    const auto t0 = std::chrono::steady_clock::now();
+    size_t rows = 0;
+    for (const Layer& y : L) rows += (size_t) (n - (y.sliding ? std::max(0, n - y.cap) : 0));
+    const size_t bytes = rows * 2 * (size_t) KD * sizeof(float);
+    const double cap = snap_cap_gib * 1073741824.0;
+    if ((double) bytes > cap) return;
+    auto total = [&]() { double t = 0; for (const KvSnap& x : snaps) t += (double) x.blob.size(); return t; };
+    while (!snaps.empty() && ((int) snaps.size() >= snap_slots || total() + (double) bytes > cap)) {
+        size_t lru = 0;
+        for (size_t i = 1; i < snaps.size(); ++i) if (snaps[i].clock < snaps[lru].clock) lru = i;
+        snaps.erase(snaps.begin() + (std::ptrdiff_t) lru);
+    }
+    KvSnap sn;
+    try { sn.blob.resize(bytes); } catch (...) { return; }
+    sn.toks = cached;
+    sn.clock = ++snap_clock;
+    char* dst = &sn.blob[0];
+    const size_t rb = (size_t) KD * sizeof(float);
+    for (const Layer& y : L) {
+        const int lo = y.sliding ? std::max(0, n - y.cap) : 0;
+        for (int p = lo; p < n; ++p) { std::memcpy(dst, &y.K[y.slot(p) * (size_t) KD], rb); dst += rb; }
+        for (int p = lo; p < n; ++p) { std::memcpy(dst, &y.V[y.slot(p) * (size_t) KD], rb); dst += rb; }
+    }
+    snaps.push_back(std::move(sn));
+    std::fprintf(stderr, "gptoss: KV snapshot stored: %d tokens, %.0f MiB, %.0f ms (%zu in RAM)\n", n, (double) bytes / 1048576.0,
+                 std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(), snaps.size());
+}
+
+bool Model::Impl::snap_restore(size_t i) {
+    if (i >= snaps.size()) return false;
+    const KvSnap& sn = snaps[i];
+    const int n = (int) sn.toks.size(), KD = c.kv_dim();
+    const char* src = sn.blob.data();
+    const size_t rb = (size_t) KD * sizeof(float);
+    for (Layer& y : L) {
+        const int lo = y.sliding ? std::max(0, n - y.cap) : 0;
+        for (int p = lo; p < n; ++p) { std::memcpy(&y.K[y.slot(p) * (size_t) KD], src, rb); src += rb; }
+        for (int p = lo; p < n; ++p) { std::memcpy(&y.V[y.slot(p) * (size_t) KD], src, rb); src += rb; }
+    }
+    cached = sn.toks;
+    pdev_kv_pos = 0;                                   // the host KV was replaced: the card's copy is re-uploaded at the next prefill (as in load_kv)
+    dev_kv_pos = 0;
+    return true;
+}
+
+void Model::Impl::snap_consider(const std::vector<int>& ids) {
+    if (ids.empty() || snap_slots <= 0) return;
+    const int n = (int) cached.size();
+    auto lcp = [&](const std::vector<int>& a) { size_t k = 0; while (k < a.size() && k < ids.size() && a[k] == ids[k]) ++k; return (int) k; };
+    const int k0 = lcp(cached);
+    int best = -1, bk = 0;
+    for (size_t i = 0; i < snaps.size(); ++i) { const int k = lcp(snaps[i].toks); if (k > bk) { bk = k; best = (int) i; } }
+    const int lost = n - k0;                           // tokens of the live cache the coming prefill will overwrite
+    const bool leaving = lost >= 1024 && lost >= n / 2;
+    if (best < 0 || bk <= k0 + 512) {                  // the live cache is the best start: keep it, but save it if this request abandons it
+        if (leaving) snap_stash();
+        return;
+    }
+    snaps[(size_t) best].clock = ++snap_clock;         // most recently used: the stash below must not evict the one we want
+    if (leaving) snap_stash();
+    best = -1; bk = 0;
+    for (size_t i = 0; i < snaps.size(); ++i) { const int k = lcp(snaps[i].toks); if (k > bk) { bk = k; best = (int) i; } }
+    if (best < 0) return;
+    const auto t0 = std::chrono::steady_clock::now();
+    if (snap_restore((size_t) best)) {
+        std::fprintf(stderr, "gptoss: KV snapshot restored: %d tokens (the live cache matched only %d), %.0f ms\n", (int) cached.size(), k0,
+                     std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+        snaps.erase(snaps.begin() + best);             // the live cache IS this state now; it is stored again if a request abandons it
+    }
+}
+
 int Model::reuse_prefix(const std::vector<int>& ids) {
     Impl& s = *p_;
+    s.snap_consider(ids);
     const int n = (int) s.cached.size();
     int k = 0;
     while (k < n && k < (int) ids.size() && s.cached[(size_t) k] == ids[(size_t) k]) ++k;

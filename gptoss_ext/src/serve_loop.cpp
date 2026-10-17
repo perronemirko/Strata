@@ -29,6 +29,20 @@ namespace gptoss
     namespace
     {
 
+        /// The live KV to disk (--kv-checkpoint): tmp + rename inside Model::save_kv, so a kill never leaves half a file.
+        void save_ckpt(Model &m, const RunOpts &o, const char *why)
+        {
+            if (o.kv_checkpoint.empty())
+                return;
+            std::string kerr;
+            const auto ts = std::chrono::steady_clock::now();
+            if (m.save_kv(o.kv_checkpoint, kerr))
+                std::fprintf(stderr, "gptoss_run: KV checkpoint saved (%s): %d tokens, %.0f ms\n", why, m.cached_len(), std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - ts).count());
+            else
+                std::fprintf(stderr, "gptoss_run: KV checkpoint FAILED (%s): %s\n", why, kerr.c_str());
+            std::fflush(stderr);
+        }
+
         /// Line reader over fd 0 (a pipe from serve/server.py).
         class LineReader
         {
@@ -319,6 +333,8 @@ namespace gptoss
                 const bool last = pos + n == (int)ids.size();
                 m.prefill(ids.data() + pos, n, pos, last ? &logits : nullptr); // logits only for the token that starts the answer
                 pos += n;
+                if (!last)
+                    save_ckpt(m, o, "prefill");   // a long prompt: the work done so far survives a kill
                 const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
                 const double rate = (double)(pos - keep) * 1000.0 / std::max(ms, 1e-9);
                 std::printf("PP %d %zu %.1f %.2f\n", pos, ids.size(), ms, rate);
@@ -342,6 +358,7 @@ namespace gptoss
             {
                 std::printf("DONE 0 %zu %.1f 0.0 cancel\n", ids.size(), prefill_ms);
                 std::fflush(stdout);
+                save_ckpt(m, o, "prefill cancelled");
                 continue;
             }
             if (logits.empty())
