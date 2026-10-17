@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <numeric>
 #include <cstdlib>
 #include <cstdlib>
 #include <cstring>
@@ -69,6 +70,23 @@ struct Model::Impl {
     std::vector<float> final_norm, rope_cos, rope_sin, lastn;
     std::vector<Work> works;
     std::vector<int> cached;
+    bool prof_on = std::getenv("GPTOSS_PROFILE") && std::getenv("GPTOSS_PROFILE")[0] == '1';   // per-token timing of the decode phases
+    double pr_attn = 0, pr_route = 0, pr_exp = 0, pr_head = 0;                                       // ms, summed over the request
+    uint64_t pr_tok = 0;
+    double pr_enq = 0, pr_cpu = 0, pr_col = 0;           // the experts' share, split
+    uint64_t pr_runok = 0, pr_runfail = 0;               // expert_run_async results in the decode
+    // --- next-layer expert prefetch (GPTOSS_PREFETCH=N, 0 = off)
+    int pf_n = std::getenv("GPTOSS_PREFETCH") ? std::atoi(std::getenv("GPTOSS_PREFETCH")) : 0;
+    int pf_max = std::getenv("GPTOSS_PREFETCH_MAX") ? std::atoi(std::getenv("GPTOSS_PREFETCH_MAX")) : 3;
+    struct PfPend { int slot, layer, e; };
+    std::vector<PfPend> pf_pend;                       // slots reserved and being filled (busy, unpublished)
+    std::vector<int> pf_pred_set, pf_up;               // the layer pf_layer: experts predicted / experts actually uploaded ahead
+    std::vector<float> pf_h, pf_g;
+    int pf_layer = -1, pf_ev = -1;
+    const float* pf_x = nullptr;                       // the residual stream of the token being decoded (set by Model::forward)
+    uint64_t pf_routed = 0, pf_pred_hit = 0, pf_uploaded = 0, pf_used = 0;
+    void prefetch_next(int li, const int32_t* idx);
+    void prefetch_land(int li, const int32_t* idx);
     // --- RAM snapshots of the KV (GPTOSS_KV_SLOTS, default 2): the live KV of a conversation a request is about to abandon
     struct KvSnap { std::vector<int> toks; std::string blob; uint64_t clock = 0; };
     std::vector<KvSnap> snaps;
@@ -434,6 +452,79 @@ void Model::Impl::route_tok(Layer& y, Work& w, const float* x, int32_t* idx, flo
     for (int e = 0; e < c.n_exp; ++e) w.glog[(size_t) e] += y.rbias[(size_t) e];
     route(w.glog.data(), c.n_exp, c.topk, idx, wt);
     count_use((int) (&y - L.data()), idx);
+}
+
+// ---- prefetch of the next layer's experts. prefetch_next runs right after layer li's experts are enqueued on the card; prefetch_land runs at the
+// start of layer li+1: it waits for the copies (long finished by then), publishes the slots and scores the prediction.
+void Model::Impl::prefetch_next(int li, const int32_t* idx) {
+    (void) idx;
+    if (pf_n <= 0 || !pf_x || !gpu_on || pool.empty() || li + 1 >= c.layers || in_parallel_region()) return;
+    const int H = c.hidden, E = c.n_exp, I = c.moe_ff;
+    const size_t G1 = (size_t) H / 32, G2 = (size_t) I / 32;
+    Layer& y = L[(size_t) li + 1];
+    pf_h.resize((size_t) H); pf_g.resize((size_t) E);
+    rmsnorm(pf_x, y.post_ln.data(), c.eps, H, pf_h.data());
+    matvec(y.router, pf_h.data(), pf_g.data());
+    for (int e = 0; e < E; ++e) pf_g[(size_t) e] += y.rbias[(size_t) e];
+    const int P = std::min(pf_n, E);
+    std::vector<int> ord((size_t) E);
+    std::iota(ord.begin(), ord.end(), 0);
+    std::partial_sort(ord.begin(), ord.begin() + P, ord.end(), [&](int a, int b) { return pf_g[(size_t) a] > pf_g[(size_t) b] || (pf_g[(size_t) a] == pf_g[(size_t) b] && a < b); });
+    pf_layer = li + 1;
+    pf_pred_set.assign(ord.begin(), ord.begin() + P);
+    pf_up.clear();
+    std::lock_guard<std::mutex> g(gmu);
+    if (pf_ev < 0) pf_ev = gpu::event_create();
+    if (pf_ev < 0) return;
+    int issued = 0;
+    for (int e : pf_pred_set) {
+        if (issued >= pf_max) break;
+        if (where.find((long long) (li + 1) * E + e) != where.end()) continue;      // already resident
+        int v = -1;
+        for (size_t i = 0; i < pool.size() && v < 0; ++i) if (pool[i].layer < 0 && !pool[i].busy) v = (int) i;
+        if (v < 0) v = o.expert_lru_layered ? victim_slot(li + 1) : -1;
+        if (v < 0) {
+            uint64_t best = ~(uint64_t) 0;
+            for (size_t i = 0; i < pool.size(); ++i) if (!pool[i].pinned && !pool[i].busy && pool[i].tick < best) { best = pool[i].tick; v = (int) i; }
+        }
+        if (v < 0) break;                                                           // every slot pinned or in use
+        Slot& sl = pool[(size_t) v];
+        if (sl.layer >= 0) where.erase((long long) sl.layer * E + sl.exp);
+        sl.layer = -1; sl.busy = true;
+        const size_t ee = (size_t) e;
+        const bool ok = gpu::h2d_copy_async(sl.gu_b, y.gu.blocks + ee * 2 * I * G1 * 16, 2 * I * G1 * 16) && gpu::h2d_copy_async(sl.gu_s, y.gu.scales + ee * 2 * I * G1, 2 * I * G1) &&
+                        gpu::h2d_copy_async(sl.dn_b, y.dn.blocks + ee * H * G2 * 16, H * G2 * 16) && gpu::h2d_copy_async(sl.dn_s, y.dn.scales + ee * H * G2, H * G2) &&
+                        gpu::h2d_copy_async(sl.gu_bias, y.gu_bias + ee * 2 * I, (size_t) 2 * I * 2) && gpu::h2d_copy_async(sl.dn_bias, y.dn_bias + ee * H, (size_t) H * 2);
+        pf_pend.push_back({v, li + 1, e});                                          // even on failure: prefetch_land waits, then frees the slot
+        pf_up.push_back(e);
+        ++issued;
+        if (!ok) { gpu_fail(gpu::last_error()); break; }
+    }
+    if (!pf_pend.empty()) gpu::event_record_copy(pf_ev);
+}
+
+void Model::Impl::prefetch_land(int li, const int32_t* idx) {
+    if (!pf_pend.empty()) {
+        std::lock_guard<std::mutex> g(gmu);
+        const bool ok = gpu::event_sync(pf_ev);
+        if (!ok) gpu_fail(gpu::last_error());
+        for (const PfPend& p : pf_pend) {
+            Slot& sl = pool[(size_t) p.slot];
+            const long long key = (long long) p.layer * c.n_exp + p.e;
+            if (ok && where.find(key) == where.end()) { sl.layer = p.layer; sl.exp = p.e; sl.tick = ++tick; where[key] = p.slot; ++pf_uploaded; }
+            else sl.layer = -1;
+            sl.busy = false;
+        }
+        pf_pend.clear();
+    }
+    if (pf_layer == li) {                                                           // score the prediction made one layer ago
+        for (int k = 0; k < c.topk; ++k) {
+            ++pf_routed;
+            if (std::find(pf_pred_set.begin(), pf_pred_set.end(), (int) idx[k]) != pf_pred_set.end()) ++pf_pred_hit;
+            if (std::find(pf_up.begin(), pf_up.end(), (int) idx[k]) != pf_up.end()) ++pf_used;
+        }
+        pf_layer = -1;
+    }
 }
 
 void Model::Impl::gpu_fail(const std::string& what) {
@@ -1111,6 +1202,8 @@ void Model::Impl::expert_add(Layer& y, Work& w, const float* h, int e, float wt,
 void Model::Impl::experts_decode(Layer& y, Work& w, const float* h, const int32_t* idx, const float* wt, float* acc) {
     const int H = c.hidden, I = c.moe_ff, K = c.topk, li = (int) (&y - L.data());
     if (cpu_miss && gpu_on && !pool.empty() && !in_parallel_region() && K <= gpu::kExpertCtxBatch) { experts_decode_miss(y, w, h, idx, wt, acc); return; }
+    prefetch_land(li, idx);
+    const auto e0 = std::chrono::steady_clock::now();
     Slot* fly[gpu::kExpertCtxBatch] = {};
     if (gpu_on && !pool.empty() && !in_parallel_region()) {
         std::lock_guard<std::mutex> g(gmu);
@@ -1122,10 +1215,17 @@ void Model::Impl::experts_decode(Layer& y, Work& w, const float* h, const int32_
             d.dn_b = sl->dn_b; d.dn_s = sl->dn_s; d.dn_bias = sl->dn_bias;
             d.H = H; d.I = I; d.halves = o.glu_halves ? 1 : 0; d.limit = c.swiglu_limit; d.alpha = c.swiglu_alpha;
             sl->busy = true;                                   // set before the enqueue: the next resident() of this loop must not pick it as the victim
-            if (gpu::expert_run_async(k, d, h, &wt[k], 1)) fly[k] = sl;
-            else { sl->busy = false; gpu_fail(gpu::last_error()); }
+            if (gpu::expert_run_async(k, d, h, &wt[k], 1)) { fly[k] = sl; ++pr_runok; }
+            else {
+                sl->busy = false; ++pr_runfail;
+                if (pr_runfail == 1) std::fprintf(stderr, "gptoss: expert_run_async refused (context %d): last_error='%s' oom=%d: its experts run on the synchronous path\n", k, gpu::last_error().c_str(), (int) gpu::last_oom());
+                gpu_fail(gpu::last_error());
+            }
         }
     }
+    const auto e1 = std::chrono::steady_clock::now();
+    auto e2 = e1;
+    if (pf_n > 0) prefetch_next(li, idx);                      // the card is busy with this layer: predict and start copying the next one's experts
     float* part = w.part.data();
     for (int k = 0; k < K; ++k) {                              // CPU share: runs while the device computes the experts above
         if (k < gpu::kExpertCtxBatch && fly[k]) continue;
@@ -1134,11 +1234,18 @@ void Model::Impl::experts_decode(Layer& y, Work& w, const float* h, const int32_
         expert_add(y, w, h, idx[k], wt[k], pk);
     }
     for (int k = 0; k < K && k < gpu::kExpertCtxBatch; ++k) {  // collect: the device already applied wt[k] and the down bias
+        if (k == 0) e2 = std::chrono::steady_clock::now();
         if (!fly[k]) continue;
         float* pk = part + (size_t) k * H;
         bool ok;
         { std::lock_guard<std::mutex> g(gmu); ok = gpu::expert_collect(k, pk); fly[k]->busy = false; if (!ok) gpu_fail(gpu::last_error()); }
         if (!ok) { std::fill(pk, pk + H, 0.0f); expert_add(y, w, h, idx[k], wt[k], pk); }
+    }
+    if (prof_on) {
+        const auto e3 = std::chrono::steady_clock::now();
+        pr_enq += std::chrono::duration<double, std::milli>(e1 - e0).count();
+        pr_cpu += std::chrono::duration<double, std::milli>(e2 - e1).count();
+        pr_col += std::chrono::duration<double, std::milli>(e3 - e2).count();
     }
     for (int k = 0; k < K; ++k) { const float* pk = part + (size_t) k * H; for (int i = 0; i < H; ++i) acc[i] += pk[i]; }
 }
@@ -1520,22 +1627,35 @@ void Model::forward(int token, int pos, std::vector<float>* logits_out) {
     if (s.dev_kv_pos > pos) s.dev_kv_pos = pos;            // decode writes the host KV only: the device copy is valid up to here
     for (int l = 0; l < c.layers; ++l) {
         Layer& L = s.L[(size_t) l];
+        const auto t_a = std::chrono::steady_clock::now();
         s.attn_in(L, w, x.data(), pos);
         s.attn_out(L, w, x.data(), pos);
         int32_t idx[64]; float wt[64];
+        const auto t_b = std::chrono::steady_clock::now();
         s.route_tok(L, w, x.data(), idx, wt);
+        const auto t_c = std::chrono::steady_clock::now();
         const std::vector<float> h = w.h;
         std::fill(acc.begin(), acc.end(), 0.0f);
+        s.pf_x = x.data();
         s.experts_decode(L, w, h.data(), idx, wt, acc.data());   // device experts in flight together; whatever has no slot runs on the host
         for (int i = 0; i < H; ++i) x[(size_t) i] += acc[(size_t) i];
+        if (s.prof_on) {
+            const auto t_d = std::chrono::steady_clock::now();
+            s.pr_attn += std::chrono::duration<double, std::milli>(t_b - t_a).count();
+            s.pr_route += std::chrono::duration<double, std::milli>(t_c - t_b).count();
+            s.pr_exp += std::chrono::duration<double, std::milli>(t_d - t_c).count();
+        }
     }
     if ((int) s.cached.size() > pos) s.cached.resize((size_t) pos);
     if ((int) s.cached.size() == pos) s.cached.push_back(token);
     if (logits_out) {
+        const auto t_h0 = std::chrono::steady_clock::now();
         rmsnorm(x.data(), s.final_norm.data(), c.eps, H, s.lastn.data());
         logits_out->resize((size_t) c.vocab);
         s.mv(s.lm_head, s.d_head, s.lastn.data(), logits_out->data());
+        if (s.prof_on) s.pr_head += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_h0).count();
     }
+    if (s.prof_on) ++s.pr_tok;
     s.counting = false;
 }
 
@@ -1854,6 +1974,7 @@ bool Model::load_profile(const std::string& path, std::string& err) {
 void Model::begin_request_stats() {
     Impl& s = *p_;
     s.base_hits = s.hits; s.base_lookups = s.hits + s.host_served; s.base_pcie = s.pcie_served;
+    s.pr_attn = s.pr_route = s.pr_exp = s.pr_head = 0; s.pr_tok = 0; s.pr_enq = s.pr_cpu = s.pr_col = 0; s.pr_runok = s.pr_runfail = 0;
 }
 
 void Model::request_stats(unsigned long long* hits, unsigned long long* lookups, unsigned long long* pcie) const {
@@ -1888,6 +2009,19 @@ std::string Model::stats() const {
                       (unsigned long long) s.promotions);
     }
     std::string r = b;
+    if (s.prof_on && s.pr_tok > 0) {
+        char pb[300];
+        const double n = (double) s.pr_tok;
+        std::snprintf(pb, sizeof pb, ", decode ms per token (%llu tokens): attention %.1f, router %.1f, experts %.1f, lm_head %.1f, total %.1f", (unsigned long long) s.pr_tok,
+                      s.pr_attn / n, s.pr_route / n, s.pr_exp / n, s.pr_head / n, (s.pr_attn + s.pr_route + s.pr_exp + s.pr_head) / n);
+        r += pb;
+        char qb[300];
+        std::snprintf(qb, sizeof qb, " [experts split: enqueue+miss upload %.1f, cpu share %.1f, wait for the card %.1f]", s.pr_enq / n, s.pr_cpu / n, s.pr_col / n);
+        r += qb;
+        char rb[200];
+        std::snprintf(rb, sizeof rb, " [expert_run_async: %llu ok, %llu refused]", (unsigned long long) s.pr_runok, (unsigned long long) s.pr_runfail);
+        r += rb;
+    }
     if (s.pre_state.load() != 0) {
         const char* st[] = {"off", "running", "done", "stopped on an error"};
         std::snprintf(b, sizeof b, ", preload %zu/%zu (%s)", s.pre_done.load(), s.pre_targets.size(), st[s.pre_state.load()]);
@@ -1896,6 +2030,11 @@ std::string Model::stats() const {
     if (s.ram_state.load() != 0) {
         const char* st[] = {"off", "running", "done", "stopped on an error"};
         std::snprintf(b, sizeof b, ", page-locked %zu layers %.1f GiB (%s)", s.ram_layers.load(), (double) s.ram_bytes.load() / 1073741824.0, st[s.ram_state.load()]);
+        r += b;
+    }
+    if (s.pf_n > 0 && s.pf_routed > 0) {
+        std::snprintf(b, sizeof b, ", prefetch top-%d: %.1f%% of the next layer's routed experts were in the predicted set, %llu uploaded ahead, %llu of the routed ones came from them", s.pf_n,
+                      100.0 * (double) s.pf_pred_hit / (double) s.pf_routed, (unsigned long long) s.pf_uploaded, (unsigned long long) s.pf_used);
         r += b;
     }
     return r;
