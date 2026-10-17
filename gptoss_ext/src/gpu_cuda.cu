@@ -727,7 +727,7 @@ namespace gptoss
                 else
                     k_exp_dn<<<(H + WARPS - 1) / WARPS, WARPS * 32, 0, st>>>(c.d_desc, c.d_act, c.d_eb);
                 k_exp_fin<<<(unsigned)std::min<size_t>(((size_t)N * H + 255) / 256, 65535), 256, 0, st>>>(c.d_desc, c.d_eb, c.d_y);
-                return !ck(cudaGetLastError(), "expert kernels");
+                return ck(cudaGetLastError(), "expert kernels");   // true = the kernels were launched (ck() is true on success)
             }
 
             bool enqueue_expert(ExpCtx &c, int N)
