@@ -1,39 +1,222 @@
-// gptoss_run - one-shot generation or the resident --serve engine for gpt-oss-120b (CPU).
+// gptoss_run - one-shot generation, the resident --serve engine, or the interactive CHAT mode for gpt-oss.
+//
+// Chat mode (this build's new front door): `gptoss --model DIR [--prompt "Ciao"]` tokenizes with the snapshot's
+// own o200k_harmony tokenizer (src/tokenizer.cpp), renders the Harmony template, and streams the final channel
+// of the answer.  With no --prompt it opens a REPL on stdin (/exit /reset /system ...).  A binary built with
+// `sh build.sh --cuda` runs chat mode ON THE GPU by default (--no-cuda forces the CPU); the plain binary is CPU.
 #include "gptoss/gpu.hpp"
 #include "gptoss/model.hpp"
 #include "gptoss/sampler.hpp"
 #include "gptoss/serve_loop.hpp"
+#include "gptoss/tokenizer.hpp"
 
+#include <algorithm>
 #include <chrono>
+#include <cctype>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <iostream>
 #include <sstream>
 #include <string>
 #include <vector>
-#include <iostream>
 
 using namespace gptoss;
 
 static void usage() {
     std::fprintf(stderr,
-        "gptoss_run --model DIR [--ctx N] [--threads N]\n"
-        "       [--prompt-ids 1,2,3 --n-predict N [--temperature T --top-k K --top-p P --seed S]] | [--serve [--eos-ids 200002,200012]]\n"
-        "       [--selfcheck] [--prefill-chunk N] [--kv-rollback N] [--kv-checkpoint FILE] [--kv-unified]\n"
-        "       [--cuda [--cuda-device N] [--vram-pct P] [--vram-total-mib N] [--vram-reserve-mib N] [--gpu-slots N] [--expert-profile FILE] [--expert-profile-save FILE] [--expert-profile-save-every SEC] [--pin-pct P] [--expert-promote N] [--expert-lru-layered] [--profile-decay N] [--prefill-dev-pct P]]\n"
-        "         -k FMT / --key-format FMT, -v FMT / --value-format FMT: format of the CARD KV cache, K and V INDEPENDENTLY (e4m3 = 1B, f16 = 2B, f32 = 4B; default f32).\n"
-        "         e4m3 cuts the KV windows 4x, f16 2x; the host cache and the KV checkpoint stay f32, the attention dequantizes in registers (no fp32 rows in VRAM).\n"
-        "         --prefill-dev-pct P: percent of the VRAM left for the device-resident prefill (its KV windows + chunk scratch); 0 = the old prefill (default 50)\n"
-        "         expert cache, opt-in (0/off = the previous release): --expert-promote N pins an LRU expert after N decode hits and unpins the coldest pinned one;\n"
-        "         --expert-lru-layered evicts inside the requesting layer first; --profile-decay N halves the usage profile past N routed activations\n"
-        "         --no-device-graphs: the decode experts run as separate kernel enqueues, no CUDA graph captured (the switch that isolates the graph from the stream/event ordering)\n"
-        "         --no-async-dense: the decode's q/k/v run as three separate round-trips (the control arm for the fused one)\n"
-        "  facts the model card does not settle (docs/gptoss_porting.md):  --glu-halves  --rope-pairs  --no-concentration\n");
+        "gptoss --model DIR [--ctx N] [--threads N]\n"
+        "  CHAT (the default when no ids are given):\n"
+        "       [--prompt TEXT]            one-shot: answer a single user message and exit\n"
+        "       [--chat]                   interactive REPL on stdin (/exit /reset /system TEXT)\n"
+        "       [--system TEXT]            developer instructions for the conversation\n"
+        "       [--reasoning low|medium|high]\n"
+        "       [--show-thinking]          stream the analysis channel too (default: final only)\n"
+        "       [--no-cuda]                force the CPU path (a CUDA build defaults to the GPU in chat mode)\n"
+        "  ONE-SHOT TOKENS:\n"
+        "       --prompt-ids 1,2,3 --n-predict N [--temperature T --top-k K --top-p P --seed S]\n"
+        "  ENGINE: --serve [--eos-ids ...] | --selfcheck\n"
+        "         --ctx N --threads N --prefill-chunk N --kv-rollback N --kv-checkpoint FILE --kv-unified\n"
+        "         --cuda [--cuda-device N] [--vram-pct P] [--vram-total-mib N] [--vram-reserve-mib N]\n"
+        "         [-k FMT -v FMT: e4m3|f16|f32, the CARD KV cache format (default f32)]\n"
+        "         --gpu-slots N --expert-profile FILE --expert-profile-save FILE [--pin-pct P] [--pin-ram-gib G]\n"
+        "         [--expert-promote N] [--expert-lru-layered] [--profile-decay N] [--no-device-graphs] [--no-async-dense]\n"
+        "         [--prefill-dev-pct P] [--no-preload] [--preload-wait] [--verbose]\n"
+        "  facts the model card does not settle (docs/gptoss_porting.md): --glu-halves --rope-pairs --no-concentration\n");
 }
 
+namespace {
+
+std::string trim(const std::string& s) {
+    size_t a = 0, b = s.size();
+    while (a < b && std::isspace((unsigned char) s[a])) ++a;
+    while (b > a && std::isspace((unsigned char) s[b - 1])) --b;
+    return s.substr(a, b - a);
+}
+
+// ------------------------------------------------------------------ streaming display of one answer
+// The model's raw completion is the Harmony stream: an optional analysis channel, then the final channel,
+// closed by <|return|>.  This printer decodes token by token (holding back the tail of an incomplete multi-byte
+// character - an emoji arrives as four single-byte tokens) and prints ONLY the final channel as it forms; with
+// show_thinking it also streams the analysis one.  At finish() whatever is left in the buffer is flushed, so a
+// reply cut by max-tokens still comes out whole.
+struct ChatPrinter {
+    static const char* kFinalTag;      // "<|channel|>final<|message|>"
+    static const char* kAnalysisTag;   // "<|channel|>analysis<|message|>"
+
+    bool show_thinking = false;
+    std::string buf;                   // decoded bytes not yet promoted to raw (an incomplete UTF-8 tail)
+    std::string raw;                   // every complete generated byte, tags included
+    size_t printed_final = 0;          // offset in raw already printed for the final window
+    size_t printed_think = 0;          // ... and for the analysis one
+    bool think_done = false;
+
+    void on_token(const Tokenizer& tk, int id) {
+        std::string b;
+        if (!tk.decode_token(id, b)) return;   // an out-of-range id: skip it rather than crash mid-stream
+        buf += b;
+        const size_t n = utf8_printable_prefix(buf);
+        if (n) { raw.append(buf.data(), n); buf.erase(0, n); }
+        pump();
+    }
+
+    void pump() {
+        // The analysis window: from its tag to the next <|end|>.  Printed only when asked for.
+        if (show_thinking && !think_done) {
+            const size_t a = raw.find(kAnalysisTag);
+            if (a != std::string::npos) {
+                const size_t c0 = a + std::strlen(kAnalysisTag);
+                const size_t e = raw.find("<|end|>", c0);
+                const size_t lim = e == std::string::npos ? raw.size() : e;   // content ends at the tag, not in it
+                if (printed_think < c0) printed_think = c0;
+                if (printed_think < lim && raw.size() > printed_think) {
+                    // Cap at the window end: once <|end|> has arrived, bytes after it belong to the next channel.
+                    const size_t m = std::min(lim - printed_think, utf8_printable_prefix(raw.substr(printed_think)));
+                    if (m) { std::fwrite(raw.data() + printed_think, 1, m, stdout); printed_think += m; }
+                }
+                if (e != std::string::npos && printed_think >= e) think_done = true;   // the whole window is out
+            }
+        }
+        // The final window: from its tag to the end of what exists so far.
+        const size_t f = raw.rfind(kFinalTag);
+        if (f != std::string::npos) {
+            const size_t c0 = f + std::strlen(kFinalTag);
+            if (printed_final < c0) printed_final = c0;
+            const size_t m = utf8_printable_prefix(raw.substr(printed_final));
+            if (m) { std::fwrite(raw.data() + printed_final, 1, m, stdout); printed_final += m; }
+        }
+    }
+
+    /// End of generation: flush the held tail and print whatever a cut-off stream never tagged.
+    void finish(std::string& thinking_out, std::string& final_out) {
+        raw += buf; buf.clear();
+        pump();
+        // A reply that carried no channel tags at all is plain content (parse_assistant_reply says so too).
+        if (raw.find("<|channel|>") == std::string::npos && printed_final < raw.size()) {
+            const size_t m = utf8_printable_prefix(raw.substr(printed_final));
+            if (m) { std::fwrite(raw.data() + printed_final, 1, m, stdout); printed_final += m; }
+        }
+        parse_assistant_reply(raw, thinking_out, final_out);
+    }
+};
+
+const char* ChatPrinter::kFinalTag = "<|channel|>final<|message|>";
+const char* ChatPrinter::kAnalysisTag = "<|channel|>analysis<|message|>";
+
+// ------------------------------------------------------------------ one turn: prompt -> ids -> prefill -> decode
+/// Builds the Harmony prompt for `hist` (the last entry is the new user message), reuses whatever of it the KV
+/// cache already holds, prefills the rest in chunks and decodes until a stop id or max_new.  Returns false when
+/// the prompt does not fit the context.  The answer's channels come back parsed; the final one was streamed to
+/// stdout as it formed.
+bool run_turn(Model& m, const RunOpts& o, Tokenizer& tk, const std::vector<ChatMsg>& hist,
+              const std::string& system, const std::string& reasoning, int max_new, const SampleOpts& so,
+              const std::vector<int>& stops, ChatPrinter& pr, std::string& thinking_out, std::string& final_out) {
+    const std::string prompt_text = build_chat_prompt(hist, system, reasoning);
+    std::vector<int> ids;
+    if (tk.encode(prompt_text, ids) != 0) { std::fprintf(stderr, "gptoss: the tokenizer refused the prompt\n"); return false; }
+    if ((int) ids.size() >= o.ctx) {
+        std::fprintf(stderr, "gptoss: the conversation (%zu tokens) does not fit the context (%d): /reset or raise --ctx\n", ids.size(), o.ctx);
+        return false;
+    }
+    if (max_new > o.ctx - (int) ids.size()) max_new = o.ctx - (int) ids.size();
+
+    std::vector<float> logits;
+    const int keep = m.reuse_prefix(ids);   // the system block + every previous turn are already in the cache
+    const auto t0 = std::chrono::steady_clock::now();
+    int pos = keep;
+    const int chunk = o.prefill_chunk > 0 ? o.prefill_chunk : (o.cuda ? 8192 : 512);
+    while (pos < (int) ids.size()) {
+        const int n = std::min(chunk, (int) ids.size() - pos);
+        m.prefill(ids.data() + pos, n, pos, pos + n == (int) ids.size() ? &logits : nullptr);
+        pos += n;
+    }
+    const double prefill_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+
+    Sampler sm(so);
+    std::vector<int> history(ids.begin(), ids.end());   // the penalties count over prompt + generated
+    const auto tg = std::chrono::steady_clock::now();
+    int generated = 0;
+    for (int i = 0; i < max_new && pos < o.ctx; ++i) {
+        const int tok = sm.sample(logits.data(), (int) logits.size(), history);
+        pr.on_token(tk, tok);
+        history.push_back(tok);
+        ++generated;
+        bool stop = false;
+        for (size_t s = 0; s < stops.size(); ++s) if (stops[s] == tok) { stop = true; break; }
+        if (stop) break;
+        m.forward(tok, pos++, &logits);
+    }
+    const double decode_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tg).count();
+    pr.finish(thinking_out, final_out);
+    std::fflush(stdout);
+    std::fprintf(stderr, "gptoss: %zu prompt (%zu read) -> %d tokens (%.0f ms prefill = %.1f tok/s, %.0f ms decode = %.1f tok/s)\n",
+                 ids.size(), (size_t)(ids.size() - keep), generated, prefill_ms,
+                 (double)(ids.size() - keep) * 1000.0 / std::max(prefill_ms, 1e-9), decode_ms,
+                 (double)generated * 1000.0 / std::max(decode_ms, 1e-9));
+    return true;
+}
+
+// ------------------------------------------------------------------ the REPL
+int chat_repl(Model& m, const RunOpts& o, Tokenizer& tk, std::string system, const std::string& reasoning,
+              bool show_thinking, int max_new_default, const SampleOpts& so, const std::vector<int>& stops) {
+    std::vector<ChatMsg> hist;
+    std::fprintf(stderr, "gptoss: chat REPL - /exit quits, /reset clears the conversation, /system TEXT sets the instructions\n");
+    for (;;) {
+        std::printf("you> ");
+        std::fflush(stdout);
+        std::string line;
+        if (!std::getline(std::cin, line)) break;   // EOF (Ctrl-D) ends the session
+        const std::string t = trim(line);
+        if (t.empty()) continue;
+        if (t == "/exit" || t == "/quit") break;
+        if (t == "/reset") { hist.clear(); m.reset(); std::fprintf(stderr, "gptoss: conversation cleared\n"); continue; }
+        if (t.size() > 7 && t.compare(0, 7, "/system") == 0) { system = trim(t.substr(7)); std::fprintf(stderr, "gptoss: system instructions set (%zu chars)\n", system.size()); continue; }
+        if (t[0] == '/') { std::fprintf(stderr, "gptoss: unknown command %s\n", t.c_str()); continue; }
+
+        ChatMsg user; user.role = "user"; user.content = line;
+        hist.push_back(user);
+        ChatPrinter pr; pr.show_thinking = show_thinking;
+        std::string thinking, final_text;
+        if (!run_turn(m, o, tk, hist, system, reasoning, max_new_default, so, stops, pr, thinking, final_text)) {
+            hist.pop_back();   // the turn never ran: do not keep a user message the model never saw
+            continue;
+        }
+        std::fprintf(stderr, "\n");
+        // The assistant turn goes back in with its FINAL content only (the template drops the analysis of every
+        // previous turn during inference); an empty final (a cut-off or tool-only reply) is kept as-is.
+        ChatMsg asst; asst.role = "assistant"; asst.content = final_text; asst.thinking = thinking;
+        hist.push_back(asst);
+    }
+    return 0;
+}
+
+}  // namespace
+
 int main(int argc, char** argv) {
-    std::string dir, ids_s, eos_s;
+    std::string dir, ids_s, eos_s, prompt, system, reasoning;
     RunOpts o; SampleOpts so;
-    int n_predict = 32; bool serve = false, selfcheck = false, allow_emu = false;
+    int n_predict = -1; bool serve = false, selfcheck = false, allow_emu = false;
+    bool chat_flag = false, show_thinking = false, cuda_set = false;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         auto val = [&]() -> const char* { if (i + 1 >= argc) { usage(); std::exit(2); } return argv[++i]; };
@@ -52,26 +235,21 @@ int main(int argc, char** argv) {
         else if (a == "--kv-checkpoint") o.kv_checkpoint = val();
         else if (a == "--kv-unified") {}      // accepted for llama.cpp parity: one sequence, one shared cache already
         else if ((a == "-k" || a == "--key-format") && i + 1 < argc) {
-            std::string val = argv[++i];
-            if (val == "e4m3")  o.key_format = KVFormat::E4M3;
-            else if (val == "f16") o.key_format = KVFormat::F16;
-            else if (val == "f32") o.key_format = KVFormat::F32;
-            else {
-                std::cerr << "Formato Key non valido: " << val << " (usa e4m3, f16, f32)\n";
-                exit(1);
-            }
-        } 
-        else if ((a == "-v" || a == "--value-format") && i + 1 < argc) {
-            std::string val = argv[++i];
-            if (val == "e4m3")  o.value_format = KVFormat::E4M3;
-            else if (val == "f16") o.value_format = KVFormat::F16;
-            else if (val == "f32") o.value_format = KVFormat::F32;
-            else {
-                std::cerr << "Formato Value non valido: " << val << " (usa e4m3, f16, f32)\n";
-                exit(1);
-            }
+            std::string v = argv[++i];
+            if (v == "e4m3") o.key_format = KVFormat::E4M3;
+            else if (v == "f16") o.key_format = KVFormat::F16;
+            else if (v == "f32") o.key_format = KVFormat::F32;
+            else { std::cerr << "Formato Key non valido: " << v << " (usa e4m3, f16, f32)\n"; exit(1); }
         }
-        else if (a == "--cuda") o.cuda = true;
+        else if ((a == "-v" || a == "--value-format") && i + 1 < argc) {
+            std::string v = argv[++i];
+            if (v == "e4m3") o.value_format = KVFormat::E4M3;
+            else if (v == "f16") o.value_format = KVFormat::F16;
+            else if (v == "f32") o.value_format = KVFormat::F32;
+            else { std::cerr << "Formato Value non valido: " << v << " (usa e4m3, f16, f32)\n"; exit(1); }
+        }
+        else if (a == "--cuda") { o.cuda = true; cuda_set = true; }
+        else if (a == "--no-cuda") { o.cuda = false; cuda_set = true; }
         else if (a == "--gpu-emu") { o.cuda = true; allow_emu = true; }     // tests only: the "device" is host memory
         else if (a == "--cuda-device") o.cuda_device = std::atoi(val());
         else if (a == "--gpu-slots") o.gpu_slots = std::atoi(val());
@@ -97,15 +275,30 @@ int main(int argc, char** argv) {
         else if (a == "--no-concentration") o.no_concentration = true;
         else if (a == "--serve") serve = true;
         else if (a == "--selfcheck") selfcheck = true;
+        // --- chat mode
+        else if (a == "--prompt") prompt = val();
+        else if (a == "--chat") chat_flag = true;
+        else if (a == "--system") system = val();
+        else if (a == "--reasoning") reasoning = val();
+        else if (a == "--show-thinking") show_thinking = true;
         else { usage(); return 2; }
     }
     if (dir.empty()) { usage(); return 2; }
-    if (o.cuda && gpu::is_emulated() && !allow_emu) { std::fprintf(stderr, "gptoss_run: this binary has the EMULATED device, not CUDA: rebuild with `sh build.sh --cuda`\n"); return 2; }
+
+    // Chat mode is the default whenever no token ids were given and this is not the serve/selfcheck path.
+    const bool chat_mode = !serve && !selfcheck && (chat_flag || !prompt.empty() || ids_s.empty());
+    if (chat_mode) {
+        // A CUDA build runs chat on the GPU by default; --no-cuda (or the plain CPU binary) keeps it on the host.
+        if (!cuda_set && !gpu::is_emulated()) { o.cuda = true; std::fprintf(stderr, "gptoss: chat mode on the GPU (pass --no-cuda for the CPU path)\n"); }
+    }
+    if (o.cuda && gpu::is_emulated() && !allow_emu) { std::fprintf(stderr, "gptoss: this binary has the EMULATED device, not CUDA: rebuild with `sh build.sh --cuda`\n"); return 2; }
+
     auto split = [](const std::string& s) { std::vector<int> v; std::stringstream ss(s); std::string t; while (std::getline(ss, t, ',')) if (!t.empty()) v.push_back(std::atoi(t.c_str())); return v; };
     Model m; std::string err;
     const auto t0 = std::chrono::steady_clock::now();
-    if (!m.load(dir, o, err)) { std::fprintf(stderr, "gptoss_run: %s\n", err.c_str()); return 1; }
-    std::fprintf(stderr, "gptoss_run: loaded in %.1f s\n", std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+    if (!m.load(dir, o, err)) { std::fprintf(stderr, "gptoss: %s\n", err.c_str()); return 1; }
+    std::fprintf(stderr, "gptoss: loaded in %.1f s\n", std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+
     if (selfcheck) {
         std::vector<float> lg; m.forward(m.config().bos >= 0 ? m.config().bos : 1, 0, &lg);
         double mn = 1e30, mx = -1e30; int bad = 0;
@@ -114,15 +307,49 @@ int main(int argc, char** argv) {
         return bad ? 1 : 0;
     }
     if (serve) { std::vector<int> eos = split(eos_s); return serve_loop(m, o, eos); }
+
+    // ------------------------------------------------------------------ chat mode
+    if (chat_mode) {
+        Tokenizer tk;
+        if (!Tokenizer::load(dir, tk, err)) { std::fprintf(stderr, "gptoss: %s\n", err.c_str()); return 1; }
+        const int max_new = n_predict > 0 ? n_predict : 512;
+        // Stop ids: the config eos (<|return|>) plus <|call|> (a tool call ends a turn too).
+        std::vector<int> stops = split(eos_s);
+        if (stops.empty()) {
+            if (m.config().eos >= 0) stops.push_back(m.config().eos);
+            stops.push_back(200012);   // <|call|>: the tool-call end of a turn (docs/gptoss_porting.md, item 7)
+        }
+        if (!prompt.empty()) {   // one-shot: a single user message, the answer on stdout, then exit.
+            std::vector<ChatMsg> hist;
+            ChatMsg u; u.role = "user"; u.content = prompt;
+            hist.push_back(u);
+            ChatPrinter pr; pr.show_thinking = show_thinking;
+            std::string thinking, final_text;
+            if (!run_turn(m, o, tk, hist, system, reasoning, max_new, so, stops, pr, thinking, final_text)) return 1;
+        } else {
+            return chat_repl(m, o, tk, system, reasoning, show_thinking, max_new, so, stops);
+        }
+        // one-shot: write the profile at exit, as the token path does
+        const std::string pp = !o.expert_profile_save.empty() ? o.expert_profile_save : o.expert_profile;
+        if (!pp.empty()) {
+            std::string perr;
+            if (m.save_profile(pp, perr)) { std::fprintf(stderr, "gptoss: expert profile saved to %s (exit)\n", pp.c_str()); m.decay_profile(); }
+            else std::fprintf(stderr, "gptoss: profile save FAILED: %s\n", perr.c_str());
+        }
+        return 0;
+    }
+
+    // ------------------------------------------------------------------ one-shot token mode (the original path)
+    const int n_pred = n_predict > 0 ? n_predict : 32;
     std::vector<int> ids = split(ids_s);
     if (ids.empty()) { usage(); return 2; }
     Sampler sm(so);
     std::vector<int> hist = ids; std::vector<float> lg;
     m.prefill(ids.data(), (int) ids.size(), 0, &lg);
     int pos = (int) ids.size();
-    for (int n = 0; n < n_predict && pos < o.ctx; ++n) {
+    for (int n = 0; n < n_pred && pos < o.ctx; ++n) {
         const int tok = sm.sample(lg.data(), (int) lg.size(), hist);
-        std::printf("%d%s", tok, n + 1 < n_predict ? "," : "\n"); std::fflush(stdout);
+        std::printf("%d%s", tok, n + 1 < n_pred ? "," : "\n"); std::fflush(stdout);
         hist.push_back(tok);
         if (tok == m.config().eos) break;
         m.forward(tok, pos++, &lg);
@@ -131,8 +358,8 @@ int main(int argc, char** argv) {
         const std::string pp = !o.expert_profile_save.empty() ? o.expert_profile_save : o.expert_profile;
         if (!pp.empty()) {
             std::string perr;
-            if (m.save_profile(pp, perr)) { std::fprintf(stderr, "gptoss_run: expert profile saved to %s (exit)\n", pp.c_str()); m.decay_profile(); }
-            else std::fprintf(stderr, "gptoss_run: profile save FAILED: %s\n", perr.c_str());
+            if (m.save_profile(pp, perr)) { std::fprintf(stderr, "gptoss: expert profile saved to %s (exit)\n", pp.c_str()); m.decay_profile(); }
+            else std::fprintf(stderr, "gptoss: profile save FAILED: %s\n", perr.c_str());
         }
     }
     return 0;
