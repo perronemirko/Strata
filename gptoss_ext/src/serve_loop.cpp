@@ -30,10 +30,10 @@ namespace gptoss
     {
 
         /// The live KV to disk (--kv-checkpoint): tmp + rename inside Model::save_kv, so a kill never leaves half a file.
-        void save_ckpt(Model &m, const RunOpts &o, const char *why)
+        double save_ckpt(Model &m, const RunOpts &o, const char *why)   // ms the save took, -1 when there was none
         {
             if (o.kv_checkpoint.empty())
-                return;
+                return -1.0;
             std::string kerr;
             const auto ts = std::chrono::steady_clock::now();
             if (m.save_kv(o.kv_checkpoint, kerr))
@@ -41,6 +41,7 @@ namespace gptoss
             else
                 std::fprintf(stderr, "gptoss_run: KV checkpoint FAILED (%s): %s\n", why, kerr.c_str());
             std::fflush(stderr);
+            return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - ts).count();
         }
 
         /// Line reader over fd 0 (a pipe from serve/server.py).
@@ -323,6 +324,8 @@ namespace gptoss
             const auto t0 = std::chrono::steady_clock::now();
             int pos = keep;
             bool stopped = false;
+            double last_ckpt_ms = 0.0;                         // duration of the last mid-prefill save (0 = none yet)
+            auto last_ckpt_end = std::chrono::steady_clock::now();
             // Prefill in batched chunks: one PP line per chunk (server.py's silence watchdog needs a line often enough).
             // 0 = auto, same rule as Model::load: this only sets how often a PP line is printed - Model::prefill clamps
             // the real chunk to the ring and to what the device scratch fits.
@@ -333,8 +336,15 @@ namespace gptoss
                 const bool last = pos + n == (int)ids.size();
                 m.prefill(ids.data() + pos, n, pos, last ? &logits : nullptr); // logits only for the token that starts the answer
                 pos += n;
-                if (!last)
-                    save_ckpt(m, o, "prefill");   // a long prompt: the work done so far survives a kill
+                if (!last)                                     // a long prompt: the work done so far survives a kill, at <= ~10% of the prefill time
+                {
+                    const double since = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - last_ckpt_end).count();
+                    if (last_ckpt_ms <= 0.0 || since >= 9.0 * last_ckpt_ms)
+                    {
+                        const double took = save_ckpt(m, o, "prefill");
+                        if (took >= 0.0) { last_ckpt_ms = std::max(took, 1.0); last_ckpt_end = std::chrono::steady_clock::now(); }
+                    }
+                }
                 const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
                 const double rate = (double)(pos - keep) * 1000.0 / std::max(ms, 1e-9);
                 std::printf("PP %d %zu %.1f %.2f\n", pos, ids.size(), ms, rate);
