@@ -25,6 +25,8 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -226,6 +228,122 @@ __global__ void k_attn(
     float* out = att + (size_t) t * QD + (size_t) h * D;
     out[d0] = o0 * zi;
     out[d1] = o1 * zi;
+}
+
+// ---- tiled prefill attention (punto 8). Block = (PA_ROWS/rep consecutive tokens) x (one KV group): PA_ROWS = 32 (token, head) rows share every K/V tile.
+constexpr int PA_KT = 32, PA_THREADS = 256, PA_ROWS = 32;
+
+template<typename T_K, typename T_V>
+__global__ void __launch_bounds__(PA_THREADS) k_attn_tile(
+    const float* __restrict__ q, const float* __restrict__ stage_k, const float* __restrict__ stage_v,
+    const T_K* __restrict__ cache_k, const T_V* __restrict__ cache_v,
+    const float* __restrict__ kinv, const float* __restrict__ vinv,
+    const float* __restrict__ sinks, float* __restrict__ att, int T, int pos0, int window, bool banded,
+    int QD, int KD, int D, int rep, int base) {
+    const int qt = PA_ROWS / rep;
+    const int t0 = blockIdx.x * qt, g = blockIdx.y;
+    const int lane = threadIdx.x & 31, w = threadIdx.x >> 5;
+    const float scale = 1.0f / sqrtf((float) D);
+    __shared__ float qs[PA_ROWS * MAXD];
+    __shared__ float ks[PA_KT * (MAXD + 1)];
+    __shared__ float vs[PA_KT * MAXD];
+    __shared__ float ps[PA_ROWS * PA_KT];
+    for (int idx = threadIdx.x; idx < PA_ROWS * D; idx += PA_THREADS) {
+        const int r = idx / D, j = idx % D;
+        const int t = t0 + r / rep;
+        qs[idx] = (t < T) ? q[(size_t) t * QD + (size_t) (g * rep + r % rep) * D + j] : 0.0f;
+    }
+    // the four rows this warp owns: r = w + 8 * i
+    int rpos[4], rlo[4];
+    float m[4], z[4], o0[4], o1[4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const int r = w + 8 * i;
+        const int t = t0 + r / rep;
+        rpos[i] = (t < T) ? pos0 + t : -1;
+        rlo[i] = banded ? max(0, rpos[i] - window + 1) : 0;
+        m[i] = sinks[g * rep + r % rep];
+        z[i] = 1.0f;                       // the sink's own term: exp(sink - m) with m == sink
+        o0[i] = 0.0f; o1[i] = 0.0f;
+    }
+    const int tlast = min(T - 1, t0 + qt - 1);
+    const int pmax = pos0 + tlast;
+    const int lomin = banded ? max(0, pos0 + t0 - window + 1) : 0;
+    for (int u0 = lomin; u0 <= pmax; u0 += PA_KT) {
+        __syncthreads();                   // the previous tile's ks/vs/ps readers are done (also orders the q load for the first tile)
+        for (int idx = threadIdx.x; idx < PA_KT * D; idx += PA_THREADS) {
+            const int kk = idx / D, j = idx % D;
+            const int u = u0 + kk;
+            float kvl = 0.0f, vvl = 0.0f;
+            if (u <= pmax) {
+                if (u >= pos0) {           // this chunk's keys: fp32 in the stage, never packed
+                    kvl = stage_k[(size_t) (u - pos0) * KD + (size_t) g * D + j];
+                    vvl = stage_v[(size_t) (u - pos0) * KD + (size_t) g * D + j];
+                } else {                   // history: packed on the card
+                    const int crow = banded ? u - base : u;
+                    kvl = gpu::unpack_target_to_fp32<T_K>(cache_k[(size_t) crow * KD + (size_t) g * D + j], kinv[crow]);
+                    vvl = gpu::unpack_target_to_fp32<T_V>(cache_v[(size_t) crow * KD + (size_t) g * D + j], vinv[crow]);
+                }
+            }
+            ks[kk * (MAXD + 1) + j] = kvl;
+            vs[kk * MAXD + j] = vvl;
+        }
+        __syncthreads();
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const int r = w + 8 * i;
+            float sc = 0.0f;
+            for (int j = 0; j < D; ++j) sc += qs[r * MAXD + j] * ks[lane * (MAXD + 1) + j];
+            sc *= scale;
+            const int u = u0 + lane;
+            const bool ok = (u <= rpos[i]) && (u >= rlo[i]);
+            sc = ok ? sc : -1e30f;
+            float mt = sc;
+#pragma unroll
+            for (int o = 16; o > 0; o >>= 1) mt = fmaxf(mt, __shfl_xor_sync(0xffffffffu, mt, o));
+            const float mn = fmaxf(m[i], mt);
+            const float resc = expf(m[i] - mn);
+            const float p = ok ? expf(sc - mn) : 0.0f;
+            float tz = p;
+#pragma unroll
+            for (int o = 16; o > 0; o >>= 1) tz += __shfl_xor_sync(0xffffffffu, tz, o);
+            z[i] = z[i] * resc + tz;
+            m[i] = mn;
+            o0[i] *= resc; o1[i] *= resc;
+            ps[r * PA_KT + lane] = p;
+        }
+        __syncwarp();                      // ps rows are written and read by the same warp only
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const int r = w + 8 * i;
+            float a0 = o0[i], a1 = o1[i];
+            for (int k = 0; k < PA_KT; ++k) {
+                const float p = ps[r * PA_KT + k];
+                a0 += p * vs[k * MAXD + lane];
+                a1 += p * vs[k * MAXD + lane + 32];
+            }
+            o0[i] = a0; o1[i] = a1;
+        }
+    }
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const int r = w + 8 * i;
+        const int t = t0 + r / rep;
+        if (t >= T) continue;
+        const float zi = 1.0f / z[i];
+        float* out = att + (size_t) t * QD + (size_t) (g * rep + r % rep) * D;
+        out[lane] = o0[i] * zi;
+        out[lane + 32] = o1[i] * zi;
+    }
+}
+
+__device__ int g_pa_chk[2];
+__global__ void k_pa_reset() { g_pa_chk[0] = 0; g_pa_chk[1] = 0; }
+__global__ void k_pa_diff(const float* __restrict__ a, const float* __restrict__ b, size_t n) {
+    for (size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (size_t) gridDim.x * blockDim.x) {
+        atomicMax(&g_pa_chk[0], __float_as_int(fabsf(a[i] - b[i])));   // non-negative floats order like ints
+        atomicMax(&g_pa_chk[1], __float_as_int(fabsf(b[i])));
+    }
 }
 
 // amax of a row across the block, then the power-of-two scale that keeps it inside the format.
@@ -840,6 +958,37 @@ void kv_trim(int pos) {
     }
 }
 
+// ---- decode attention over THIS cache (punto 2). The prefill keeps a packed K/V cache of the whole ctx for every dense layer; the decode attends over
+// it instead of holding a second copy. `valid` stays the truth: the decode only extends it by copying host rows, exactly as kv_prefetch does.
+bool decode_ready() {
+    if (g_bad || g_kv.empty() || g_kv.size() != g_L.size()) return false;
+    for (size_t l = 0; l < g_kv.size(); ++l)
+        if (!g_kv[l].ring && (!g_kv[l].K || !g_kv[l].V || !g_kv[l].kinv || !g_kv[l].vinv || !g_L[l].sinks)) return false;
+    return true;
+}
+
+bool dense_kv(int layer, const void** K, const void** V, const float** kinv, const float** vinv, const float** sinks, int* cap, int* kfmt, int* vfmt) {
+    if (!decode_ready() || layer < 0 || layer >= (int) g_kv.size() || g_kv[(size_t) layer].ring) return false;
+    const KVDev& kv = g_kv[(size_t) layer];
+    *K = kv.K; *V = kv.V; *kinv = kv.kinv; *vinv = kv.vinv; *sinks = g_L[(size_t) layer].sinks;
+    *cap = kv.cap; *kfmt = g_kfmt; *vfmt = g_vfmt;
+    return true;
+}
+
+// Mirrors host rows [valid, upto) of a DENSE layer into its card cache; afterwards valid == upto and the copy is complete (move_kv syncs the stream).
+// The last row (upto - 1) is the one the host has just written: it is never trusted, so a regenerated position is re-copied.
+bool dense_kv_sync(int layer, const float* host_K, const float* host_V, int host_cap, int upto) {
+    if (g_bad || layer < 0 || layer >= (int) g_kv.size()) return false;
+    KVDev& kv = g_kv[(size_t) layer];
+    if (kv.ring || upto < 1 || upto > kv.cap) return false;
+    if (kv.valid > upto - 1) kv.valid = upto - 1;
+    if ((long long) upto > kv.valid) {
+        if (!move_kv(layer, host_K, host_V, host_cap, false, (int) kv.valid, upto - (int) kv.valid, cudaMemcpyHostToDevice)) return false;
+        kv.valid = upto;
+    }
+    return true;
+}
+
 bool run_layer(const Cfg& cfg, int layer, const LayerIO& w, int T, int pos0, bool sliding, float* router_logits) {
     (void) w;
     if (g_bad) return false;
@@ -866,20 +1015,49 @@ bool run_layer(const Cfg& cfg, int layer, const LayerIO& w, int T, int pos0, boo
     if (!sliding && pos0 + T > kv.cap) { g_err = "prefill_dev: dense history past the card cache"; return false; }   // cannot happen: init keeps dense_rows == ctx
     // The nine (K,V) format combinations are instantiated by this dispatch: each kernel
     // body exists exactly once, and the history rows are read PACKED and dequantized in registers.
-#define ATTN(KT, VT) k_attn<KT, VT><<<(unsigned) (size_t) T * heads, ATTN_THREADS, 0, g_st>>>( \
+static const bool pa_on = !(std::getenv("GPTOSS_ATTN_PREFILL") && std::atoi(std::getenv("GPTOSS_ATTN_PREFILL")) == 0);
+    static const bool pa_chk = std::getenv("GPTOSS_CHECK_PREFILL_ATTN") && std::atoi(std::getenv("GPTOSS_CHECK_PREFILL_ATTN")) != 0;
+    static int pa_logged = 0;
+    const bool tiled = pa_on && rep >= 1 && rep <= PA_ROWS && PA_ROWS % rep == 0 && D == MAXD;
+    if (pa_logged == 0) { std::fprintf(stderr, "gptoss: device prefill attention: %s kernel\n", tiled ? "tiled" : "per-head"); pa_logged = 1; }
+#define KV_DISPATCH(M) \
+    if (g_kfmt == 0 && g_vfmt == 0) M(__nv_fp8_e4m3, __nv_fp8_e4m3); \
+    else if (g_kfmt == 0 && g_vfmt == 1) M(__nv_fp8_e4m3, half); \
+    else if (g_kfmt == 1 && g_vfmt == 0) M(half, __nv_fp8_e4m3); \
+    else if (g_kfmt == 1 && g_vfmt == 1) M(half, half); \
+    else if (g_kfmt == 0) M(__nv_fp8_e4m3, float); \
+    else if (g_kfmt == 1) M(half, float); \
+    else if (g_vfmt == 0) M(float, __nv_fp8_e4m3); \
+    else if (g_vfmt == 1) M(float, half); \
+    else M(float, float)
+#define ATTN_OLD(KT, VT) k_attn<KT, VT><<<(unsigned) (size_t) T * heads, ATTN_THREADS, 0, g_st>>>( \
     g_Q, g_KS, g_VS, (const KT*) kv.K, (const VT*) kv.V, kv.kinv, kv.vinv, d.sinks, g_ATT, \
     T, pos0, cfg.window, sliding, qd, kd, D, heads, rep, kv.base)
-    if (g_kfmt == 0 && g_vfmt == 0) ATTN(__nv_fp8_e4m3, __nv_fp8_e4m3);
-    else if (g_kfmt == 0 && g_vfmt == 1) ATTN(__nv_fp8_e4m3, half);
-    else if (g_kfmt == 1 && g_vfmt == 0) ATTN(half, __nv_fp8_e4m3);
-    else if (g_kfmt == 1 && g_vfmt == 1) ATTN(half, half);
-    else if (g_kfmt == 0) ATTN(__nv_fp8_e4m3, float);
-    else if (g_kfmt == 1) ATTN(half, float);
-    else if (g_vfmt == 0) ATTN(float, __nv_fp8_e4m3);
-    else if (g_vfmt == 1) ATTN(float, half);
-    else ATTN(float, float);
-#undef ATTN
+#define ATTN_TILE(KT, VT) k_attn_tile<KT, VT><<<dim3((unsigned) ((T + PA_ROWS / rep - 1) / (PA_ROWS / rep)), (unsigned) kvh), PA_THREADS, 0, g_st>>>( \
+    g_Q, g_KS, g_VS, (const KT*) kv.K, (const VT*) kv.V, kv.kinv, kv.vinv, d.sinks, g_ATT, \
+    T, pos0, cfg.window, sliding, qd, kd, D, rep, kv.base)
+#define ATTN_CHK(KT, VT) k_attn<KT, VT><<<(unsigned) (size_t) 16 * heads, ATTN_THREADS, 0, g_st>>>( \
+    g_Q, g_KS, g_VS, (const KT*) kv.K, (const VT*) kv.V, kv.kinv, kv.vinv, d.sinks, g_OB, \
+    16, pos0, cfg.window, sliding, qd, kd, D, heads, rep, kv.base)
+    if (tiled) { KV_DISPATCH(ATTN_TILE); } else { KV_DISPATCH(ATTN_OLD); }
     if (bad(cudaGetLastError(), "attn")) return false;
+    if (pa_chk && tiled && T >= 32 && pa_logged < 41) {   // the old kernel on the first 16 tokens of the chunk (into g_OB, free until the output projection)
+        KV_DISPATCH(ATTN_CHK);
+        if (bad(cudaGetLastError(), "attn check")) return false;
+        k_pa_reset<<<1, 1, 0, g_st>>>();
+        k_pa_diff<<<64, 256, 0, g_st>>>(g_ATT, g_OB, (size_t) 16 * qd);
+        int h[2] = {0, 0};
+        if (bad(cudaStreamSynchronize(g_st), "attn check sync") || bad(cudaMemcpyFromSymbol(h, g_pa_chk, sizeof h), "attn check read")) return false;
+        float dmax, rmax;
+        std::memcpy(&dmax, &h[0], 4); std::memcpy(&rmax, &h[1], 4);
+        ++pa_logged;
+        if (pa_logged <= 6 || dmax > 1e-3f * (rmax + 1e-6f))
+            std::fprintf(stderr, "gptoss: prefill attention check (layer %d, pos0 %d, T %d): tiled vs per-head max diff %.3e (max |value| %.3e)\n", layer, pos0, T, dmax, rmax);
+    }
+#undef ATTN_OLD
+#undef ATTN_TILE
+#undef ATTN_CHK
+#undef KV_DISPATCH
     if (!dense_mm(d.dobj, H, qd, g_ATT, T, g_OB)) return false;
     k_resid<<<(unsigned) std::min<size_t>(((size_t) T * H + 255) / 256, 65535), 256, 0, g_st>>>(g_X, g_OB, d.bo, H, T);
     if (bad(cudaGetLastError(), "resid")) return false;
