@@ -14,6 +14,7 @@ bool config_from_file(const std::string& path, GptConfig& c, std::string& err) {
     Json t; std::string jerr;
     if (!parse_json(ss.str(), t, jerr)) { err = path + ": " + jerr; return false; }
     if (t.str("model_type") != "gpt_oss") { err = "model_type is '" + t.str("model_type") + "', expected 'gpt_oss'"; return false; }
+    c.arch = t.str("model_type");                 // the components above keep their gpt-oss defaults
     c.hidden = (int) t.num("hidden_size", 0);
     c.layers = (int) t.num("num_hidden_layers", 0);
     c.heads = (int) t.num("num_attention_heads", 0);
@@ -50,6 +51,11 @@ bool config_from_file(const std::string& path, GptConfig& c, std::string& err) {
     if (c.head_dim % 2) { err = "head_dim must be even"; return false; }
     if (c.hidden % 32 || c.moe_ff % 32) { err = "hidden_size and intermediate_size must be multiples of 32 (MXFP4 blocks)"; return false; }
     if (c.topk > c.n_exp || c.topk > 64) { err = "num_experts_per_tok out of range"; return false; }
+    // This build implements the components of gpt-oss only (see GptConfig). Anything else would run with the wrong math.
+    if (c.arch != "gpt_oss" || c.attn != "gqa_sink" || c.rope != "yarn" || c.router != "softmax_topk_bias" || c.act != "swiglu_clamped" || c.expert_format != "mxfp4") {
+        err = "this build implements the components of gpt-oss only (arch=" + c.arch + ", attn=" + c.attn + ", experts=" + c.expert_format + ")";
+        return false;
+    }
     return true;
 }
 

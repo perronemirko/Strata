@@ -17,6 +17,13 @@ struct GptConfig {
     int bos = -1, eos = -1, pad = -1;
     std::vector<char> sliding;                     // per layer: 1 = banded window, 0 = dense (from layer_types)
     std::string prefix = "model.";
+    // Architecture and components (phase 0 of the generalization). Filled from config.json; only the gpt-oss values exist so far.
+    std::string arch = "gpt_oss";                // model_type: selects the model file
+    std::string attn = "gqa_sink";               // gqa_sink: grouped-query attention with a sink in the softmax denominator (MLA for other models)
+    std::string rope = "yarn";                   // yarn
+    std::string router = "softmax_topk_bias";    // softmax over the router logits, top-k, learned bias added before the top-k
+    std::string act = "swiglu_clamped";          // SwiGLU with the limit / alpha above
+    std::string expert_format = "mxfp4";         // the routed experts' weight format
     int q_dim() const { return heads * head_dim; }
     int kv_dim() const { return kv_heads * head_dim; }
 };
