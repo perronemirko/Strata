@@ -1,6 +1,8 @@
 // gptoss_run - one-shot generation or the resident --serve engine for gpt-oss-120b (CPU).
 #include "gptoss/gpu.hpp"
 #include "gptoss/model.hpp"
+#include "gptoss/adapter_gpt_oss.hpp"
+#include "gptoss/sampler.hpp"
 #include "gptoss/sampler.hpp"
 #include "gptoss/serve_loop.hpp"
 
@@ -57,6 +59,7 @@ int main(int argc, char** argv) {
     std::string dir, ids_s, eos_s;
     RunOpts o; SampleOpts so;
     int n_predict = 32; bool serve = false, selfcheck = false, allow_emu = false;
+    bool gateway_info = false;                  // --gateway-info: open gpt-oss only through the gateway, print arch/vocab, exit
     std::string selfcheck_file;                 // --selfcheck-file: reference sequence (written the first time, compared after)
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
@@ -121,15 +124,50 @@ int main(int argc, char** argv) {
         else if (a == "--no-concentration") o.no_concentration = true;
         else if (a == "--serve") serve = true;
         else if (a == "--selfcheck") selfcheck = true;
+        else if (a == "--gateway-info") gateway_info = true;
         else if (a == "--selfcheck-file") selfcheck_file = val();
         else { usage(); return 2; }
     }
     if (dir.empty()) { usage(); return 2; }
     if (o.cuda && gpu::is_emulated() && !allow_emu) { std::fprintf(stderr, "gptoss_run: this binary has the EMULATED device, not CUDA: rebuild with `sh build.sh --cuda`\n"); return 2; }
     auto split = [](const std::string& s) { std::vector<int> v; std::stringstream ss(s); std::string t; while (std::getline(ss, t, ',')) if (!t.empty()) v.push_back(std::atoi(t.c_str())); return v; };
-    Model m; std::string err;
+    if (gateway_info) {
+        gptoss::register_gpt_oss(o);
+        try {
+            auto ad = gptoss::Gateway::instance().open("gpt_oss", dir);
+            std::printf("gateway: arch=%s vocab=%d\n", ad->arch(), ad->vocab());
+            // Stessa sequenza del selfcheck diretto, ma attraverso l'adapter.
+            const int V = ad->vocab() > 0 ? ad->vocab() : 1;
+            std::vector<int> pid(64);
+            for (int i = 0; i < 64; ++i) pid[(size_t) i] = (i * 997 + 13) % V;
+            ad->reset();
+            std::vector<float> lg;
+            ad->prefill(pid.data(), (int) pid.size(), 0, &lg);
+            gptoss::Sampler greedy(gptoss::SampleOpts{});
+            std::vector<int> hist = pid, got;
+            int pos = (int) pid.size();
+            for (int n = 0; n < 16; ++n) {
+                const int tok = greedy.sample(lg.data(), (int) lg.size(), hist);
+                got.push_back(tok); hist.push_back(tok);
+                if (n + 1 < 16) ad->forward(tok, pos++, &lg);
+            }
+            std::string line;
+            for (size_t i = 0; i < got.size(); ++i) line += (i ? "," : "") + std::to_string(got[i]);
+            std::printf("GATEWAY_TOKENS %s\n", line.c_str());
+            return 0;
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "gateway: %s\n", e.what());
+            return 1;
+        }
+    }
+    std::string err;
     const auto t0 = std::chrono::steady_clock::now();
-    if (!m.load(dir, o, err)) { std::fprintf(stderr, "gptoss_run: %s\n", err.c_str()); return 1; }
+    // Il modello si apre attraverso il gateway (facade -> GptOssAdapter -> Model): stesso Model di prima, nessun calcolo nuovo.
+    gptoss::register_gpt_oss(o);
+    std::unique_ptr<gptoss::ModelAdapter> base;
+    try { base = gptoss::Gateway::instance().open("gpt_oss", dir); }
+    catch (const std::exception& e) { std::fprintf(stderr, "gptoss_run: %s\n", e.what()); return 1; }
+    gptoss::Model& m = dynamic_cast<gptoss::GptOssAdapter*>(base.get())->model();
     std::fprintf(stderr, "gptoss_run: loaded in %.1f s\n", std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
     if (selfcheck) {
         // Deterministic regression test: 64 fixed prompt ids, then 16 greedy tokens. The sequence is printed; with --selfcheck-file
