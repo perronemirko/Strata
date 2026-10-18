@@ -6,6 +6,7 @@
 
 #include <chrono>
 #include <cstdio>
+#include <fstream>
 #include <cstdlib>
 #include <sstream>
 #include <string>
@@ -30,10 +31,33 @@ static void usage() {
         "  facts the model card does not settle (docs/gptoss_porting.md):  --glu-halves  --rope-pairs  --no-concentration\n");
 }
 
+extern char** environ;
+
+// Every GPTOSS_* variable the engine reads. An unknown one is almost always a typo, and until now it was silently ignored.
+// Keep this list in step with the getenv calls in model.cpp / prefill_dev.cu / gpu_cuda.cu.
+static void check_gptoss_env() {
+    static const char* known[] = {"GPTOSS_PROFILE", "GPTOSS_ATTN_DEC", "GPTOSS_ATTN_DEC_CTX", "GPTOSS_ATTN_DEC_MIN", "GPTOSS_ATTN_DEC_SHARED",
+                                  "GPTOSS_ATTN_PREFILL", "GPTOSS_CHECK_DECODE_ATTN", "GPTOSS_CHECK_PREFILL", "GPTOSS_CHECK_PREFILL_ATTN",
+                                  "GPTOSS_CPU_MISS", "GPTOSS_KV_SLOTS", "GPTOSS_KV_SLOTS_GIB", "GPTOSS_PREFETCH", "GPTOSS_PREFETCH_MAX", nullptr};
+    std::string set;
+    for (char** e = environ; e && *e; ++e) {
+        const std::string kv = *e;
+        if (kv.compare(0, 7, "GPTOSS_") != 0) continue;
+        const std::string k = kv.substr(0, kv.find('='));
+        bool ok = false;
+        for (const char** p = known; *p && !ok; ++p) ok = (k == *p);
+        if (!ok) std::fprintf(stderr, "gptoss_run: WARNING unknown environment variable %s: it is ignored (typo?)\n", k.c_str());
+        else set += (set.empty() ? "" : " ") + kv;
+    }
+    if (!set.empty()) std::fprintf(stderr, "gptoss_run: environment: %s\n", set.c_str());
+}
+
 int main(int argc, char** argv) {
+    check_gptoss_env();
     std::string dir, ids_s, eos_s;
     RunOpts o; SampleOpts so;
     int n_predict = 32; bool serve = false, selfcheck = false, allow_emu = false;
+    std::string selfcheck_file;                 // --selfcheck-file: reference sequence (written the first time, compared after)
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         auto val = [&]() -> const char* { if (i + 1 >= argc) { usage(); std::exit(2); } return argv[++i]; };
@@ -97,6 +121,7 @@ int main(int argc, char** argv) {
         else if (a == "--no-concentration") o.no_concentration = true;
         else if (a == "--serve") serve = true;
         else if (a == "--selfcheck") selfcheck = true;
+        else if (a == "--selfcheck-file") selfcheck_file = val();
         else { usage(); return 2; }
     }
     if (dir.empty()) { usage(); return 2; }
@@ -107,11 +132,41 @@ int main(int argc, char** argv) {
     if (!m.load(dir, o, err)) { std::fprintf(stderr, "gptoss_run: %s\n", err.c_str()); return 1; }
     std::fprintf(stderr, "gptoss_run: loaded in %.1f s\n", std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
     if (selfcheck) {
-        std::vector<float> lg; m.forward(m.config().bos >= 0 ? m.config().bos : 1, 0, &lg);
-        double mn = 1e30, mx = -1e30; int bad = 0;
-        for (float v : lg) { if (!(v == v) || v > 1e30f || v < -1e30f) ++bad; else { mn = std::min<double>(mn, v); mx = std::max<double>(mx, v); } }
-        std::printf("selfcheck: %zu logits, non-finite %d, min %.3f max %.3f\n", lg.size(), bad, mn, mx);
-        return bad ? 1 : 0;
+        // Deterministic regression test: 64 fixed prompt ids, then 16 greedy tokens. The sequence is printed; with --selfcheck-file
+        // it is compared with the reference in that file (written on the first run). Same flags, same reference.
+        const int V = m.config().vocab > 0 ? m.config().vocab : 1;
+        std::vector<int> pid(64);
+        for (int i = 0; i < 64; ++i) pid[(size_t) i] = (i * 997 + 13) % V;
+        m.reset();
+        std::vector<float> lg;
+        m.prefill(pid.data(), (int) pid.size(), 0, &lg);
+        int bad = 0;
+        for (float v : lg) if (!(v == v) || v > 1e30f || v < -1e30f) ++bad;
+        Sampler greedy(SampleOpts{});
+        std::vector<int> hist = pid, got;
+        int pos = (int) pid.size();
+        for (int n = 0; n < 16; ++n) {
+            const int tok = greedy.sample(lg.data(), (int) lg.size(), hist);
+            got.push_back(tok); hist.push_back(tok);
+            if (n + 1 < 16) m.forward(tok, pos++, &lg);
+        }
+        std::string line;
+        for (size_t i = 0; i < got.size(); ++i) line += (i ? "," : "") + std::to_string(got[i]);
+        std::printf("selfcheck: %zu logits, non-finite %d, tokens %s\n", lg.size(), bad, line.c_str());
+        int rc = bad ? 1 : 0;
+        if (!selfcheck_file.empty()) {
+            std::ifstream in(selfcheck_file);
+            std::string ref;
+            if (in && std::getline(in, ref)) {
+                if (ref == line) std::printf("selfcheck: MATCH with the reference %s\n", selfcheck_file.c_str());
+                else { std::printf("selfcheck: DIFFERENT from the reference %s (reference: %s)\n", selfcheck_file.c_str(), ref.c_str()); rc = 1; }
+            } else {
+                std::ofstream out(selfcheck_file);
+                out << line << "\n";
+                std::printf("selfcheck: reference written to %s\n", selfcheck_file.c_str());
+            }
+        }
+        return rc;
     }
     if (serve) { std::vector<int> eos = split(eos_s); return serve_loop(m, o, eos); }
     std::vector<int> ids = split(ids_s);
