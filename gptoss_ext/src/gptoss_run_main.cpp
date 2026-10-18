@@ -2,6 +2,7 @@
 #include "gptoss/gpu.hpp"
 #include "gptoss/model.hpp"
 #include "gptoss/adapter_gpt_oss.hpp"
+#include "gptoss/arch_check.hpp"
 #include "gptoss/sampler.hpp"
 #include "gptoss/sampler.hpp"
 #include "gptoss/serve_loop.hpp"
@@ -164,6 +165,15 @@ int main(int argc, char** argv) {
     const auto t0 = std::chrono::steady_clock::now();
     // Il modello si apre attraverso il gateway (facade -> GptOssAdapter -> Model): stesso Model di prima, nessun calcolo nuovo.
     gptoss::register_gpt_oss(o);
+    {   // Controllo della specifica: se il modello chiede componenti che il motore non esegue, ci si ferma PRIMA di caricare i pesi.
+        const auto sc = gptoss::check_arch_spec(dir, "gpt_oss");
+        if (!sc.found) std::fprintf(stderr, "gptoss_run: arch.json assente in %s: controllo componenti saltato\n", dir.c_str());
+        else if (!sc.ok()) {
+            std::fprintf(stderr, "gptoss_run: questo modello non e' eseguibile dal motore. Mancano:\n");
+            for (const auto& miss : sc.missing) std::fprintf(stderr, "  - %s\n", miss.c_str());
+            return 1;
+        }
+    }
     std::unique_ptr<gptoss::ModelAdapter> base;
     try { base = gptoss::Gateway::instance().open("gpt_oss", dir); }
     catch (const std::exception& e) { std::fprintf(stderr, "gptoss_run: %s\n", e.what()); return 1; }
