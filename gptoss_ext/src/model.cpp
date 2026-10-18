@@ -17,6 +17,7 @@
 #include <thread>
 #include <unordered_map>
 #include <sys/stat.h>
+#include <unistd.h>
 #ifdef _OPENMP
 #include <omp.h>
 #endif
@@ -70,6 +71,13 @@ struct Model::Impl {
     std::vector<float> final_norm, rope_cos, rope_sin, lastn;
     std::vector<Work> works;
     std::vector<int> cached;
+    // append-only KV checkpoint (GPKV0002): what the file on disk holds right now
+    struct CkSeg { uint64_t start, off; };
+    std::string ck_path;
+    std::vector<int> ck_toks;                          // the tokens the file holds
+    std::vector<CkSeg> ck_segs;                        // first position and byte offset of every segment
+    uint64_t ck_end = 0;                               // file size right after the last committed segment
+    bool ck_ok = false;                                // the four above describe the file at ck_path
     bool prof_on = std::getenv("GPTOSS_PROFILE") && std::getenv("GPTOSS_PROFILE")[0] == '1';   // per-token timing of the decode phases
     double pr_attn = 0, pr_route = 0, pr_exp = 0, pr_head = 0;                                       // ms, summed over the request
     uint64_t pr_tok = 0;
@@ -85,6 +93,7 @@ struct Model::Impl {
     int pf_layer = -1, pf_ev = -1;
     const float* pf_x = nullptr;                       // the residual stream of the token being decoded (set by Model::forward)
     uint64_t pf_routed = 0, pf_pred_hit = 0, pf_uploaded = 0, pf_used = 0;
+    double pf_ms_pred = 0, pf_ms_scan = 0, pf_ms_copy = 0;   // prefetch_next: where its time goes (ms, summed over the request)
     void prefetch_next(int li, const int32_t* idx);
     void prefetch_land(int li, const int32_t* idx);
     // --- RAM snapshots of the KV (GPTOSS_KV_SLOTS, default 2): the live KV of a conversation a request is about to abandon
@@ -136,6 +145,7 @@ struct Model::Impl {
     int dev_kfmt = 2, dev_vfmt = 2;                        // formats the DEVICE KV cache is packed in (the emulated device keeps f32)
     // --- decode attention on the card (dense layers only, punto 7b): persistent packed KV + the split-K kernel; dev_kv_pos is its watermark too
     bool dd_on = false, dd_cur = false, dd_check = false;   // dd_cur: THIS token's dense layers run on the card
+    bool dd_shared = false;                                // true: the decode reads the device prefill's own dense-layer cache (no second copy)
     int dd_min = 512, dd_cap = 0;                          // first position that uses it / positions held per dense layer
     float *dd_q = nullptr, *dd_out = nullptr, *dd_ws = nullptr;
     uint64_t dd_calls = 0, dd_chk_n = 0;
@@ -197,6 +207,17 @@ namespace gpu {
 __attribute__((weak)) bool attn_decode_supported(const AttnShape&) { return false; }
 __attribute__((weak)) bool attn_decode(const float*, const void*, const void*, const float*, int, const AttnShape&, float*, float*) { return false; }
 }  // namespace gpu
+
+// Decode attention over the prefill's own card cache (punto 2). Defined in prefill_dev.cu; the CPU build links the stub instead, so these WEAK
+// defaults answer "not available" there. A strong definition at link time replaces them.
+namespace pdev {
+bool decode_ready();
+bool dense_kv(int layer, const void** K, const void** V, const float** kinv, const float** vinv, const float** sinks, int* cap, int* kfmt, int* vfmt);
+bool dense_kv_sync(int layer, const float* host_K, const float* host_V, int host_cap, int upto);
+__attribute__((weak)) bool decode_ready() { return false; }
+__attribute__((weak)) bool dense_kv(int, const void**, const void**, const float**, const float**, const float**, int*, int*, int*) { return false; }
+__attribute__((weak)) bool dense_kv_sync(int, const float*, const float*, int, int) { return false; }
+}  // namespace pdev
 
 Model::Model() : p_(new Impl) {}
 Model::~Model() {
@@ -461,7 +482,7 @@ void Model::Impl::attn_heads(Layer& y, Work& w, int pos, const KvStage& st) {
 
 void Model::Impl::attn_out(Layer& y, Work& w, float* x, int pos, const KvStage& st) {
     bool done = false;
-    if (dd_cur && !st.K && !y.sliding && y.dKc) {         // decode, dense layer: the history is attended on the card
+    if (dd_cur && !st.K && !y.sliding && (y.dKc || dd_shared)) {   // shared mode: no cache of its own, the prefill's one is used         // decode, dense layer: the history is attended on the card
         if (dd_check) {
             attn_heads(y, w, pos, st);                    // GPTOSS_CHECK_DECODE_ATTN: the HOST result is the one the model uses
             const size_t QD = (size_t) c.q_dim();
@@ -498,6 +519,7 @@ void Model::Impl::route_tok(Layer& y, Work& w, const float* x, int32_t* idx, flo
 void Model::Impl::prefetch_next(int li, const int32_t* idx) {
     (void) idx;
     if (pf_n <= 0 || !pf_x || !gpu_on || pool.empty() || li + 1 >= c.layers || in_parallel_region()) return;
+    const auto pt0 = std::chrono::steady_clock::now();
     const int H = c.hidden, E = c.n_exp, I = c.moe_ff;
     const size_t G1 = (size_t) H / 32, G2 = (size_t) I / 32;
     Layer& y = L[(size_t) li + 1];
@@ -512,6 +534,8 @@ void Model::Impl::prefetch_next(int li, const int32_t* idx) {
     pf_layer = li + 1;
     pf_pred_set.assign(ord.begin(), ord.begin() + P);
     pf_up.clear();
+    const auto pt1 = std::chrono::steady_clock::now();
+    double copy_ms = 0;
     std::lock_guard<std::mutex> g(gmu);
     if (pf_ev < 0) pf_ev = gpu::event_create();
     if (pf_ev < 0) return;
@@ -531,15 +555,21 @@ void Model::Impl::prefetch_next(int li, const int32_t* idx) {
         if (sl.layer >= 0) where.erase((long long) sl.layer * E + sl.exp);
         sl.layer = -1; sl.busy = true;
         const size_t ee = (size_t) e;
+        const auto pc0 = std::chrono::steady_clock::now();
         const bool ok = gpu::h2d_copy_async(sl.gu_b, y.gu.blocks + ee * 2 * I * G1 * 16, 2 * I * G1 * 16) && gpu::h2d_copy_async(sl.gu_s, y.gu.scales + ee * 2 * I * G1, 2 * I * G1) &&
                         gpu::h2d_copy_async(sl.dn_b, y.dn.blocks + ee * H * G2 * 16, H * G2 * 16) && gpu::h2d_copy_async(sl.dn_s, y.dn.scales + ee * H * G2, H * G2) &&
                         gpu::h2d_copy_async(sl.gu_bias, y.gu_bias + ee * 2 * I, (size_t) 2 * I * 2) && gpu::h2d_copy_async(sl.dn_bias, y.dn_bias + ee * H, (size_t) H * 2);
+        copy_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - pc0).count();
         pf_pend.push_back({v, li + 1, e});                                          // even on failure: prefetch_land waits, then frees the slot
         pf_up.push_back(e);
         ++issued;
         if (!ok) { gpu_fail(gpu::last_error()); break; }
     }
     if (!pf_pend.empty()) gpu::event_record_copy(pf_ev);
+    const auto pt2 = std::chrono::steady_clock::now();
+    pf_ms_pred += std::chrono::duration<double, std::milli>(pt1 - pt0).count();
+    pf_ms_copy += copy_ms;
+    pf_ms_scan += std::chrono::duration<double, std::milli>(pt2 - pt1).count() - copy_ms;
 }
 
 void Model::Impl::prefetch_land(int li, const int32_t* idx) {
@@ -835,7 +865,7 @@ void Model::Impl::release_attn() {
     for (float** p : g) { gpu::release(*p); *p = nullptr; }
     float** dd[] = {&dd_q, &dd_out, &dd_ws};
     for (float** p : dd) { gpu::release(*p); *p = nullptr; }
-    dd_on = false; dd_cur = false;
+    dd_on = false; dd_cur = false; dd_shared = false;
     attn_dev = false;
 }
 
@@ -851,6 +881,22 @@ bool Model::Impl::setup_decode_attn(double& budget) {
     dd_check = std::getenv("GPTOSS_CHECK_DECODE_ATTN") != nullptr;
     dd_min = 512;
     if (const char* e = std::getenv("GPTOSS_ATTN_DEC_MIN")) dd_min = std::max(0, std::atoi(e));
+    {   // Shared mode: the device prefill already keeps a packed K/V cache of the WHOLE ctx for every dense layer; the decode attends over that one.
+        const char* sh = std::getenv("GPTOSS_ATTN_DEC_SHARED");
+        if (pdev_on && pdev::decode_ready() && !(sh && std::atoi(sh) == 0)) {
+            const size_t ws = (size_t) c.heads * (size_t) gpu::kAttnDecMaxSplit * (D + 2) * 4;
+            const double need = 2.0 * (double) QD * 4.0 + (double) ws;
+            dd_q = (float*) gpu::alloc(QD * 4);
+            dd_out = (float*) gpu::alloc(QD * 4);
+            dd_ws = (float*) gpu::alloc(ws);
+            if (!dd_q || !dd_out || !dd_ws) { release_attn(); std::fprintf(stderr, "gptoss: decode attention stays on the host (device allocation failed)\n"); return false; }
+            budget -= need;
+            dd_shared = true; dd_cap = o.ctx; dd_on = true; dev_kv_pos = 0;
+            std::fprintf(stderr, "gptoss: decode attention on the card for the dense layers: it reads the prefill's own KV cache (no second copy, %d positions), from position %d on%s\n",
+                         dd_cap, dd_min, dd_check ? " [CHECK: the host result is used, the difference is logged]" : "");
+            return true;
+        }
+    }
     long long cap = std::min<long long>(o.ctx, 65536);   // default: 65536 positions per dense layer; GPTOSS_ATTN_DEC_CTX raises it up to --ctx
     if (const char* e = std::getenv("GPTOSS_ATTN_DEC_CTX")) { const long long v = std::atoll(e); if (v > 0) cap = std::min<long long>((long long) o.ctx, v); }
     const bool emu = gpu::is_emulated();
@@ -912,6 +958,7 @@ bool Model::Impl::setup_decode_attn(double& budget) {
 
 // Host KV -> card KV of the dense layers for positions [dev_kv_pos, upto), in runs of 2048 rows so the staging buffer stays small.
 bool Model::Impl::dd_sync(int upto) {
+    if (dd_shared) return true;                        // each layer mirrors its own rows into the prefill's cache at the call
     if (dev_kv_pos >= upto) return true;
     const size_t KD = (size_t) c.kv_dim();
     const int from = dev_kv_pos;
@@ -941,6 +988,31 @@ bool Model::Impl::dd_sync(int upto) {
 // caller runs the host attention for this layer (the host state is untouched).
 bool Model::Impl::attn_heads_dev(Layer& y, Work& w, int pos) {
     const size_t KD = (size_t) c.kv_dim(), QD = (size_t) c.q_dim();
+    if (dd_shared) {                                  // the prefill's own card cache: sync this token's row into it, then attend
+        const int li = (int) (&y - L.data());
+        const void *Kc = nullptr, *Vc = nullptr;
+        const float *ki = nullptr, *vi = nullptr, *sk = nullptr;
+        int cap = 0, kf = 2, vf = 2;
+        std::lock_guard<std::mutex> g(gmu);
+        bool ok = pdev_on && pdev::decode_ready() && pdev::dense_kv(li, &Kc, &Vc, &ki, &vi, &sk, &cap, &kf, &vf);
+        if (ok) {
+            gpu::AttnShape a;
+            a.heads = c.heads; a.kv_heads = c.kv_heads; a.D = c.head_dim; a.window = c.window; a.sliding = false; a.cap = cap;
+            a.k_fmt = kf; a.v_fmt = vf; a.dKinv = const_cast<float*>(ki); a.dVinv = const_cast<float*>(vi);
+            ok = pdev::dense_kv_sync(li, y.K.data(), y.V.data(), y.cap, pos + 1) &&
+                 gpu::h2d(dd_q, w.q.data(), QD * 4) &&
+                 gpu::attn_decode(dd_q, Kc, Vc, sk, pos, a, dd_ws, dd_out) &&
+                 gpu::d2h(w.att.data(), dd_out, QD * 4);
+        }
+        if (!ok) {
+            std::fprintf(stderr, "gptoss: decode attention on the card off (%s%s%s): the host attention continues\n", pdev_on ? "" : "device prefill off; ",
+                         pdev::last_error().c_str(), gpu::last_error().c_str());
+            dd_on = false; dd_cur = false;
+            return false;
+        }
+        ++dd_calls;
+        return true;
+    }
     gpu::AttnShape a;
     a.heads = c.heads; a.kv_heads = c.kv_heads; a.D = c.head_dim; a.window = c.window; a.sliding = false; a.cap = y.cap;
     a.k_fmt = dev_kfmt; a.v_fmt = dev_vfmt; a.dKinv = y.dKinv; a.dVinv = y.dVinv;
@@ -1794,7 +1866,7 @@ void Model::forward(int token, int pos, std::vector<float>* logits_out) {
     Work& w = s.works[0];
     if (s.pdev_kv_pos > pos) s.pdev_kv_pos = pos;
     if (s.dev_kv_pos > pos) s.dev_kv_pos = pos;            // decode writes the host KV only: the device copy is valid up to here
-    s.dd_cur = s.dd_on && pos >= s.dd_min && pos < s.dd_cap && s.dd_sync(pos);   // the dense layers' history is on the card up to pos - 1
+    s.dd_cur = s.dd_on && (!s.dd_shared || s.pdev_on) && pos >= s.dd_min && pos < s.dd_cap && s.dd_sync(pos);   // the dense layers' history is on the card up to pos - 1
     for (int l = 0; l < c.layers; ++l) {
         Layer& L = s.L[(size_t) l];
         const auto t_a = std::chrono::steady_clock::now();
@@ -1816,7 +1888,11 @@ void Model::forward(int token, int pos, std::vector<float>* logits_out) {
             s.pr_exp += std::chrono::duration<double, std::milli>(t_d - t_c).count();
         }
     }
-    if (s.dd_cur) { s.dev_kv_pos = pos + 1; s.dd_cur = false; }   // every dense layer packed this token's row into the card cache
+    if (s.dd_cur) {                                              // every dense layer packed this token's row into the card cache
+        s.dev_kv_pos = pos + 1;
+        if (s.dd_shared) s.pdev_kv_pos = pos + 1;                // the prefill's dense mirror holds this row too: the next prefill keeps it instead of re-copying it
+        s.dd_cur = false;
+    }
     if ((int) s.cached.size() > pos) s.cached.resize((size_t) pos);
     if ((int) s.cached.size() == pos) s.cached.push_back(token);
     if (logits_out) {
@@ -1839,6 +1915,7 @@ void Model::prefill(const int* tokens, int n, int start_pos, std::vector<float>*
     for (int i = 0; i < n && !bad; ++i) bad = tokens[i] < 0 || tokens[i] >= c.vocab;
     if (bad) { if (logits_last) logits_last->assign((size_t) c.vocab, 0.0f); return; }
     if (s.dev_kv_pos > start_pos) s.dev_kv_pos = start_pos;   // the host rows from start_pos on are rewritten: the card's copy of them is stale
+    if (s.dd_shared) pdev::kv_trim(start_pos);                // same for the device prefill's own mirror, which the decode shares
     static const bool chk = std::getenv("GPTOSS_CHECK_PREFILL") != nullptr;
     if (chk && s.gpu_on && !s.in_check) {
         // The device prefill as in production, then the plain CPU path over the same tokens. The CPU result is kept (logits and K/V rows),
@@ -2049,51 +2126,152 @@ int Model::reuse_prefix(const std::vector<int>& ids) {
 }
 
 namespace {
-struct KvHead { char magic[8]; uint32_t layers, kv_dim, fp_len; uint64_t n; };
+struct KvHead { char magic[8]; uint32_t layers, kv_dim, fp_len; uint64_t n; };                 // GPKV0001 (read only)
+struct KvHead2 { char magic[8]; uint32_t layers, kv_dim, fp_len, nseg; uint64_t n; };         // GPKV0002: nseg and n are rewritten at every commit
+struct KvSegHead { uint64_t start, count; };
+
+// Rows of one segment [a, e) for one layer: a banded layer only keeps the last `cap` of them (older ones are not in its ring any more).
+inline int ck_lo(bool sliding, int cap, int a, int e) { return sliding ? std::max(a, e - cap) : a; }
 }
 
 bool Model::save_kv(const std::string& path, std::string& err) const {
-    const Impl& s = *p_;
-    const std::string tmp = path + ".tmp", fp = s.fingerprint();
+    Impl& s = const_cast<Impl&>(*p_);                  // the checkpoint bookkeeping (ck_*) lives in the Impl; the model itself is not touched
+    const std::string fp = s.fingerprint();
+    const int n = (int) s.cached.size(), KD = s.c.kv_dim();
+    const size_t hdr = sizeof(KvHead2) + fp.size();
+    auto write_header = [&](FILE* f, uint32_t nseg, uint64_t total) {
+        KvHead2 h{{'G', 'P', 'K', 'V', '0', '0', '0', '2'}, (uint32_t) s.c.layers, (uint32_t) KD, (uint32_t) fp.size(), nseg, total};
+        return fseeko(f, 0, SEEK_SET) == 0 && std::fwrite(&h, sizeof h, 1, f) == 1 && std::fwrite(fp.data(), 1, fp.size(), f) == fp.size();
+    };
+    auto write_seg = [&](FILE* f, int a, int e) {
+        KvSegHead sh{(uint64_t) a, (uint64_t) (e - a)};
+        bool ok = std::fwrite(&sh, sizeof sh, 1, f) == 1 &&
+                  (e == a || std::fwrite(s.cached.data() + a, sizeof(int), (size_t) (e - a), f) == (size_t) (e - a));
+        for (const Layer& y : s.L) {
+            const int lo = ck_lo(y.sliding, y.cap, a, e);
+            for (int p = lo; p < e && ok; ++p) ok = std::fwrite(&y.K[y.slot(p) * KD], sizeof(float), (size_t) KD, f) == (size_t) KD;
+            for (int p = lo; p < e && ok; ++p) ok = std::fwrite(&y.V[y.slot(p) * KD], sizeof(float), (size_t) KD, f) == (size_t) KD;
+        }
+        return ok;
+    };
+
+    // --- append: the file on disk is a valid prefix of the live cache (up to the first position where the tokens differ)
+    if (s.ck_ok && s.ck_path == path && !s.ck_segs.empty()) {
+        struct stat st;
+        if (::stat(path.c_str(), &st) == 0 && (uint64_t) st.st_size == s.ck_end) {
+            size_t c = 0;
+            while (c < s.ck_toks.size() && c < s.cached.size() && s.ck_toks[c] == s.cached[c]) ++c;
+            size_t bi = s.ck_segs.size();                  // first segment to drop
+            if (c < s.ck_toks.size()) {                    // diverged (rewind): rewrite from the start of the segment that holds position c
+                bi = 0;
+                for (size_t i = 0; i < s.ck_segs.size(); ++i) if (s.ck_segs[i].start <= c) bi = i;
+            }
+            const uint64_t b = (bi < s.ck_segs.size()) ? s.ck_segs[bi].start : (uint64_t) s.ck_toks.size();
+            if (bi == s.ck_segs.size() && (uint64_t) n == b) return true;   // nothing new
+            FILE* f = std::fopen(path.c_str(), "r+b");
+            if (f) {
+                std::setvbuf(f, nullptr, _IOFBF, (size_t) 1 << 20);
+                bool ok = true;
+                if (bi < s.ck_segs.size()) {               // shrink first, so a kill in the middle leaves a shorter but valid file
+                    const uint64_t off = s.ck_segs[bi].off;
+                    ok = write_header(f, (uint32_t) bi, b) && std::fflush(f) == 0 && ftruncate(fileno(f), (off_t) off) == 0;
+                    if (ok) { s.ck_segs.resize(bi); s.ck_toks.resize((size_t) b); s.ck_end = off; }
+                }
+                const bool had_seg = ok && (uint64_t) n > b;
+                if (ok && had_seg) ok = fseeko(f, (off_t) s.ck_end, SEEK_SET) == 0 && write_seg(f, (int) b, n);
+                const off_t end = ok ? ftello(f) : (off_t) -1;
+                if (ok) ok = write_header(f, (uint32_t) (s.ck_segs.size() + (had_seg ? 1 : 0)), (uint64_t) n) && std::fflush(f) == 0;
+                ok = (std::fclose(f) == 0) && ok;
+                if (ok) {
+                    if (had_seg) { s.ck_segs.push_back({b, s.ck_end}); s.ck_end = (uint64_t) end; }
+                    s.ck_toks = s.cached;
+                    return true;
+                }
+            }
+            s.ck_ok = false;                               // anything went wrong: fall through to a full rewrite
+        }
+    }
+
+    // --- full rewrite (first save of a run, another file, a torn file): tmp + rename, ONE segment [0, n)
+    const std::string tmp = path + ".tmp";
     FILE* f = std::fopen(tmp.c_str(), "wb");
     if (!f) { err = "cannot write " + tmp; return false; }
-    const int n = (int) s.cached.size(), KD = s.c.kv_dim();
-    KvHead h{{'G', 'P', 'K', 'V', '0', '0', '0', '1'}, (uint32_t) s.c.layers, (uint32_t) KD, (uint32_t) fp.size(), (uint64_t) n};
-    bool ok = std::fwrite(&h, sizeof h, 1, f) == 1 && std::fwrite(fp.data(), 1, fp.size(), f) == fp.size() &&
-              std::fwrite(s.cached.data(), sizeof(int), s.cached.size(), f) == s.cached.size();
-    for (const Layer& y : s.L) {
-        const int lo = y.sliding ? std::max(0, n - y.cap) : 0;
-        for (int p = lo; p < n && ok; ++p) ok = std::fwrite(&y.K[y.slot(p) * KD], sizeof(float), (size_t) KD, f) == (size_t) KD;
-        for (int p = lo; p < n && ok; ++p) ok = std::fwrite(&y.V[y.slot(p) * KD], sizeof(float), (size_t) KD, f) == (size_t) KD;
-    }
+    std::setvbuf(f, nullptr, _IOFBF, (size_t) 1 << 20);
+    bool ok = write_header(f, 1, (uint64_t) n) && write_seg(f, 0, n);
+    const off_t end = ok ? ftello(f) : (off_t) -1;
     ok = (std::fclose(f) == 0) && ok;
     if (!ok) { err = "write error on " + tmp; std::remove(tmp.c_str()); return false; }
     if (std::rename(tmp.c_str(), path.c_str()) != 0) { err = "rename failed"; return false; }
+    s.ck_path = path; s.ck_toks = s.cached; s.ck_segs.assign(1, Impl::CkSeg{0, (uint64_t) hdr}); s.ck_end = (uint64_t) end; s.ck_ok = true;
     return true;
 }
 
 bool Model::load_kv(const std::string& path, std::string& err) {
     Impl& s = *p_;
+    s.ck_ok = false;
     FILE* f = std::fopen(path.c_str(), "rb");
     if (!f) { err = "cannot open " + path; return false; }
-    KvHead h;
-    if (std::fread(&h, sizeof h, 1, f) != 1 || std::memcmp(h.magic, "GPKV0001", 8) != 0) { std::fclose(f); err = "not a KV checkpoint"; return false; }
+    std::setvbuf(f, nullptr, _IOFBF, (size_t) 1 << 20);
+    char magic[8];
+    if (std::fread(magic, 1, 8, f) != 8) { std::fclose(f); err = "not a KV checkpoint"; return false; }
+    const bool v1 = std::memcmp(magic, "GPKV0001", 8) == 0, v2 = std::memcmp(magic, "GPKV0002", 8) == 0;
+    if (!v1 && !v2) { std::fclose(f); err = "not a KV checkpoint"; return false; }
+    fseeko(f, 0, SEEK_SET);
+    const int KD = s.c.kv_dim();
+    if (v1) {                                          // the old layout: one block per layer
+        KvHead h;
+        if (std::fread(&h, sizeof h, 1, f) != 1) { std::fclose(f); err = "not a KV checkpoint"; return false; }
+        std::string fp(h.fp_len, '\0');
+        if (h.fp_len > 4096 || std::fread(&fp[0], 1, h.fp_len, f) != h.fp_len || fp != s.fingerprint() || h.layers != (uint32_t) s.c.layers) {
+            std::fclose(f); err = "checkpoint belongs to another model/options"; return false;
+        }
+        if (h.n > (uint64_t) s.o.ctx) { std::fclose(f); err = "checkpoint has more tokens than --ctx"; return false; }
+        const int n = (int) h.n;
+        std::vector<int> toks((size_t) n);
+        bool ok = std::fread(toks.data(), sizeof(int), (size_t) n, f) == (size_t) n;
+        for (Layer& y : s.L) {
+            const int lo = y.sliding ? std::max(0, n - y.cap) : 0;
+            for (int p = lo; p < n && ok; ++p) ok = std::fread(&y.K[y.slot(p) * KD], sizeof(float), (size_t) KD, f) == (size_t) KD;
+            for (int p = lo; p < n && ok; ++p) ok = std::fread(&y.V[y.slot(p) * KD], sizeof(float), (size_t) KD, f) == (size_t) KD;
+        }
+        std::fclose(f);
+        if (!ok) { s.cached.clear(); err = "truncated checkpoint"; return false; }
+        s.cached = std::move(toks);
+        s.pdev_kv_pos = 0;
+        s.dev_kv_pos = 0;                              // the host KV was replaced: the device copy is re-uploaded at the next prefill
+        return true;                                   // ck_ok stays false: the first save converts the file to the append format
+    }
+    KvHead2 h;
+    if (std::fread(&h, sizeof h, 1, f) != 1) { std::fclose(f); err = "not a KV checkpoint"; return false; }
     std::string fp(h.fp_len, '\0');
     if (h.fp_len > 4096 || std::fread(&fp[0], 1, h.fp_len, f) != h.fp_len || fp != s.fingerprint() || h.layers != (uint32_t) s.c.layers) {
         std::fclose(f); err = "checkpoint belongs to another model/options"; return false;
     }
     if (h.n > (uint64_t) s.o.ctx) { std::fclose(f); err = "checkpoint has more tokens than --ctx"; return false; }
-    const int n = (int) h.n, KD = s.c.kv_dim();
-    std::vector<int> toks((size_t) n);
-    bool ok = std::fread(toks.data(), sizeof(int), (size_t) n, f) == (size_t) n;
-    for (Layer& y : s.L) {
-        const int lo = y.sliding ? std::max(0, n - y.cap) : 0;
-        for (int p = lo; p < n && ok; ++p) ok = std::fread(&y.K[y.slot(p) * KD], sizeof(float), (size_t) KD, f) == (size_t) KD;
-        for (int p = lo; p < n && ok; ++p) ok = std::fread(&y.V[y.slot(p) * KD], sizeof(float), (size_t) KD, f) == (size_t) KD;
+    std::vector<int> toks;
+    std::vector<Impl::CkSeg> segs;
+    bool ok = true;
+    uint64_t run = 0;
+    for (uint32_t i = 0; i < h.nseg && ok; ++i) {
+        const off_t off = ftello(f);
+        KvSegHead sh;
+        ok = std::fread(&sh, sizeof sh, 1, f) == 1 && sh.start == run && sh.start + sh.count <= h.n;
+        if (!ok) break;
+        const int a = (int) sh.start, e = (int) (sh.start + sh.count);
+        toks.resize((size_t) e);
+        ok = (e == a) || std::fread(toks.data() + a, sizeof(int), (size_t) (e - a), f) == (size_t) (e - a);
+        for (Layer& y : s.L) {
+            const int lo = ck_lo(y.sliding, y.cap, a, e);
+            for (int p = lo; p < e && ok; ++p) ok = std::fread(&y.K[y.slot(p) * KD], sizeof(float), (size_t) KD, f) == (size_t) KD;
+            for (int p = lo; p < e && ok; ++p) ok = std::fread(&y.V[y.slot(p) * KD], sizeof(float), (size_t) KD, f) == (size_t) KD;
+        }
+        if (ok) { segs.push_back({sh.start, (uint64_t) off}); run = (uint64_t) e; }
     }
+    const off_t end = ftello(f);
     std::fclose(f);
-    if (!ok) { s.cached.clear(); err = "truncated checkpoint"; return false; }
+    if (!ok || run != h.n) { s.cached.clear(); err = "truncated checkpoint"; return false; }
     s.cached = std::move(toks);
+    s.ck_path = path; s.ck_toks = s.cached; s.ck_segs = std::move(segs); s.ck_end = (uint64_t) end; s.ck_ok = true;
     s.pdev_kv_pos = 0;
     s.dev_kv_pos = 0;                                  // the host KV was replaced: the device copy is re-uploaded at the next prefill
     return true;
@@ -2146,7 +2324,7 @@ bool Model::load_profile(const std::string& path, std::string& err) {
 void Model::begin_request_stats() {
     Impl& s = *p_;
     s.base_hits = s.hits; s.base_lookups = s.hits + s.host_served; s.base_pcie = s.pcie_served;
-    s.pr_attn = s.pr_route = s.pr_exp = s.pr_head = 0; s.pr_tok = 0; s.pr_enq = s.pr_cpu = s.pr_col = 0; s.pr_runok = s.pr_runfail = 0;
+    s.pf_ms_pred = s.pf_ms_scan = s.pf_ms_copy = 0; s.pr_attn = s.pr_route = s.pr_exp = s.pr_head = 0; s.pr_tok = 0; s.pr_enq = s.pr_cpu = s.pr_col = 0; s.pr_runok = s.pr_runfail = 0;
 }
 
 void Model::request_stats(unsigned long long* hits, unsigned long long* lookups, unsigned long long* pcie) const {
@@ -2212,6 +2390,9 @@ std::string Model::stats() const {
     if (s.pf_n > 0 && s.pf_routed > 0) {
         std::snprintf(b, sizeof b, ", prefetch top-%d: %.1f%% of the next layer's routed experts were in the predicted set, %llu uploaded ahead, %llu of the routed ones came from them", s.pf_n,
                       100.0 * (double) s.pf_pred_hit / (double) s.pf_routed, (unsigned long long) s.pf_uploaded, (unsigned long long) s.pf_used);
+        r += b;
+        const double nt = (double) std::max<uint64_t>(1, s.pr_tok);
+        std::snprintf(b, sizeof b, ", prefetch cost per token: predict %.1f ms, victim search+lock %.1f ms, copy issue %.1f ms", s.pf_ms_pred / nt, s.pf_ms_scan / nt, s.pf_ms_copy / nt);
         r += b;
     }
     return r;
