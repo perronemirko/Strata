@@ -147,6 +147,14 @@ private:
     }
 
     static uint64_t type_bytes(uint32_t type, uint64_t n) {
+        switch (type) {
+            case 24: return n;        // I8
+            case 25: return n * 2;    // I16
+            case 26: return n * 4;    // I32
+            case 27: return n * 8;    // I64
+            case 28: return n * 8;    // F64
+            default: break;
+        }
         if (type == 0) return n * 4;                  // F32
         if (type == 1 || type == 30) return n * 2;    // F16, BF16
         const DequantType* dt = dequant_lookup(static_cast<int>(type));
