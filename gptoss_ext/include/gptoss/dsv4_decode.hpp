@@ -13,6 +13,8 @@
 #pragma once
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstdint>
 #include <numeric>
 #include <utility>
@@ -119,6 +121,7 @@ public:
     }
 
     int64_t pos() const { return t_; }
+    bool debug = false;  // stampa norme per layer (diagnostica)
 
     // Elabora un token alla posizione pos(). Se want_logits, scrive V logit in logits.
     void step(int32_t tok, bool want_logits, float* logits) {
@@ -132,6 +135,7 @@ public:
         std::vector<float> emb(static_cast<size_t>(E));
         dequantize(M_.tok_embd.type, M_.tok_embd.data + static_cast<size_t>(tok) * erb, emb.data(), E);
         for (int64_t h = 0; h < HC; ++h) std::copy(emb.begin(), emb.end(), X.begin() + h * E);
+        if (debug) dbg_vec("embd", emb.data(), E);
 
         for (size_t il = 0; il < M_.layers.size(); ++il) {
             const DsLayerW& L = M_.layers[il];
@@ -145,9 +149,33 @@ public:
             hc_pre(X.data(), HC, E, L.hc_attn_fn, L.hc_attn_scale, L.hc_attn_base, eps, M_.hc_eps, M_.sinkhorn_iters,
                    cur.data(), post.data(), comb.data());
             rms_norm_weighted(cur.data(), E, L.attn_norm, eps, cur.data());
+            if (debug && il == 0) {
+                dbg_vec("attn_norm-0", cur.data(), E);
+                std::vector<float> qa(static_cast<size_t>(NQ)), qn(static_cast<size_t>(NQ)), qp(static_cast<size_t>(H * D)),
+                    kvp(static_cast<size_t>(D));
+                if (FILE* fd = std::fopen("attn_norm_l0.bin", "wb")) {  // dump per l'oracolo ggml
+                    std::fwrite(cur.data(), sizeof(float), static_cast<size_t>(E), fd);
+                    std::fclose(fd);
+                }
+                matvec_quant(L.attn.wq_a.type, L.attn.wq_a.data, E, NQ, cur.data(), qa.data(), buf);
+                dbg_vec("qr-0", qa.data(), NQ);
+                qn = qa;
+                rms_norm_weighted(qn.data(), NQ, L.attn.q_a_norm, eps, qn.data());
+                dbg_vec("qr_norm-0", qn.data(), NQ);
+                matvec_quant(L.attn.wq_b.type, L.attn.wq_b.data, NQ, H * D, qn.data(), qp.data(), buf);
+                dbg_vec("q-0 pre-head-norm", qp.data(), H * D);
+                matvec_quant(L.attn.wkv.type, L.attn.wkv.data, E, D, cur.data(), kvp.data(), buf);
+                dbg_vec("node_23 kv pre-norm", kvp.data(), D);
+            }
 
             std::vector<float> q(static_cast<size_t>(H * D)), kv(static_cast<size_t>(D));
             attn_project_qkv(p, L.attn, cur.data(), t_, compressed, q.data(), kv.data(), buf);
+            // llama.cpp salva la cache KV in f16 per default: arrotondiamo kv a fp16 prima di metterlo in cache.
+            // DSV4_KVF16=0 la disattiva (solo per A/B).
+            static const bool kvf16 = !std::getenv("DSV4_KVF16") || std::atoi(std::getenv("DSV4_KVF16")) != 0;
+            if (kvf16) {
+                for (float& v : kv) v = round_fp16(v);
+            }
             C.rawk.insert(C.rawk.end(), kv.begin(), kv.end());
 
             std::vector<int64_t> sel;  // blocchi compressi visibili e selezionati
@@ -206,19 +234,29 @@ public:
             for (int64_t b : sel) rows.push_back(C.comp.blocks.data() + b * D);
 
             const float scale = 1.0f / std::sqrt((float) D);
+            // Diagnostica: moltiplicatore della scala degli score (default 1). Solo per A/B della scala.
+            static const float kscale_mult = std::getenv("DSV4_KSCALE") ? (float) std::atof(std::getenv("DSV4_KSCALE")) : 1.0f;
             std::vector<float> o(static_cast<size_t>(H * D)), sc;
             for (int64_t h = 0; h < H; ++h) {
                 const float* qh = q.data() + h * D;
                 sc.clear();
-                float mx = L.attn.sinks[h];
+                const int sink_mode = std::getenv("DSV4_SINK_MODE") ? std::atoi(std::getenv("DSV4_SINK_MODE")) : 0;
+                float mx = sink_mode == 1 ? -std::numeric_limits<float>::infinity() : L.attn.sinks[h];
                 for (const float* kr : rows) {
                     float dot = 0.0f;
                     for (int64_t d = 0; d < D; ++d) dot += qh[d] * kr[d];
-                    dot *= scale;
+                    dot *= scale * kscale_mult;
                     sc.push_back(dot);
                     mx = std::max(mx, dot);
                 }
-                float den = std::exp(L.attn.sinks[h] - mx);
+                if (debug && il == 0 && h == 0) {
+                    std::printf("      rope: freq_base=%g n_rot=%lld neox=%d head_dim=%lld\n", (double) p.freq_base,
+                                (long long) p.n_rot, (int) p.neox, (long long) p.head_dim);
+                    std::printf("      head0 sink=%.6g scores(scalati):", L.attn.sinks[h]);
+                    for (float s : sc) std::printf(" %.6g", s);
+                    std::printf("\n");
+                }
+                float den = sink_mode == 1 ? 0.0f : std::exp(L.attn.sinks[h] - mx);  // sink_mode 1: senza termine del sink (A/B)
                 float* oh = o.data() + h * D;
                 for (int64_t d = 0; d < D; ++d) oh[d] = 0.0f;
                 for (size_t k = 0; k < rows.size(); ++k) {
@@ -230,18 +268,45 @@ public:
                 for (int64_t d = 0; d < D; ++d) oh[d] *= inv;
             }
 
+            if (debug && il == 0) {
+                dbg_vec("q-0", q.data(), H * D);
+                dbg_vec("kv-0", kv.data(), D);
+                dbg_vec("attn_raw-0 (o)", o.data(), H * D);
+            }
             std::vector<float> y(static_cast<size_t>(E));
             attn_project_out(p, L.attn, o.data(), t_, compressed, y.data(), buf);
             hc_post(y.data(), res.data(), post.data(), comb.data(), HC, E, X.data());
+            if (debug) dbg_line(il, "attn", X, y);
+            if (debug && il == 0) {
+                dbg_vec("attn_out-0", y.data(), E);
+                // wo_a per gruppi (come attn_project_out, a pos 0 il derope è identità) + dump per l'oracolo di wo_b
+                const int64_t G = p.n_groups, og = (H / G) * D;
+                std::vector<float> oa(static_cast<size_t>(p.o_lora_rank * G));
+                const size_t rba = dequant_row_bytes(L.attn.wo_a.type, og);
+                for (int64_t g = 0; g < G; ++g) {
+                    matvec_quant(L.attn.wo_a.type, L.attn.wo_a.data + static_cast<size_t>(g * p.o_lora_rank) * rba, og,
+                                 p.o_lora_rank, o.data() + g * og, oa.data() + g * p.o_lora_rank, buf);
+                }
+                dbg_vec("attn_wo_a-0 (gruppo 0)", oa.data(), p.o_lora_rank);
+                if (FILE* fd = std::fopen("oa_l0.bin", "wb")) {
+                    std::fwrite(oa.data(), sizeof(float), oa.size(), fd);
+                    std::fclose(fd);
+                }
+            }
 
             // ---- FFN ----
             res = X;
             hc_pre(X.data(), HC, E, L.hc_ffn_fn, L.hc_ffn_scale, L.hc_ffn_base, eps, M_.hc_eps, M_.sinkhorn_iters,
                    cur.data(), post.data(), comb.data());
             rms_norm_weighted(cur.data(), E, L.ffn_norm, eps, cur.data());
+            if (debug && il == 0) dbg_vec("ffn_norm-0", cur.data(), E);
             std::vector<float> f(static_cast<size_t>(E));
+            moe_debug() = debug && il == 0;
             moe_forward_token(M_.moe_cfg, L.moe, cur.data(), tok, L.hash_layer, f.data(), buf);
+            moe_debug() = false;
+            if (debug && il == 0) dbg_vec("ffn_moe_out-0", f.data(), E);
             hc_post(f.data(), res.data(), post.data(), comb.data(), HC, E, X.data());
+            if (debug) dbg_line(il, "ffn ", X, f);
         }
 
         ++t_;
@@ -255,6 +320,16 @@ public:
     }
 
 private:
+    static void dbg_line(size_t il, const char* tag, const std::vector<float>& X, const std::vector<float>& sub) {
+        double sx = 0, sy = 0;
+        float mx = 0;
+        int bad = 0;
+        for (float v : X) { if (!std::isfinite(v)) ++bad; sx += (double) v * v; mx = std::max(mx, std::fabs(v)); }
+        for (float v : sub) { if (!std::isfinite(v)) ++bad; sy += (double) v * v; }
+        std::printf("  L%02zu %s |X|=%.3e max=%.3e |sub|=%.3e nonfinite=%d\n", il, tag, std::sqrt(sx), mx, std::sqrt(sy), bad);
+        std::printf("      %s[0:4] = %.6g %.6g %.6g %.6g\n", tag, sub[0], sub[1], sub[2], sub[3]);
+    }
+
     const DsModel& M_;
     std::vector<LayerCache> cache_;
     int64_t t_ = 0;
