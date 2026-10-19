@@ -57,9 +57,7 @@ def read_gguf(path):
             if t == 9:
                 et, cnt = struct.unpack("<IQ", f.read(12))
                 if et == 8:
-                    for _ in range(cnt):
-                        s()
-                    return {"array_len": cnt}
+                    return [s() for _ in range(cnt)]
                 fmt = "<" + scalar[et]
                 f.seek(struct.calcsize(fmt) * cnt, 1)
                 return {"array_len": cnt}
@@ -73,7 +71,10 @@ def read_gguf(path):
             v = value(t)
             if key.startswith("general.") or key.endswith(("block_count", "embedding_length", "expert_count", "expert_used_count",
                                                           "context_length", "vocab_size", "attention.head_count", "attention.head_count_kv",
-                                                          "attention.sliding_window", "expert_feed_forward_length")) or isinstance(v, str):
+                                                          "attention.sliding_window", "expert_feed_forward_length", "attention.type",
+                                                          "rope.theta", "rope.type", "rope.factor", "rope.scale", "rope.attention_factor",
+                                                          "rope.original_ctx", "rope.beta_fast", "rope.beta_slow", "rope.ext_factor",
+                                                          "rms_norm_eps", "rope.length_scale", "feed_forward_length")) or isinstance(v, str):
                 meta[key] = v
         tensors = {}
         for _ in range(n_tensors):
@@ -187,6 +188,143 @@ def fingerprint(tensors, config, meta):
     return fp
 
 
+# Evidence of the fingerprint: which tensor names matched each rule. The adapter reads the names,
+# not just the boolean: a rule that matches the wrong tensor must be visible as such.
+def evidence(tensors):
+    names = list(tensors)
+    def has(*parts):
+        return [n for n in names if all(p in n for p in parts)]
+    def rx(pat):
+        return [n for n in names if re.search(pat, n)]
+    return {
+        "attention_sinks": has("sinks"),
+        "qk_norm": has("q_norm") + has("k_norm"),
+        "mla_latent_kv": has("kv_a_proj_with_mqa") + has("q_a_proj") + has("attn_kv_a_mqa") + has("attn_q_a"),
+        "router_bias": rx(r"exp_probs_b|e_score_correction_bias") + has("router", "bias"),
+        "shared_experts": has("shared_expert") + has("shexp"),
+        "mxfp4_experts": [n for n, t in tensors.items() if t["dtype"] == "MXFP4" and ("exps" in n or "experts" in n)]
+                         + (has("_blocks") if has("_scales") else []),
+        "fp8_block_scales": has("weight_scale_inv"),
+        "attention_bias": rx(r"(attn_q|q_proj)\.bias"),
+        "linear_recurrent_ssm": rx(r"(^|[._])ssm_") + has("linear_attn") + has("mamba"),
+        "sparse_indexer": rx(r"(^|[._])indexer"),
+        "kv_compressor": rx(r"(^|[._])compressor"),
+        "hash_routing_tid2eid": rx("tid2eid"),
+        "hyper_connections": rx(r"(^|[._])hc_"),
+        "per_layer_embeddings": rx(r"(^|[._])ple_"),
+        "mtp_head": rx(r"(^|[._])nextn\."),
+    }
+
+
+# Structural parameters an adapter needs. Each value carries its source; a parameter not declared
+# by the model's own files is "unknown", never a guess. "deduced" = arithmetic from declared values.
+PARAM_KEYS = {  # canonical name -> (config.json key, GGUF key suffix)
+    "layers": ("num_hidden_layers", "block_count"),
+    "hidden": ("hidden_size", "embedding_length"),
+    "vocab": ("vocab_size", "vocab_size"),
+    "heads": ("num_attention_heads", "attention.head_count"),
+    "kv_heads": ("num_key_value_heads", "attention.head_count_kv"),
+    "head_dim": ("head_dim", "attention.head_dim_k"),
+    "ffn_intermediate": ("intermediate_size", "feed_forward_length"),
+    "n_experts": ("num_local_experts", "expert_count"),
+    "topk": ("experts_per_token", "expert_used_count"),
+    "window": ("sliding_window", "attention.sliding_window"),
+    "pos_max": ("max_position_embeddings", "context_length"),
+    "rope_theta": ("rope_theta", "rope.theta"),
+    "rope_type": ("rope_scaling.rope_type", "rope.type"),
+    "yarn_factor": ("rope_scaling.factor", "rope.factor"),
+    "yarn_beta_fast": ("rope_scaling.beta_fast", "rope.beta_fast"),
+    "yarn_beta_slow": ("rope_scaling.beta_slow", "rope.beta_slow"),
+    "yarn_orig": ("rope_scaling.original_max_position_embeddings", "rope.original_ctx"),
+    "rms_eps": ("rms_norm_eps", "rms_norm_eps"),
+    "swiglu_limit": ("swiglu_limit", "swiglu_limit"),
+    "swiglu_alpha": ("swiglu_alpha", "swiglu_alpha"),
+    "attention_bias": ("attention_bias", "attention.bias"),
+    "tie_word_embeddings": ("tie_word_embeddings", "tensor_length"),
+    "bos": ("bos_token_id", "bos_token_id"),
+    "eos": ("eos_token_id", "eos_token_id"),
+    "pad": ("pad_token_id", "pad_token_id"),
+}
+
+
+def params_of(config, meta, tensors):
+    """Let the structural parameters from the files that declare them. Returns (params, unknown).
+    Never invents: a parameter not declared stays in unknown."""
+    out, unknown = {}, []
+    for canon, (cfg_key, gg_key) in PARAM_KEYS.items():
+        val, src = None, None
+        if config:
+            cur = config
+            for part in cfg_key.split("."):
+                cur = cur.get(part) if isinstance(cur, dict) else None
+                if cur is None:
+                    break
+            if cur is not None:
+                val, src = cur, "config.json:" + cfg_key
+        if val is None:
+            for k, v in meta.items():
+                if isinstance(k, str) and k.endswith("." + gg_key):
+                    val, src = v, "gguf:" + k
+                    break
+        if val is None:
+            unknown.append(canon)
+        else:
+            out[canon] = {"value": val, "from": src, "how": "declared"}
+    # head_dim = hidden / kv_heads: only when both are declared and the division is exact.
+    if "head_dim" not in out and {"hidden", "kv_heads"} <= set(out):
+        h, kh = out["hidden"]["value"], out["kv_heads"]["value"]
+        if isinstance(h, int) and isinstance(kh, int) and kh > 0 and h % kh == 0:
+            out["head_dim"] = {"value": h // kh, "from": "hidden/kv_heads", "how": "deduced"}
+    # experts from the per-experto names, when the layout shows them.
+    if "n_experts" not in out:
+        e = max((int(m.group(1)) for n in tensors for m in EXPERT_RE.finditer(n)), default=0)
+        if e:
+            out["n_experts"] = {"value": e, "from": "tensor names experts.{e}", "how": "deduced"}
+    return out, unknown
+
+
+def layer_types_of(config, meta, n_layers):
+    """Type of each layer (sliding/full/...), only if the file declares it. Returns (list, source).
+    layer_kinds groups layers by their TENSORS; it cannot express a model whose layers share the same
+    tensors but differ in behaviour (gpt-oss: 36 identical stems, alternating sliding/full)."""
+    if config and isinstance(config.get("layer_types"), list) and len(config["layer_types"]) == n_layers:
+        norm = {"sliding_attention": "sliding", "full_attention": "full"}
+        return [norm.get(t, t) for t in config["layer_types"]], "config.json:layer_types"
+    for key, v in meta.items():
+        if key.endswith(".attention.type") and isinstance(v, list) and len(v) == n_layers:
+            return list(v), "gguf:" + key
+    return None, None
+
+
+# Standard structural roles. A stem that matches none of these is not bound to any known component:
+# the spec says so, it does not invent a meaning.
+KNOWN_STEMS_RE = re.compile(
+    r"^(?:"
+    r"model\.(?:embed_tokens|norm)\.weight|lm_head\.weight"
+    r"|(?:input|post_attention|output)_layernorm\.weight|norm(?:_b)?\.weight"
+    r"|self_attn\.(?:q|k|v|o)_proj\.(?:weight|bias)|self_attn\.sinks"
+    r"|attn_(?:q|q_b|q_a|k|k_a|kv|kv_a|v|o|o_a|o_b)(?:\.(?:weight|bias|norm))?|attn_sinks|attn_max_bias"
+    r"|mlp\.router\.(?:weight|bias)|ffn_gate_inp\.weight|exp_probs_b\.bias"
+    r"|mlp\.experts\.(?:gate_up|down)_proj(?:_blocks|_scales|_bias)?|mlp\.experts\.{e}\..*"
+    r"|ffn_(?:gate|up|down)_(?:exps|shexp|inp)\.weight|ffn_gate_proj\.weight|ffn_(?:gate|up|down)_proj\.weight"
+    r"|gate_proj\.weight|up_proj\.weight|down_proj\.weight"
+    r")$")
+
+
+def unbound_stems(layer_kinds, ev_hits):
+    """Stem templates of the layers that no component rule and no standard role recognizes."""
+    bound = set()
+    for names in ev_hits.values():
+        for n in names:
+            bound.add(stem_of(n))
+    out = set()
+    for stems, _ls in layer_kinds:
+        for s in stems:
+            if s not in bound and not KNOWN_STEMS_RE.match(s):
+                out.add(s)
+    return sorted(out)
+
+
 def ranges(xs):
     xs = sorted(xs)
     out, start, prev = [], None, None
@@ -263,8 +401,12 @@ def main():
             experts, expert_src = cand[0], "dal config/metadati"
     layers = max((L for _, ls in layer_kinds for L in ls), default=-1) + 1
     fp = fingerprint(tensors, config, meta)
+    ev = evidence(tensors)
     dtypes = {t["dtype"] for t in tensors.values()}
     unknown = sorted(d for d in dtypes if d.startswith("ggml_"))
+    params, unknown_params = params_of(config, meta, tensors)
+    ltypes, ltypes_src = layer_types_of(config, meta, layers)
+    unbound = unbound_stems(layer_kinds, ev)
 
     report = {
         "source": target,
@@ -294,9 +436,16 @@ def main():
         "experts": experts,
         "experts_source": expert_src,
         "components": {k: v for k, v in fp.items() if isinstance(v, bool)},
+        "component_evidence": {k: v for k, v in ev.items() if v},
         "dtypes": sorted(dtypes),
         "layer_kinds": [{"id": i + 1, "layers": ls, "stems": sorted(s)} for i, (s, ls) in enumerate(layer_kinds)],
         "tensors": report["groups"],
+        "params": params,
+        "unknown_params": unknown_params,
+        "layer_types": {"value": ltypes, "from": ltypes_src} if ltypes else {"value": None, "from": None},
+        "unbound_tensors": unbound,
+        "routing": {"algorithm": "unknown", "topk": params.get("topk", {}).get("value"),
+                    "note": "the algorithm (softmax/renorm/bias order) is not declared by the model files; read it from the reference code"},
         "missing": missing,
         "engine_ready": not missing,
     }
@@ -309,6 +458,14 @@ def main():
 
     print("formato: %s   tensori: %d   layer: %d   esperti: %d (%s)"
           % ("+".join(sorted(fmts)), len(tensors), layers, experts, expert_src))
+    print("parametri structurali (value <- sorgli):")
+    for k in sorted(params):
+        print("  %-18s %s <- %s (%s)" % (k, short(params[k]["value"]), params[k]["from"], params[k]["how"]))
+    if unknown_params:
+        print("PARAMETRI UNKNOWN (not declared by the files, not guessed): %s" % ", ".join(unknown_params))
+    print("types of layers: %s" % (ltypes_src if ltypes else "NOT DECLARED (layer_kinds groups by tensors, not by behaviour)"))
+    if unbound:
+        print("TENSORI NOT BOUND to a component or a standard role: %s" % ", ".join(unbound))
     if unknown:
         print("ATTENZIONE tipi non in tabella: %s -> controllare ggml.h e aggiungerli a GGML_TYPES" % ", ".join(unknown))
     if n_aux:

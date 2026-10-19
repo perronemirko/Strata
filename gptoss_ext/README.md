@@ -1,6 +1,6 @@
 # gptoss-ext
 
-Motore di inferenza CPU autonomo per **gpt-oss-120b** (GQA + sink + strati a finestra alternati, MoE 128x4 in MXFP4). Note e incognite: [docs/gptoss_porting.md](docs/gptoss_porting.md).
+Motore di inferenza CPU autonomo per **gpt-oss-120b** (GQA + sink + strati a finestra alternati, MoE 128x4 in MXFP4). Note e incognite: [docs/gptoss_porting.md](docs/gptoss_porting.md). Como compilarlo, runarlo, testarlo, flag: [docs/HOW_TO_RUN.md](docs/HOW_TO_RUN.md).
 
     sh build.sh                                   # compila e lancia i test sul checkpoint minuscolo (rigenerabile: python3 tools/tiny_gptoss.py tests/tiny)
     ./build-out/gptoss_run --model SNAPSHOT --ctx 8192 --selfcheck

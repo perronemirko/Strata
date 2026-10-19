@@ -3,7 +3,7 @@
 #include "gptoss/model.hpp"
 #include "gptoss/adapter_gpt_oss.hpp"
 #include "gptoss/arch_check.hpp"
-#include "gptoss/sampler.hpp"
+#include "gptoss/gate.hpp"
 #include "gptoss/sampler.hpp"
 #include "gptoss/serve_loop.hpp"
 
@@ -23,6 +23,8 @@ static void usage() {
         "gptoss_run --model DIR [--ctx N] [--threads N]\n"
         "       [--prompt-ids 1,2,3 --n-predict N [--temperature T --top-k K --top-p P --seed S]] | [--serve [--eos-ids 200002,200012]]\n"
         "       [--selfcheck] [--prefill-chunk N] [--kv-rollback N] [--kv-checkpoint FILE] [--kv-unified]\n"
+        "       [--gateway-info | --gate-info]  --gate-info: the gate answers for these flags without loading the model\n"
+        "         the gate records the result of --selfcheck in arch/certifications.txt (append-only); the gateway admits an adapter only on MATCH\n"
         "       [--cuda [--cuda-device N] [--vram-pct P] [--vram-total-mib N] [--vram-reserve-mib N] [--gpu-slots N] [--expert-profile FILE] [--expert-profile-save FILE] [--expert-profile-save-every SEC] [--pin-pct P] [--expert-promote N] [--expert-lru-layered] [--profile-decay N] [--prefill-dev-pct P]]\n"
         "         -k FMT / --key-format FMT, -v FMT / --value-format FMT: format of the CARD KV cache, K and V INDEPENDENTLY (e4m3 = 1B, f16 = 2B, f32 = 4B; default f32).\n"
         "         e4m3 cuts the KV windows 4x, f16 2x; the host cache and the KV checkpoint stay f32, the attention dequantizes in registers (no fp32 rows in VRAM).\n"
@@ -61,6 +63,7 @@ int main(int argc, char** argv) {
     RunOpts o; SampleOpts so;
     int n_predict = 32; bool serve = false, selfcheck = false, allow_emu = false;
     bool gateway_info = false;                  // --gateway-info: open gpt-oss only through the gateway, print arch/vocab, exit
+    bool gate_info = false;                     // --gate-info: print the registry and the approval state of the gate, exit
     std::string selfcheck_file;                 // --selfcheck-file: reference sequence (written the first time, compared after)
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
@@ -126,12 +129,31 @@ int main(int argc, char** argv) {
         else if (a == "--serve") serve = true;
         else if (a == "--selfcheck") selfcheck = true;
         else if (a == "--gateway-info") gateway_info = true;
+        else if (a == "--gate-info") gate_info = true;
         else if (a == "--selfcheck-file") selfcheck_file = val();
         else { usage(); return 2; }
     }
     if (dir.empty()) { usage(); return 2; }
     if (o.cuda && gpu::is_emulated() && !allow_emu) { std::fprintf(stderr, "gptoss_run: this binary has the EMULATED device, not CUDA: rebuild with `sh build.sh --cuda`\n"); return 2; }
     auto split = [](const std::string& s) { std::vector<int> v; std::stringstream ss(s); std::string t; while (std::getline(ss, t, ',')) if (!t.empty()) v.push_back(std::atoi(t.c_str())); return v; };
+    if (gate_info) {
+        // The gate: what the gateway would do with these flags, without loading the model.
+        // The architecture comes from arch.json, never from the command line.
+        gptoss::register_gpt_oss(o);
+        gptoss::Gate::instance().load("arch/certifications.txt");
+        const gptoss::Spec s = gptoss::read_spec(dir, o);
+        if (!s.valid) { std::fprintf(stderr, "gate: spec not valid: %s\n", s.why_invalid.c_str()); return 1; }
+        const GateStatus st = gptoss::Gate::instance().status(s.arch, s.cfg, s.spec_hash, selfcheck_file);
+        std::printf("gate: arch=%s schema=%s cfg=%s spec=%llu ref=%llu status=%s registered=%d\n",
+                    s.arch.c_str(), s.schema.c_str(), s.cfg.c_str(), s.spec_hash,
+                    selfcheck_file.empty() ? 0ULL : gptoss::hash_file(selfcheck_file), gate_status_name(st),
+                    gptoss::Gateway::instance().has(s.arch) ? 1 : 0);
+        for (const auto& m : s.missing) std::printf("  not supported: %s\n", m.c_str());
+        for (const auto& u : s.unknown_sem) std::printf("  semantics unknown: %s\n", u.c_str());
+        std::printf("gate: gateway.open_from_spec -> %s\n",
+                    (gptoss::Gateway::instance().has(s.arch) && st == GateStatus::Match) ? "adapter" : "refused");
+        return st == GateStatus::Match ? 0 : 1;
+    }
     if (gateway_info) {
         gptoss::register_gpt_oss(o);
         try {
@@ -202,16 +224,24 @@ int main(int argc, char** argv) {
         for (size_t i = 0; i < got.size(); ++i) line += (i ? "," : "") + std::to_string(got[i]);
         std::printf("selfcheck: %zu logits, non-finite %d, tokens %s\n", lg.size(), bad, line.c_str());
         int rc = bad ? 1 : 0;
+        // The gate: the result of this verification is recorded for the EXACT configuration (flags + spec + reference).
+        // Only a MATCH recorded here authorizes the gateway in a later run; writing the reference for the first time
+        // is INCONCLUSIVE (no comparison happened).
+        const gptoss::Spec sp = gptoss::read_spec(dir, o);
         if (!selfcheck_file.empty()) {
             std::ifstream in(selfcheck_file);
             std::string ref;
             if (in && std::getline(in, ref)) {
                 if (ref == line) std::printf("selfcheck: MATCH with the reference %s\n", selfcheck_file.c_str());
                 else { std::printf("selfcheck: DIFFERENT from the reference %s (reference: %s)\n", selfcheck_file.c_str(), ref.c_str()); rc = 1; }
+                if (sp.valid)
+                    gptoss::Gate::instance().record(sp.arch, sp.cfg, sp.spec_hash, selfcheck_file,
+                                                    rc ? GateStatus::NoMatch : GateStatus::Match);
             } else {
                 std::ofstream out(selfcheck_file);
                 out << line << "\n";
                 std::printf("selfcheck: reference written to %s\n", selfcheck_file.c_str());
+                if (sp.valid) gptoss::Gate::instance().record(sp.arch, sp.cfg, sp.spec_hash, selfcheck_file, GateStatus::Inconclusive);
             }
         }
         return rc;

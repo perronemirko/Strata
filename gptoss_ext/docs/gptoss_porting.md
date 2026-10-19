@@ -202,3 +202,46 @@ Why they should help, on the shape of that run:
 **Not measured.** No run with these flags was started here (the GPU holds the next task). The `experts:` line printed after each request ends now with `promotions N` when `--expert-promote` is on (cumulative, like the other counters in that line; with the flag off the line is byte-identical to the last release, so the server window's `_parse_done` fields do not move). A run that never promotes is visible and one that promotes on every token is too. To compare: same binary, same prompts, one arm per flag, and report the `experts:` line of each arm.
 
 Suggested order to try, cheapest first: `--profile-decay 200000`, then `--expert-lru-layered`, then `--expert-promote 40`. `--pin-pct` stays the blunt lever, and `tools/profile_report.py` says where it stops helping (a flat curve = pinning gains nothing).
+
+## The gateway, the adapters and the gate
+
+The engine is one model today (gpt-oss). The next increment puts a facade in front of it so a second model enters without touching the numeric path of the first. Three pieces, each with one job:
+
+| Piece | File | Job |
+| --- | --- | --- |
+| Extractor | `tools/inspect_model.py` | describes the structure: `layer_map.json` + `arch.json` (schema `arch-spec/1`) |
+| Adapter | `include/gptoss/adapter_gpt_oss.hpp` | implements one model: load, prefill, decode. Thin: every call goes to the `Model` already verified by the selfcheck |
+| Gateway | `include/gptoss/gateway.hpp` | routes: reads `arch.json`, validates the contract, finds the adapter in the registry, admits it only if the gate approved it |
+| Gate | `include/gptoss/gate.hpp` | certifies: an adapter is admitted only on `MATCH` against an independent reference, for the exact configuration |
+
+The architecture comes from `arch.json`, never from the directory name or a flag. There is no fallback: an architecture without an approved adapter stops before the inference, with a diagnostic that separates two different causes — a component the engine **does not run** (`arch/supported.json`) from a component whose **semantics are unknown** (a tensor no rule recognizes, a parameter the model's own files do not declare, a routing algorithm not stated). The first needs an adapter; the second needs the reference code read.
+
+`open(arch, dir)` — the path the original entry point used — is kept as it is, so `run_regression_test.sh` still tests the same thing. `open_from_spec(dir, opts, ref, diag)` is the new path: it derives the architecture from the spec and asks the gate.
+
+### What arch-spec/1 must carry, and what was missing
+
+Checked against the real gpt-oss-120b (36 layers, 687 tensors, 15 shards) and its `config.json`. The fields the first version had were not enough to write an adapter:
+
+- **No structural parameters.** An adapter needs hidden 2880, head_dim 64, 64 heads / 8 kv, window 128, YaRN factor 32 / beta 32-1 / orig 4096, theta 150000, `swiglu_limit` 7.0, `rms_norm_eps` 1e-5, vocab 201088, eos 200002. Added as `params`, each value with `{value, from, how}`: `declared` = the file says it, `deduced` = arithmetic from declared values (`head_dim = hidden / kv_heads`, only when the division is exact), otherwise the name goes to `unknown_params`. Nothing is guessed: on the real model `swiglu_alpha` and `bos` are **not** in `config.json`, and they stay in `unknown_params`.
+- **No `layer_types`.** The 36 layers of gpt-oss have **one** `layer_kind` — identical tensor names in every layer — while 18 are sliding and 18 are dense, alternating. `layer_kinds` groups by tensors and cannot express that. Added as `layer_types: {value, from}`, read from `config.json:layer_types` or the GGUF `*.attention.type`; when neither declares it, the spec says so.
+- **No tensor→component binding.** Added `component_evidence`: for each component rule, the tensor names that matched. A rule that matches the wrong tensor is then visible, not hidden behind a boolean. And `unbound_tensors`: stems that match no component rule and no standard role — for gpt-oss that list is empty, for an unrecognized model it is where the adapter work starts.
+- **No routing.** `config.json` does not state the routing algorithm (softmax, renormalize, bias order). The spec carries `routing.algorithm = "unknown"` and says to read it from the reference code. It is not invented.
+
+### The gate
+
+`arch/certifications.txt`, append-only, one line per verification: `arch | config | code-version | hash(arch.json) | hash(reference) | status`. A record authorizes a run only if all five match: the configuration fingerprint covers the flags that change the numeric path (`--cuda`, ctx, `--prefill-chunk`, `--gpu-attn`, `--prefill-dev-pct`, `-k`/`-v`, `--no-device-graphs`, `--no-async-dense`, `--glu-halves`, `--rope-pairs`, `--no-concentration`, `--vram-pct`, `--vram-reserve-mib`, `--pin-ram-gib`, `--expert-promote`), the spec is the same bytes, the reference is the same file, and `GATE_CODE_VERSION` has not moved. `NO_MATCH` and `INCONCLUSIVE` block the admission; writing the reference for the first time is `INCONCLUSIVE`, because no comparison happened. The gate certifies correctness within the tests run, not for every input.
+
+`--gate-info` answers, without loading the model, what the gateway would do with those flags.
+
+### What was run, and what was not
+
+Run on the emulated device with `tests/tiny` (4 layers, 8 experts, 96 vocab), same binary `build-out/gptoss_run_cpu_gate`:
+
+- `test_gptoss_core` on `tests/tiny`: `all ok` — the numeric path did not move.
+- `--gateway-info` (through the adapter) prints `GATEWAY_TOKENS 13,0,0,...` and the direct selfcheck prints `tokens 13,0,0,...`: identical sequences.
+- gate: first selfcheck writes the reference → record `INCONCLUSIVE`, gateway refuses; second selfcheck → `MATCH with the reference`, record `MATCH`, `--gate-info` with the same flags and the same `--selfcheck-file` → `status=MATCH ... gateway.open_from_spec -> adapter`; with one flag changed (`--ctx 48`) → `status=UNKNOWN ... refused`.
+- a directory without `arch.json` → `spec not valid: arch.json absent`; a spec with `"schema":"arch-spec/0"` → `schema 'arch-spec/0' not arch-spec/1`; `tests/gguf/test.gguf` (arch `test`) → `registered=0`, `not supported: architettura 'test' non registrata nel motore`, plus the list of unknown parameters. No fallback in any of the four.
+
+Not run: the CUDA selfcheck of gpt-oss-120b on the new binary. The GPU was occupied by another process (23790 MiB of 24564 MiB held by pid 2665405), so the run stopped at `cudaSetDevice: out of memory` after the load had printed the model card and the KV plan. The `MATCH` of the previous build belongs to the previous binary; it is not evidence about this one. To verify: `cd /home/albus/workspaces/RiStarta/Strata/gptoss_ext && NVCC=/usr/local/cuda/bin/nvcc bash build.sh --cuda && ./build-out/gptoss_run_cuda --model /media/albus/windows/Users/mio/models/llm_models/models/lmstudio-community/gpt-oss-120b --cuda --ctx 128000 --prefill-chunk 0 --vram-pct 97 --vram-reserve-mib 768 --expert-profile /var/tmp/gptoss-expert.bin --pin-ram-gib 58 -k e4m3 -v e4m3 --expert-promote 3 --selfcheck --selfcheck-file /var/tmp/selfcheck_ref.txt` — then `--gate-info` with the same flags must print `status=MATCH`.
+
+The multi-architecture support is not claimed: one adapter exists. A second model enters only with its own adapter and its own `MATCH`.
