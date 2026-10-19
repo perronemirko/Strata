@@ -1,0 +1,1 @@
+./build-out/gptoss_run_cuda --model /media/albus/windows/Users/mio/models/llm_models/models/lmstudio-community/gpt-oss-120b --cuda --ctx 128000 --prefill-chunk 0 --vram-pct 97 --vram-reserve-mib 768 --expert-profile /var/tmp/gptoss-expert.bin --pin-ram-gib 58 -k e4m3 -v e4m3 --expert-promote 3 --selfcheck --selfcheck-file /var/tmp/selfcheck_ref.txt $@
