@@ -68,6 +68,16 @@ public:
         auto it = ints_.find(key);
         return it == ints_.end() ? def : static_cast<uint64_t>(it->second);
     }
+    const std::vector<std::string>& meta_strs(const std::string& key) const {
+        static const std::vector<std::string> empty;
+        auto it = strarrs_.find(key);
+        return it == strarrs_.end() ? empty : it->second;
+    }
+    const std::vector<int64_t>& meta_ints(const std::string& key) const {
+        static const std::vector<int64_t> empty;
+        auto it = intarrs_.find(key);
+        return it == intarrs_.end() ? empty : it->second;
+    }
     double meta_float(const std::string& key, double def) const {
         auto it = floats_.find(key);
         return it == floats_.end() ? def : it->second;
@@ -137,10 +147,30 @@ private:
             case 6: { const uint32_t b = static_cast<uint32_t>(rd(4)); float f; std::memcpy(&f, &b, 4); floats_[key] = f; break; }
             case 7:  rd(1); break;   // bool
             case 8:  strs_[key] = rd_str(); break;
-            case 9: {                // array: tipo elementi, conteggio, elementi (scartati)
+            case 9: {                // array: stringhe e interi letti, altri tipi scartati
                 const uint32_t et = static_cast<uint32_t>(rd(4));
                 const uint64_t n = rd(8);
-                for (uint64_t i = 0; i < n; ++i) skip_element(et);
+                if (et == 8) {
+                    auto& v = strarrs_[key];
+                    v.reserve(n);
+                    for (uint64_t i = 0; i < n; ++i) v.push_back(rd_str());
+                } else if (et <= 5 || et == 10 || et == 11) {
+                    auto& v = intarrs_[key];
+                    v.reserve(n);
+                    for (uint64_t i = 0; i < n; ++i) {
+                        switch (et) {
+                            case 0: v.push_back((int64_t) rd(1)); break;
+                            case 1: v.push_back((int64_t) (int8_t) rd(1)); break;
+                            case 2: v.push_back((int64_t) rd(2)); break;
+                            case 3: v.push_back((int64_t) (int16_t) rd(2)); break;
+                            case 4: v.push_back((int64_t) rd(4)); break;
+                            case 5: v.push_back((int64_t) (int32_t) rd(4)); break;
+                            default: v.push_back((int64_t) rd(8)); break;
+                        }
+                    }
+                } else {
+                    for (uint64_t i = 0; i < n; ++i) skip_element(et);
+                }
                 break;
             }
             case 10: ints_[key] = static_cast<int64_t>(rd(8)); break;
@@ -220,6 +250,8 @@ private:
     std::map<std::string, int64_t> ints_;
     std::map<std::string, std::string> strs_;
     std::map<std::string, double> floats_;
+    std::map<std::string, std::vector<std::string>> strarrs_;
+    std::map<std::string, std::vector<int64_t>> intarrs_;
 };
 
 }  // namespace gptoss

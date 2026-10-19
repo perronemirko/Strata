@@ -60,6 +60,18 @@ inline float silu_f(float v) { return v / (1.0f + std::exp(-v)); }
 
 inline float softplus_stable(float v) { return v > 20.0f ? v : std::log1p(std::exp(v)); }
 
+// Diagnostica: se true, moe_forward_token stampa tutti gli intermedi (impostato dal decoder al layer 0).
+inline bool& moe_debug() {
+    static bool on = false;
+    return on;
+}
+
+// Stampa primi 3 e ultimi 3 valori di un tensore, nel formato del debug di llama (confronto diretto).
+inline void dbg_vec(const char* name, const float* p, int64_t n) {
+    std::printf("      %-28s[0:3] = %.6g %.6g %.6g   [E-3:E] = %.6g %.6g %.6g\n", name, p[0], p[1], p[2], p[n - 3], p[n - 2],
+                p[n - 1]);
+}
+
 // MoE + esperto condiviso per un token. x: [E] normalizzato (ffn_norm). out: [E].
 inline void moe_forward_token(const MoeCfg& c, const MoeWeights& w, const float* x, int32_t tok, bool hash_layer,
                               float* out, std::vector<float>& buf) {
@@ -90,6 +102,9 @@ inline void moe_forward_token(const MoeCfg& c, const MoeWeights& w, const float*
         for (float& v : wgt) v /= s;
     }
     for (float& v : wgt) v *= c.weights_scale;
+    if (moe_debug()) {
+        for (int64_t k = 0; k < K; ++k) std::printf("      moe k=%lld expert=%lld w=%.6g\n", (long long) k, (long long) sel[k], wgt[k]);
+    }
 
     for (int64_t i = 0; i < E; ++i) out[i] = 0.0f;
     std::vector<float> g(static_cast<size_t>(NF)), u(static_cast<size_t>(NF)), hbuf(static_cast<size_t>(NF));
@@ -99,7 +114,21 @@ inline void moe_forward_token(const MoeCfg& c, const MoeWeights& w, const float*
         qmat_expert(w.gate_exps, e, x, g.data(), buf);
         qmat_expert(w.up_exps, e, x, u.data(), buf);
         for (int64_t i = 0; i < NF; ++i) hbuf[i] = silu_f(g[i]) * u[i];
+        if (moe_debug()) {
+            char nm[64];
+            std::snprintf(nm, sizeof nm, "gate k=%lld", (long long) k);
+            dbg_vec(nm, g.data(), NF);
+            std::snprintf(nm, sizeof nm, "up k=%lld", (long long) k);
+            dbg_vec(nm, u.data(), NF);
+            std::snprintf(nm, sizeof nm, "swiglu k=%lld", (long long) k);
+            dbg_vec(nm, hbuf.data(), NF);
+        }
         qmat_expert(w.down_exps, e, hbuf.data(), y.data(), buf);
+        if (moe_debug()) {
+            char nm[64];
+            std::snprintf(nm, sizeof nm, "down k=%lld", (long long) k);
+            dbg_vec(nm, y.data(), E);
+        }
         for (int64_t i = 0; i < E; ++i) out[i] += wgt[k] * y[i];
     }
 
@@ -109,6 +138,12 @@ inline void moe_forward_token(const MoeCfg& c, const MoeWeights& w, const float*
     matvec_quant(w.up_shexp.type, w.up_shexp.data, E, NS, x, us.data(), buf);
     for (int64_t i = 0; i < NS; ++i) hs[i] = silu_f(gs[i]) * us[i];
     matvec_quant(w.down_shexp.type, w.down_shexp.data, NS, E, hs.data(), y.data(), buf);
+    if (moe_debug()) {
+        dbg_vec("shexp gate", gs.data(), NS);
+        dbg_vec("shexp up", us.data(), NS);
+        dbg_vec("shexp swiglu", hs.data(), NS);
+        dbg_vec("shexp out", y.data(), E);
+    }
     for (int64_t i = 0; i < E; ++i) out[i] += y[i];
 }
 
