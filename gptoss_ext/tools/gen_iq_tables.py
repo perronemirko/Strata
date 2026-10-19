@@ -6,7 +6,7 @@
 import hashlib, re, sys
 
 TABLES = ["kmask_iq2xs", "ksigns_iq2xs", "iq2xxs_grid", "iq2xs_grid", "iq2s_grid",
-          "iq3xxs_grid", "iq3s_grid", "iq1s_grid", "kvalues_iq4nl"]
+          "iq3xxs_grid", "iq3s_grid", "iq1s_grid", "kvalues_iq4nl", "kvalues_fp4"]
 
 def main():
     if len(sys.argv) < 2:
