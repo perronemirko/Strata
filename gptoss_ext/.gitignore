@@ -1,3 +1,8 @@
 build-out/
 __pycache__/
 serve-work/
+# gate records: per-machine (they carry the local paths and the hashes of the local references)
+arch/certifications.txt
+arch.json
+layer_map.json
+gptoss_ext/docs/HOW_TO_RUN.md
