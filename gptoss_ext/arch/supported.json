@@ -1,0 +1,13 @@
+{
+  "schema": "supported/1",
+  "architectures": {
+    "gpt_oss": {
+      "components": [
+        "attention_sinks",
+        "router_bias",
+        "mxfp4_experts",
+        "attention_bias"
+      ]
+    }
+  }
+}

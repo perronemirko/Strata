@@ -18,14 +18,13 @@ LAYER_RE = re.compile(r"(?:(?<=layers\.)|(?<=blk\.))(\d+)(?=\.)")   # "model.lay
 EXPERT_RE = re.compile(r"(?<=experts\.)(\d+)(?=\.)")           # "mlp.experts.42.x" -> 42 (safetensors per-esperto)
 PREFIX_RE = re.compile(r"^(?:model\.)?(?:layers|blk)\.\{i\}\.")
 
-# Tipi GGML. Quelli con "?" vengono dalla memoria e non sono verificati: controllare con
-#   grep -n "GGML_TYPE_" ggml/include/ggml.h   (nella cartella di llama.cpp)
+# Tipi GGML, verificati da ggml/include/ggml.h (enum ggml_type, llama.cpp): gli id 4, 5, 31-33, 36-38 sono ritirati e non compaiono.
 GGML_TYPES = {
     0: "F32", 1: "F16", 2: "Q4_0", 3: "Q4_1", 6: "Q5_0", 7: "Q5_1", 8: "Q8_0", 9: "Q8_1",
     10: "Q2_K", 11: "Q3_K", 12: "Q4_K", 13: "Q5_K", 14: "Q6_K", 15: "Q8_K",
-    16: "IQ2_XXS?", 17: "IQ2_XS?", 18: "IQ3_XXS?", 19: "IQ1_S?", 20: "IQ4_NL?", 21: "IQ3_S?", 22: "IQ2_S?", 23: "IQ4_XS?",
-    24: "I8", 25: "I16", 26: "I32", 27: "I64", 28: "F64", 29: "IQ1_M?", 30: "BF16", 34: "TQ1_0?", 35: "TQ2_0?",
-    39: "MXFP4", 40: "NVFP4?",
+    16: "IQ2_XXS", 17: "IQ2_XS", 18: "IQ3_XXS", 19: "IQ1_S", 20: "IQ4_NL", 21: "IQ3_S", 22: "IQ2_S", 23: "IQ4_XS",
+    24: "I8", 25: "I16", 26: "I32", 27: "I64", 28: "F64", 29: "IQ1_M", 30: "BF16", 34: "TQ1_0", 35: "TQ2_0",
+    39: "MXFP4", 40: "NVFP4", 41: "Q1_0", 42: "Q2_0",
 }
 
 
@@ -109,9 +108,27 @@ def template_of(name):
     return EXPERT_RE.sub("{e}", LAYER_RE.sub("{i}", name))
 
 
+AUX_RE = re.compile(r"^(v|mm|a)\.")   # visione (v.), proiettore (mm.), audio (a.): non sono layer di testo
+
+
+def is_aux(name):
+    return bool(AUX_RE.match(name))
+
+
 def layer_of(name):
+    if is_aux(name):
+        return None
     m = LAYER_RE.search(name)
     return int(m.group(1)) if m else None
+
+
+def text_arch(meta, fallback):
+    """Un file mmproj/multimodale dichiara arch 'clip' ma contiene il testo: l'architettura vera e' il prefisso di '*.block_count'."""
+    if meta.get("general.architecture") in ("clip", None) or meta.get("general.type") == "mmproj":
+        cands = [k.split(".")[0] for k in meta if k.endswith(".block_count") and not k.startswith("clip.")]
+        if cands:
+            return cands[0]
+    return fallback
 
 
 def stem_of(name):
@@ -159,6 +176,7 @@ def fingerprint(tensors, config, meta):
         "hash_routing_tid2eid": rx("tid2eid"),
         "hyper_connections": rx(r"(^|[._])hc_"),
         "per_layer_embeddings": rx(r"(^|[._])ple_"),
+        "mtp_head": rx(r"(^|[._])nextn\."),
         "quant_dtypes": sorted(d for d in dtypes if d != "F32"),
     }
     if config:
@@ -192,6 +210,32 @@ def short(v, n=110):
 
 def short_list(xs, n=12):
     return ", ".join(xs[:n]) + (" ... (+%d)" % (len(xs) - n) if len(xs) > n else "")
+
+
+SUPPORTED_FALLBACK = {"gpt_oss": ["attention_sinks", "router_bias", "mxfp4_experts", "attention_bias"]}
+
+
+def supported_for(arch):
+    """Componenti che il motore esegue per questa architettura, letti da arch/supported.json (dentro gptoss_ext). Senza file: tabella di riserva."""
+    p = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "arch", "supported.json")
+    try:
+        with open(p, encoding="utf-8") as f:
+            archs = json.load(f).get("architectures", {})
+        return set(archs.get(arch, {}).get("components", []))
+    except (OSError, ValueError, AttributeError):
+        return set(SUPPORTED_FALLBACK.get(arch, []))
+
+
+def missing_for(arch, components, layer_kinds):
+    """Cio' che il motore non sa eseguire per questo modello. Lista vuota = eseguibile."""
+    sup = supported_for(arch)
+    miss = []
+    if arch not in SUPPORTED_FALLBACK and not sup:
+        miss.append("architettura '%s' non registrata nel motore" % arch)
+    miss += [k for k, v in components.items() if v is True and k not in sup]
+    if len(layer_kinds) > 1 and "multiple_layer_kinds" not in sup:
+        miss.append("layer di %d tipi diversi" % len(layer_kinds))
+    return miss
 
 
 def main():
@@ -238,10 +282,14 @@ def main():
         json.dump(report, f, indent=2, ensure_ascii=False)
 
     # Specifica per gli adapter: formato arch-spec/1 (contratto da cui si scrive ogni modello)
+    arch_name = text_arch(meta, fp.get("model_type") or fp.get("gguf_architecture") or "unknown")
+    n_aux = sum(1 for n in tensors if is_aux(n))
+    fp_components = {k: v for k, v in fp.items() if isinstance(v, bool)}
+    missing = missing_for(arch_name, fp_components, layer_kinds)
     spec = {
         "schema": "arch-spec/1",
         "source": target,
-        "arch": fp.get("model_type") or fp.get("gguf_architecture") or "unknown",
+        "arch": arch_name,
         "layers": layers,
         "experts": experts,
         "experts_source": expert_src,
@@ -249,15 +297,22 @@ def main():
         "dtypes": sorted(dtypes),
         "layer_kinds": [{"id": i + 1, "layers": ls, "stems": sorted(s)} for i, (s, ls) in enumerate(layer_kinds)],
         "tensors": report["groups"],
+        "missing": missing,
+        "engine_ready": not missing,
     }
     spec_path = os.path.join(base, "arch.json")
     with open(spec_path, "w", encoding="utf-8") as f:
         json.dump(spec, f, indent=2, ensure_ascii=False)
+    print("scritto: " + spec_path)
+    print("motore: " + ("eseguibile, nessun componente mancante" if not missing
+                        else "NON eseguibile. Mancano: " + "; ".join(missing)))
 
     print("formato: %s   tensori: %d   layer: %d   esperti: %d (%s)"
           % ("+".join(sorted(fmts)), len(tensors), layers, experts, expert_src))
     if unknown:
         print("ATTENZIONE tipi non in tabella: %s -> controllare ggml.h e aggiungerli a GGML_TYPES" % ", ".join(unknown))
+    if n_aux:
+        print("tensori ausiliari (visione/audio/proiettore, esclusi dai layer): %d" % n_aux)
     print("impronta:")
     for k, v in fp.items():
         print("  %-22s %s" % (k, v))
