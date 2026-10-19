@@ -27,6 +27,7 @@ bool config_from_file(const std::string& path, GptConfig& c, std::string& err) {
     c.window = (int) t.num("sliding_window", 0);
     c.eps = (float) t.num("rms_norm_eps", 1e-5);
     c.swiglu_limit = (float) t.num("swiglu_limit", 7.0);
+    c.swiglu_alpha = (float) t.num("swiglu_alpha", 1.702);
     c.rope_theta = (float) t.num("rope_theta", 150000.0);
     c.max_pos = (int64_t) t.num("max_position_embeddings", 0);
     c.attention_bias = t.boolean("attention_bias", true);

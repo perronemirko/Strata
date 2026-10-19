@@ -1,4 +1,4 @@
-// arch_check.hpp - legge arch.json (arch-spec/1) e dice quali componenti mancano al motore per quel modello. Header-only.
+// arch_check.hpp - controlla arch.json (arch-spec/1) contro arch/supported.json: quali componenti mancano al motore. Header-only.
 #pragma once
 #include <fstream>
 #include <set>
@@ -17,8 +17,25 @@ struct SpecCheck {
     bool ok() const { return missing.empty(); }
 };
 
-// Componenti eseguiti per ciascuna architettura. Aggiungere qui un componente quando e' implementato E verificato col selfcheck.
-inline std::set<std::string> supported_components(const std::string& arch) {
+// Componenti eseguiti per architettura, da arch/supported.json. Senza file (o illeggibile) usa la tabella di riserva.
+inline std::set<std::string> supported_components(const std::string& arch, const std::string& path = "arch/supported.json") {
+    std::ifstream in(path);
+    if (in) {
+        std::stringstream ss;
+        ss << in.rdbuf();
+        Json j;
+        std::string err;
+        if (parse_json(ss.str(), j, err)) {
+            std::set<std::string> out;
+            const Json* archs = j.get("architectures");
+            const Json* e = archs ? archs->get(arch) : nullptr;
+            const Json* c = e ? e->get("components") : nullptr;
+            if (c)
+                for (const auto& x : c->a)
+                    if (x.t == Json::Str) out.insert(x.s);
+            return out;
+        }
+    }
     if (arch == "gpt_oss") return {"attention_sinks", "router_bias", "mxfp4_experts", "attention_bias"};
     return {};
 }
