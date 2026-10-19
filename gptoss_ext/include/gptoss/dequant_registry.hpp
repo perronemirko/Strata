@@ -11,6 +11,8 @@
 #include "dequant_iq.hpp"
 #include "dequant_kquants.hpp"
 #include "dequant_fp4.hpp"
+#include "dequant_q5k.hpp"
+#include "dequant_float.hpp"
 
 namespace gptoss {
 
@@ -43,6 +45,10 @@ GPT_DQ_WRAP(dequantize_row_iq1_s, block_iq1_s)
 GPT_DQ_WRAP(dequantize_row_iq1_m, block_iq1_m)
 GPT_DQ_WRAP(dequantize_row_iq4_nl, block_iq4_nl)
 GPT_DQ_WRAP(dequantize_row_iq4_xs, block_iq4_xs)
+GPT_DQ_WRAP(dequantize_row_q5_K, block_q5_K)
+GPT_DQ_WRAP(dequantize_row_f32, float)
+GPT_DQ_WRAP(dequantize_row_f16, uint16_t)
+GPT_DQ_WRAP(dequantize_row_bf16, uint16_t)
 
 #undef GPT_DQ_WRAP
 
@@ -65,6 +71,10 @@ inline const DequantType* dequant_lookup(int ggml_id) {
         {29, "IQ1_M",    256, 56,  dq_dequantize_row_iq1_m},
         {20, "IQ4_NL",   32,  18,  dq_dequantize_row_iq4_nl},
         {23, "IQ4_XS",   256, 136, dq_dequantize_row_iq4_xs},
+        {13, "Q5_K",     256, 176, dq_dequantize_row_q5_K},
+        {0,  "F32",      1,   4,   dq_dequantize_row_f32},
+        {1,  "F16",      1,   2,   dq_dequantize_row_f16},
+        {30, "BF16",     1,   2,   dq_dequantize_row_bf16},
     };
     for (const auto& t : table)
         if (t.ggml_id == ggml_id) return &t;
@@ -103,5 +113,6 @@ static_assert(sizeof(block_iq1_s) == 50, "iq1_s");
 static_assert(sizeof(block_iq1_m) == 56, "iq1_m");
 static_assert(sizeof(block_iq4_nl) == 18, "iq4_nl");
 static_assert(sizeof(block_iq4_xs) == 136, "iq4_xs");
+static_assert(sizeof(block_q5_K) == 176, "q5_K");
 
 }  // namespace gptoss
