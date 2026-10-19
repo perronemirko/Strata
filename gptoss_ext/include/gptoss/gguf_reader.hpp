@@ -68,6 +68,10 @@ public:
         auto it = ints_.find(key);
         return it == ints_.end() ? def : static_cast<uint64_t>(it->second);
     }
+    double meta_float(const std::string& key, double def) const {
+        auto it = floats_.find(key);
+        return it == floats_.end() ? def : it->second;
+    }
     std::string meta_str(const std::string& key, const std::string& def = "") const {
         auto it = strs_.find(key);
         return it == strs_.end() ? def : it->second;
@@ -130,7 +134,7 @@ private:
             case 3:  ints_[key] = static_cast<int64_t>(static_cast<int16_t>(rd(2))); break;
             case 4:  ints_[key] = static_cast<int64_t>(rd(4)); break;
             case 5:  ints_[key] = static_cast<int64_t>(static_cast<int32_t>(rd(4))); break;
-            case 6:  rd(4); break;   // f32: letto e scartato
+            case 6: { const uint32_t b = static_cast<uint32_t>(rd(4)); float f; std::memcpy(&f, &b, 4); floats_[key] = f; break; }
             case 7:  rd(1); break;   // bool
             case 8:  strs_[key] = rd_str(); break;
             case 9: {                // array: tipo elementi, conteggio, elementi (scartati)
@@ -141,7 +145,7 @@ private:
             }
             case 10: ints_[key] = static_cast<int64_t>(rd(8)); break;
             case 11: ints_[key] = static_cast<int64_t>(rd(8)); break;
-            case 12: rd(8); break;   // f64: letto e scartato
+            case 12: { const uint64_t b = rd(8); double d; std::memcpy(&d, &b, 8); floats_[key] = d; break; }
             default: throw std::runtime_error("gguf: tipo di metadato sconosciuto " + std::to_string(t));
         }
     }
@@ -215,6 +219,7 @@ private:
     std::map<std::string, size_t> index_;
     std::map<std::string, int64_t> ints_;
     std::map<std::string, std::string> strs_;
+    std::map<std::string, double> floats_;
 };
 
 }  // namespace gptoss
