@@ -51,14 +51,14 @@ int main() {
         std::vector<float> x(hc_dim), fn(mix * hc_dim), scale = {0.5f, 0.5f, 0.5f}, base(mix, 0.0f), ox(ne), opost(hc), ocomb(hc * hc);
         for (auto& v : x) v = U(rng);
         for (auto& v : fn) v = U(rng) * 0.1f;
-        gptoss::hc_pre(x.data(), hc, ne, fn.data(), scale.data(), base.data(), 1e-6f, 20, ox.data(), opost.data(), ocomb.data());
+        gptoss::hc_pre(x.data(), hc, ne, fn.data(), scale.data(), base.data(), 1e-5f, 1e-6f, 20, ox.data(), opost.data(), ocomb.data());
         bool fin = true;
         for (float v : ox) fin = fin && std::isfinite(v);
         for (float v : opost) fin = fin && std::isfinite(v) && v > 0 && v < 2;
         check(fin, "hc_pre: valori finiti, post in (0,2)");
         std::vector<float> hx(ne), hfn(hc * hc_dim), hscale = {0.5f}, hbase(hc, 0.0f);
         for (auto& v : hfn) v = U(rng) * 0.1f;
-        gptoss::hc_head(x.data(), hc, ne, hfn.data(), hscale.data(), hbase.data(), 1e-6f, hx.data());
+        gptoss::hc_head(x.data(), hc, ne, hfn.data(), hscale.data(), hbase.data(), 1e-5f, 1e-6f, hx.data());
         bool fin2 = true; for (float v : hx) fin2 = fin2 && std::isfinite(v);
         check(fin2, "hc_head: valori finiti");
     }
