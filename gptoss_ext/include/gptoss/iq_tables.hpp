@@ -628,5 +628,10 @@ static const int8_t kvalues_iq4nl[16] = {
     1, 13, 25, 38, 53, 69, 89, 113,
 };
 
+static const int8_t kvalues_fp4[16] = {
+    0, 1, 2, 3, 4, 6, 8, 12,
+    0, -1, -2, -3, -4, -6, -8, -12,
+};
+
 }  // namespace iq
 }  // namespace gptoss
