@@ -188,17 +188,28 @@ __global__ void swiglu_batch_kernel(const float* __restrict__ g, const float* __
 // d_Y[sel[t]] += d_dn[t] for every t: the down projections of one expert, scattered back to their
 // token rows. sel is the same device array matmul_kernel reads.
 //
-// No atomics, deliberately. Within ONE expert a token appears at most once (a token routes to an
-// expert once), so this launch has no write conflicts at all; the experts are separate launches on
-// one stream, which run strictly in order. The sum therefore happens in expert order, exactly like
-// the CPU-emulated backend, instead of the arbitrary order atomicAdd would give.
+// A token can appear MORE THAN ONCE in one bucket: a hash layer's routing table may send both of a
+// token's K slots to the same expert, so its down projection must be added once per entry. The old
+// flat scatter did Y[sel[t]] += dn[i] with no atomics on the assumption that sel has no duplicates;
+// with duplicates two threads race on the same address and one increment is silently lost (the
+// batched prefill then drifts from the token-per-token path, which sums every entry). So each thread
+// first gathers its own token's entries in bucket order - the exact order host_expert() accumulates
+// them - and writes the sum once. No atomics, no write conflicts, deterministic rounding.
 __global__ void scatter_add_kernel(const float* __restrict__ dn, const int32_t* __restrict__ sel,
                                    int n, int64_t dim, float* __restrict__ Y) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= (int64_t) n * dim) return;
     const int64_t t = i / dim;
     const int64_t c = i - t * dim;
-    Y[(int64_t) sel[t] * dim + c] += dn[i];
+    // Duplicates of one token are contiguous in the bucket (entries are filled in token order), so
+    // each run is a span: sum it, and let only its FIRST entry write. Every (token, column) pair is
+    // then written exactly once - no atomics, no races, fixed summation order.
+    int q0 = (int) t;
+    while (q0 > 0 && sel[q0 - 1] == sel[t]) --q0;
+    if (q0 != (int) t) return;   // an earlier entry of this token's run owns the write
+    float s = 0.f;
+    for (int q = q0; q < n && sel[q] == sel[t]; ++q) s += dn[(size_t) q * dim + c];
+    Y[(int64_t) sel[t] * dim + c] += s;
 }
 
 // d_y = sum_k tmp[k] in a fixed order: deterministic, and cheap (dim floats).
