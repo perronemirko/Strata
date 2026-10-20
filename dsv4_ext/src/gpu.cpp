@@ -152,7 +152,8 @@ bool experts_batch(const ExpBatch* e, int n_exp, uint32_t type_g, uint32_t type_
             for (int64_t i = 0; i < ff; ++i) a[i] *= b.w[t];
         }
         if (!matmul(type_d, dsrc, dim, ff, d_a, b.n, nullptr, d_dn, ff, dim)) return false;
-        // Expert order, no atomics: within one bucket a token appears exactly once.
+        // Entry order, sequential on the host: a token may appear several times in one bucket (a
+        // hash layer can send both of its K slots to the same expert) and every entry is added.
         for (int t = 0; t < b.n; ++t) {
             const int32_t tk = b.tok[t];
             if (tk < 0) return false;

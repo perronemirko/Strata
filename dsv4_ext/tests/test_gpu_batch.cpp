@@ -116,12 +116,15 @@ static void test_matmul(uint32_t type, std::mt19937& rng) {
 }
 
 static void test_experts(uint32_t type, std::mt19937& rng) {
-    const int dim = 64, ff = 32, T = 9, NE = 3;
+    const int dim = 64, ff = 32, T = 9, NE = 4;
     const float lim = 3.0f;
     std::vector<std::vector<uint8_t>> G, U, D;
     for (int e = 0; e < NE; ++e) { G.push_back(make_weights(type, ff, dim, rng)); U.push_back(make_weights(type, ff, dim, rng)); D.push_back(make_weights(type, dim, ff, rng)); }
-    // token -> experts: each expert gets a different bucket, a token can be in several buckets
-    const std::vector<std::vector<int32_t>> bucket = {{0, 2, 3, 8}, {1, 2, 5, 6, 8}, {0, 4, 7}};
+    // token -> experts: each expert gets a different bucket, a token can be in several buckets.
+    // Expert 3's bucket lists token 5 TWICE with two different weights: a hash layer may send both
+    // of a token's K slots to the same expert, so its contribution must be added once per entry -
+    // the regression case for the non-atomic scatter race that lost one of the two increments.
+    const std::vector<std::vector<int32_t>> bucket = {{0, 2, 3, 8}, {1, 2, 5, 6, 8}, {0, 4, 7}, {5, 5}};
     const auto X = rand_vec((size_t) T * dim, rng);
     std::vector<std::vector<float>> W;
     for (auto& b : bucket) { std::vector<float> w; for (size_t i = 0; i < b.size(); ++i) w.push_back(0.1f + 0.2f * (float) i); W.push_back(w); }
