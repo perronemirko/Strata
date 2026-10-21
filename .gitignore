@@ -95,3 +95,7 @@ node_modules/
 /build-spark/
 /build-vision-spark/
 /.venv-build/
+# core dumps and local model downloads stay out of git
+core
+core.*
+models

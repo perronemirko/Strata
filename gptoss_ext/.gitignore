@@ -1,3 +1,5 @@
 build-out/
 __pycache__/
 serve-work/
+# compiled oracle binaries + raw .bin fixtures (regenerate locally, do not commit)
+tests/gguf/
