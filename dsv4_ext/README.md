@@ -93,6 +93,51 @@ Check it before trusting it - it needs no GPU and takes seconds:
 It runs the same prompt one token at a time and in chunks of 1, 2, 3, 4, 5 and 8, and fails if the
 routing of the last token differs or a logit moves by more than 1e-4.
 
+### KV checkpoint and cache formats (ported from gptoss_ext)
+
+`--kv-checkpoint FILE` makes the engine remember what it has already computed. The file (magic
+`DSKV0002`) carries a fingerprint of model + options (`load_kv()` refuses it when they differ), the
+token history, and every piece of per-layer state attention reads: the window-ring rows still live at
+each segment's end plus both compressors' rolling buffers and their compressed-entry caches. Restoring
+is a pure memcpy - no math - so after `load_kv()` the engine is exactly where the saving run left off
+and `forward()` may continue at position `cached_tokens().size()`.
+
+The file grows by **segments**: the first save writes one segment `[0, n)` (tmp + rename, atomic); a
+later save whose history extends the saved one appends only the new segment - ring rows for the live
+window and the compressor entries NEW in that range. A rewind (a prompt that diverges from the saved
+history) truncates back to the segment holding the divergence point and rewrites from there, so a kill
+in the middle always leaves a shorter but valid file.
+
+With `--kv-checkpoint` set:
+
+* at start the checkpoint is restored if the file exists (a mismatched one is refused and ignored);
+* in `--serve`, the cache lives across requests: each prompt reuses its leading cached tokens via
+  `reuse_prefix()` - only the delta is prefilled. The last prompt token is always recomputed (its
+  logits start the answer), and a rewind deeper than the window ring cannot be served, so the whole
+  prompt runs again;
+* after every finished request (and on cancel) the checkpoint is rewritten.
+
+Without the flag nothing changes: each `--serve` request still starts from an empty cache.
+
+    ./build-out/dsv4_run --model S1.gguf --prompt-ids ... --kv-checkpoint /var/tmp/dsv4.kv
+    # second run with a prompt sharing its prefix: "reusing N cached tokens of the prompt"
+
+`-k FMT` / `--key-format` and `-v FMT` / `--value-format` set the format of the cached KV rows -
+`e4m3` (1 byte, FP8), `f16` (2 bytes) or `f32` (default). DSv4-Flash caches ONE fused vector per token
+that serves as both key and value, so `-k` names the row's format and `-v` must match it (the load
+refuses otherwise); `--kv-unified` is accepted for llama.cpp parity. The checkpoint always stores f32
+rows, so a quantized run restores to full precision.
+
+Check it before trusting it - needs no GPU:
+
+    python3 tools/tiny_model.py /tmp/dsv4_tiny
+    sh build.sh
+    ./build-out/test_kv_checkpoint --model /tmp/dsv4_tiny/tiny.gguf
+
+It proves the save/restore round-trip (next-step logits bit-identical), the append mode, prefix reuse
+matching a full recompute, the deep-rewind refusal, and the fingerprint refusing another ctx/format.
+
+
 ### Speed: what actually decides the tok/s
 
 The real GGUF is **43 layers x 256 experts, top-6** (`dsv4_plan` prints it): 74.4 GiB of
