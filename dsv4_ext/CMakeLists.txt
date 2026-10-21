@@ -45,12 +45,14 @@ add_library(dsv4_core
     src/gguf_header.cpp
     src/config.cpp
     src/mem_plan.cpp
+    src/mtp_adapter.cpp
     src/ops.cpp
     src/dequant.cpp
     src/iq_tables.cpp
     ${DSV4_GPU_SRC}
     src/sampler.cpp
     src/serve_loop.cpp
+    src/st_header.cpp
     src/model.cpp
 )
 
@@ -115,6 +117,20 @@ target_link_libraries(test_mtp PRIVATE dsv4_core)
 if(Python3_Interpreter_FOUND)
     add_test(NAME mtp COMMAND test_mtp --model ${_dsv4_tiny_dir}/tiny.gguf --refdir ${_dsv4_tiny_dir})
     set_tests_properties(mtp PROPERTIES FIXTURES_REQUIRED dsv4_tiny_model)
+endif()
+# The MTP bridge: a Hugging Face safetensors draft module on top of the GGUF model (adapter exactness,
+# refusal of a mismatched module, load, greedy parity vs the GGUF's own module, checkpoint round-trip).
+add_executable(test_mtp_safetensors tests/test_mtp_safetensors.cpp)
+target_link_libraries(test_mtp_safetensors PRIVATE dsv4_core)
+if(Python3_Interpreter_FOUND)
+    set(_dsv4_st_dir ${CMAKE_CURRENT_BINARY_DIR}/tiny_mtp)
+    add_test(NAME tiny_mtp_ckpt_gen
+             COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/tiny_mtp_checkpoint.py ${_dsv4_st_dir})
+    set_tests_properties(tiny_mtp_ckpt_gen PROPERTIES FIXTURES_SETUP dsv4_tiny_mtp)
+    add_test(NAME mtp_safetensors
+             COMMAND test_mtp_safetensors --model ${_dsv4_tiny_dir}/tiny.gguf --refdir ${_dsv4_tiny_dir}
+                     --ckpt ${_dsv4_st_dir}/model-00001-of-00001.safetensors)
+    set_tests_properties(mtp_safetensors PROPERTIES FIXTURES_REQUIRED "dsv4_tiny_model;dsv4_tiny_mtp")
 endif()
 add_test(NAME core COMMAND test_dsv4_core)
 add_test(NAME ops COMMAND test_ops ${CMAKE_CURRENT_SOURCE_DIR}/tests/golden.txt)
