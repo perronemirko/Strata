@@ -247,10 +247,15 @@ def main() -> int:
 
     class Dsv4Engine(S.StrataEngine):
         """Same protocol, different process. Everything else (the pump thread, the STOP handling, the
-        silence watchdog, restart, sessions) is inherited unchanged."""
+        silence watchdog, restart, sessions) is inherited unchanged.
 
-        def __init__(self, exe_, args, cwd=None, log=None, env=None, lazy=False):
-            super().__init__(exe_, args, cwd=cwd, log=log, env=env, lazy=lazy)
+        The signature mirrors serve.server.StrataEngine.__init__ exactly, including the trailing
+        cpus/_attempt: server.py retries a failed start by calling StrataEngine.__init__(self, ...)
+        positionally with all nine arguments (serve/server.py:1090), and this class is what it finds
+        under that name. A short signature here is what made the second attempt raise a TypeError."""
+
+        def __init__(self, exe_, args, cwd=None, log=None, env=None, lazy=False, cpus=None, _attempt=0):
+            super().__init__(exe_, args, cwd=cwd, log=log, env=env, lazy=lazy, cpus=cpus, _attempt=_attempt)
             # StrataEngine looks for --native/--pack; this engine names its model --model.
             self.model_path = next((args[i + 1] for i, x in enumerate(args) if x == "--model"), str(exe_))
             self.info.setdefault("engine", "dsv4_ext")

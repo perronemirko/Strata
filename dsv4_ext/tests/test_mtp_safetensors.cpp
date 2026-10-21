@@ -72,15 +72,40 @@ static RunOpts base_opts(int spec_n) {
     return o;
 }
 
-// One greedy speculative run of G tokens; returns the emitted stream.
-static std::vector<int> greedy_spec(Model& m, const std::vector<int>& toks, int G) {
+// Plain greedy decoding of G tokens (no speculation): the reference stream.
+static std::vector<int> greedy_plain(Model& m, const std::vector<int>& toks, int G) {
     m.reset();
+    std::vector<int> out;
     std::vector<float> lg;
     for (int i = 0; i < NPROMPT; ++i) {
         std::vector<float> l;
         m.forward(toks[(size_t) i], i, &l);
         m.end_token();
         if (i + 1 == NPROMPT) lg = l;
+    }
+    for (int g = 0; g < G - 1; ++g) {
+        const int t = argmax(lg);
+        out.push_back(t);
+        std::vector<float> l;
+        m.forward(t, NPROMPT + g, &l);
+        m.end_token();
+        lg = std::move(l);
+    }
+    out.push_back(argmax(lg));
+    return out;
+}
+
+// One greedy speculative run of G tokens; returns the emitted stream. The prompt is `toks`,
+// however long it is (T6 replays a whole conversation as the prompt).
+static std::vector<int> greedy_spec(Model& m, const std::vector<int>& toks, int G) {
+    m.reset();
+    std::vector<float> lg;
+    const int np = (int) toks.size();
+    for (int i = 0; i < np; ++i) {
+        std::vector<float> l;
+        m.forward(toks[(size_t) i], i, &l);
+        m.end_token();
+        if (i + 1 == np) lg = l;
     }
     Sampler smp(SampleOpts{});
     std::vector<int> out;
@@ -229,7 +254,7 @@ int main(int argc, char** argv) {
         Model plain;
         if (!plain.load({model}, base_opts(0), err)) { std::printf("FAIL load plain: %s\n", err.c_str()); return 1; }
         const int G = 12;
-        const std::vector<int> ta = greedy_spec(plain, toks, G);
+        const std::vector<int> ta = greedy_plain(plain, toks, G);
         const std::vector<int> tb = greedy_spec(B, toks, G);
         CHECK((int) ta.size() == G && (int) tb.size() == G);
         bool same = true;
