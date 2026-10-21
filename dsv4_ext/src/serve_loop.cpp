@@ -205,13 +205,23 @@ int serve_loop(Model& m, const RunOpts& o, const std::vector<int>& eos_ids) {
             std::fflush(stderr);
         }
 
-        m.reset();
+        // Without --kv-checkpoint each request is independent (old behavior). With it, the cache lives across
+        // requests: a prompt that shares its leading tokens skips re-prefilling them, and nothing usable means reset.
+        size_t start_i = 0;
+        if (!o.kv_checkpoint.empty()) {
+            const int k = m.reuse_prefix(ids);
+            if (k == 0 && !m.cached_tokens().empty()) m.reset();
+            else if (k > 0) std::fprintf(stderr, "dsv4_run: reusing %d cached tokens of the prompt (%zu total)\n", k, ids.size());
+            start_i = (size_t) k;
+        } else {
+            m.reset();
+        }
         std::vector<float> logits;
         std::vector<int> history = ids;            // the penalties count over prompt + generated
         std::fill(m.last_routing.begin(), m.last_routing.end(), -1);
 
         const auto t0 = std::chrono::steady_clock::now();
-        int pos = 0;
+        int pos = (int) start_i;
         bool stopped = false;
         // Prefill runs in chunks of m.max_chunk() tokens: every weight row an expert holds is decoded
         // once for the whole chunk instead of once per token, which is what makes a long prompt cost
@@ -220,7 +230,7 @@ int serve_loop(Model& m, const RunOpts& o, const std::vector<int>& eos_ids) {
         const int bchunk = m.max_chunk();
         const size_t report = 8;
         size_t since_report = 0;
-        for (size_t i = 0; i < ids.size(); ) {
+        for (size_t i = start_i; i < ids.size(); ) {
             const size_t left = ids.size() - i;
             const int n = (bchunk > 1 && left > 1) ? (int) std::min<size_t>(left, (size_t) bchunk) : 1;
             m.forward_chunk(ids.data() + i, n, pos, n == (int) left ? &logits : nullptr);
@@ -244,6 +254,12 @@ int serve_loop(Model& m, const RunOpts& o, const std::vector<int>& eos_ids) {
         const double prefill_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
         if (stopped) {
             std::printf("DONE 0 %zu %.1f 0.0 cancel\n", ids.size(), prefill_ms);
+        // KV checkpoint: persist prompt + generated for the next request and for a restart.
+        if (!o.kv_checkpoint.empty()) {
+            std::string kerr;
+            if (m.save_kv(o.kv_checkpoint, kerr)) std::fprintf(stderr, "dsv4_run: KV checkpoint saved: %zu tokens -> %s\n", m.cached_tokens().size(), o.kv_checkpoint.c_str());
+            else std::fprintf(stderr, "dsv4_run: KV checkpoint save failed: %s\n", kerr.c_str());
+        }
             std::fflush(stdout);
             continue;
         }
@@ -287,6 +303,12 @@ int serve_loop(Model& m, const RunOpts& o, const std::vector<int>& eos_ids) {
         // DONE <generated> <prompt_tokens> <prompt_ms> <decode_ms> <finish>: the five fields server.py's
         // _parse_done always reads. The later fields it only reads when present are left out on purpose.
         std::printf("DONE %d %zu %.1f %.1f %s\n", generated, ids.size(), prefill_ms, decode_ms, finish.c_str());
+        // KV checkpoint: persist prompt + generated for the next request and for a restart.
+        if (!o.kv_checkpoint.empty()) {
+            std::string kerr;
+            if (m.save_kv(o.kv_checkpoint, kerr)) std::fprintf(stderr, "dsv4_run: KV checkpoint saved: %zu tokens -> %s\n", m.cached_tokens().size(), o.kv_checkpoint.c_str());
+            else std::fprintf(stderr, "dsv4_run: KV checkpoint save failed: %s\n", kerr.c_str());
+        }
         std::fflush(stdout);
         std::fprintf(stderr, "dsv4_run: %zu prompt -> %d tokens, %s (%.0f ms prefill, %.0f ms decode)\n",
                      ids.size(), generated, finish.c_str(), prefill_ms, decode_ms);

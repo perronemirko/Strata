@@ -32,6 +32,7 @@
 
 #include "dsv4/config.hpp"
 #include "dsv4/mem_plan.hpp"
+#include "dsv4/kv_quant.hpp"
 #include <string>
 #include <vector>
 #include <cstdint>
@@ -65,6 +66,9 @@ struct RunOpts {
     bool verify_slots = false;          ///< Verify VRAM slot assignments at load time.
     bool verbose = true;                ///< Print startup report: memory plan, profile, RAM/VRAM counts.
     int prefill_chunk = 256;            ///< Prefill batch size: 0 = disabled (one token at a time).
+    std::string kv_checkpoint;          ///< --kv-checkpoint FILE: restored at load, rewritten after every request.
+    KVFormat key_format = KVFormat::F32;   ///< -k / --key-format: format of the cached (fused) KV rows (e4m3/f16/f32).
+    KVFormat value_format = KVFormat::F32; ///< -v / --value-format: must match key_format - DSv4 caches one fused row per token.
 };
 
 /**
@@ -193,6 +197,38 @@ public:
      * @return Number of tokens actually processed (may be less than N if chunk exceeds limits).
      */
     int forward_chunk(const int* tokens, int n, int pos0, std::vector<float>* logits_out);
+
+    /**
+     * @brief Save the KV cache and token history to a checkpoint file (magic DSKV0002).
+     *
+     * The file carries a fingerprint of model + options; load_kv() refuses it when they differ.
+     * Written atomically (tmp + rename); after the first save, saves that extend the same history
+     * append only the new segment instead of rewriting the whole file.
+     */
+    bool save_kv(const std::string& path, std::string& err) const;
+
+    /**
+     * @brief Restore the KV cache and token history from a checkpoint file (see save_kv()).
+     *
+     * After a successful call the engine is exactly where the saving run left off: forward() may
+     * continue at position cached_tokens().size(). The host cache comes back f32 whatever -k/-v were.
+     */
+    bool load_kv(const std::string& path, std::string& err);
+
+    /**
+     * @brief Reuse the leading part of `ids` already held in the KV cache (prefix reuse).
+     *
+     * Returns k: ids[0..k) are cached and must NOT be prefilled again; the caller starts at position k.
+     * The last prompt token is always recomputed (its logits start the answer), so k <= ids.size()-1.
+     * A rewind deeper than the window ring cannot be served (the rows are gone): then 0 is returned
+     * and the whole prompt must run again. Truncates the internal history to k on success.
+     */
+    int reuse_prefix(const std::vector<int>& ids);
+
+    /**
+     * @brief Copy of the token history currently held in the KV cache (positions 0..size()-1).
+     */
+    std::vector<int> cached_tokens() const;
 
     /**
      * @brief Get routing information for all tokens of the last `forward_chunk()` call.

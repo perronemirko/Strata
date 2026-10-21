@@ -44,6 +44,9 @@ static void usage() {
         "  --expert-ram all|profile  'all' copies every expert to RAM (default: profile only)\n"
         "  --ram-cache-mib M         host-RAM LRU arena for MISS experts (default 8192, 0 = read straight from disk)\n"
         "  --prefill-chunk N         prompt tokens per batched forward (default 256, 0 = one token per pass)\n"
+        "  --kv-checkpoint F       KV cache checkpoint (DSKV0002): restored at start, rewritten after every request\n"
+        "  -k FMT / --key-format   format of the cached KV rows: e4m3 | f16 | f32 (default f32; e4m3 = 1/4 the memory)\n"
+        "  -v FMT / --value-format must match -k (DSv4 caches ONE fused row per token)   --kv-unified accepted for parity\n"
         "  --expert-adapt-swaps N    max VRAM swaps per token (0 = static)      --verify-slots   byte-compare every uploaded slot\n"
         "  --dump-routing F          write the routing trace (input of tools/make_expert_profile.py)\n"
         "  --dump-logits F           write float32 logits of every processed token\n"
@@ -106,6 +109,10 @@ int main(int argc, char** argv) {
         else if (a == "--expert-ram") o.ram_all = std::string(next()) == "all";
         else if (a == "--ram-cache-mib") o.ram_cache_mib = std::atoll(next());
         else if (a == "--prefill-chunk") o.prefill_chunk = std::atoi(next());
+        else if (a == "--kv-checkpoint") o.kv_checkpoint = next();
+        else if (a == "-k" || a == "--key-format") { std::string v = next(); if (!parse_kv_format(v, o.key_format)) { std::fprintf(stderr, "error: invalid -k format '%s' (use e4m3, f16, f32)\n", v.c_str()); return 2; } }
+        else if (a == "-v" || a == "--value-format") { std::string v = next(); if (!parse_kv_format(v, o.value_format)) { std::fprintf(stderr, "error: invalid -v format '%s' (use e4m3, f16, f32)\n", v.c_str()); return 2; } }
+        else if (a == "--kv-unified") {}   // accepted for llama.cpp parity: one sequence, one shared cache already
         else if (a == "--expert-adapt-swaps") o.adapt_swaps = std::atoi(next());
         else if (a == "--expert-source") { if (std::string(next()) == "host") std::fprintf(stderr, "note: --expert-source host == --expert-ram all in this build; experts are always mmap'ed first\n"); }
         else if (a == "--verify-slots") o.verify_slots = true;
@@ -119,10 +126,23 @@ int main(int argc, char** argv) {
     if (!serve && prompt.empty() && !selfcheck) { usage(); return 2; }
     if (o.vram_pct < 0 && o.abs_slots < 0 && !o.gpu) o.vram_pct = 0;
 
+    if (o.key_format != o.value_format) { std::fprintf(stderr, "error: -k and -v must match (%s vs %s): DSv4-Flash caches ONE fused row per token\n", kv_format_name(o.key_format), kv_format_name(o.value_format)); return 2; }
     Model m; std::string err;
     auto t0 = std::chrono::steady_clock::now();
     if (!m.load(shards, o, err)) { std::fprintf(stderr, "error: %s\n", err.c_str()); return 1; }
     std::fprintf(stderr, "loaded in %.1f s (%s)\n", std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(), o.gpu ? (gpu::is_emulated() ? "GPU EMULATED on CPU" : "CUDA") : "CPU only");
+    // KV checkpoint: restore what a previous run left behind (the file must exist; a mismatched one is refused and ignored).
+    if (!o.kv_checkpoint.empty()) {
+        FILE* probe = std::fopen(o.kv_checkpoint.c_str(), "rb");
+        if (probe) {
+            std::fclose(probe);
+            std::string kerr;
+            if (m.load_kv(o.kv_checkpoint, kerr))
+                std::fprintf(stderr, "dsv4_run: KV checkpoint restored: %zu tokens from %s\n", m.cached_tokens().size(), o.kv_checkpoint.c_str());
+            else
+                std::fprintf(stderr, "dsv4_run: KV checkpoint not used (%s): starting with an empty cache\n", kerr.c_str());
+        }
+    }
     // selfcheck prints a table on stdout; in --serve that channel is the protocol, so it stays out of it.
     if (selfcheck && serve) std::fprintf(stderr, "note: --selfcheck is skipped with --serve (stdout is the protocol)\n");
     else if (selfcheck) m.selfcheck();
@@ -169,7 +189,14 @@ int main(int argc, char** argv) {
     const int bchunk = lf ? 1 : m.max_chunk();
     if (lf && m.max_chunk() > 1)
         std::fprintf(stderr, "note: --dump-logits needs one logit set per token, prefill batching disabled\n");
-    for (size_t i = 0; i < prompt.size(); ) {
+    // Prefix reuse: if the prompt shares its leading tokens with what the checkpoint restored, skip re-prefilling them.
+    size_t start_i = 0;
+    if (!o.kv_checkpoint.empty() && !prompt.empty()) {
+        const int k = m.reuse_prefix(prompt);
+        pos = k; start_i = (size_t) k;
+        if (k > 0) std::fprintf(stderr, "dsv4_run: reusing %d cached tokens of the prompt (%zu total)\n", k, prompt.size());
+    }
+    for (size_t i = start_i; i < prompt.size(); ) {
         const size_t left = prompt.size() - i;
         const int n = (bchunk > 1 && left > 1) ? (int) std::min<size_t>(left, (size_t) bchunk) : 1;
         if (n == 1) {
@@ -216,6 +243,12 @@ int main(int argc, char** argv) {
                  s.cache_bytes / 1073741824.0, (unsigned long long) s.cache_evictions,
                  s.h2d_bytes / 1073741824.0, s.cpu_miss_s, s.gpu_hit_s,
                  (unsigned long long) s.prefill_tokens, (unsigned long long) s.prefill_chunks, m.max_chunk());
+    // KV checkpoint: persist the whole conversation (prompt + generated) for the next run.
+    if (!o.kv_checkpoint.empty()) {
+        std::string kerr;
+        if (m.save_kv(o.kv_checkpoint, kerr)) std::fprintf(stderr, "dsv4_run: KV checkpoint saved: %zu tokens -> %s\n", m.cached_tokens().size(), o.kv_checkpoint.c_str());
+        else std::fprintf(stderr, "dsv4_run: KV checkpoint save failed: %s\n", kerr.c_str());
+    }
     if (tr) std::fclose(tr);
     if (lf) std::fclose(lf);
     if (!o.profile_out.empty()) { if (!m.save_profile(err)) std::fprintf(stderr, "profile save failed: %s\n", err.c_str()); else std::fprintf(stderr, "profile saved: %s\n", o.profile_out.c_str()); }

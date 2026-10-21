@@ -183,6 +183,14 @@ struct Model::Impl {
     std::vector<float> cos_y, sin_y, cos_p, sin_p;   // YaRN (compressed layers) / plain (window-only layers) rope tables
     uint64_t model_hash = 0;
     std::vector<std::string> toks;
+    // ---- KV checkpoint + prefix reuse (ported from gptoss_ext: --kv-checkpoint, -k/-v) ----
+    std::vector<int> cached;                 // token history held by the KV cache (positions 0..size()-1)
+    std::string ck_path;                     // file this run last saved to / loaded from (append mode needs it to match)
+    bool ck_ok = false;                      // true: the on-disk file is a valid prefix of `cached` and can be appended to
+    std::vector<int> ck_toks;                // token history as of the last successful save/load
+    struct CkSeg { uint64_t start, off; };   // segment [start..) starts at byte offset off (its own header)
+    std::vector<CkSeg> ck_segs;
+    uint64_t ck_end = 0;                     // file size after the last commit
     // device scratch
     float *d_x = nullptr, *d_y = nullptr, *d_g = nullptr, *d_u = nullptr, *d_a = nullptr, *d_yh = nullptr;
     std::vector<void*> allocs;
@@ -906,6 +914,34 @@ struct Model::Impl {
         return true;
     }
 
+    // ------------------------------------------------------------ KV checkpoint + prefix reuse (ported from gptoss_ext)
+    /// What a checkpoint must match to be loadable: model identity + every option that changes the math.
+    std::string fingerprint() const {
+        char b[512];
+        std::snprintf(b, sizeof b, "hash=%llu|layers=%d|dim=%d|win=%d|hd=%d|ctx=%d|qat=%d|kvf=%d|%d",
+                      (unsigned long long) model_hash, nrun, dim, win, hd, o.ctx, (int) o.qat_sim, (int) o.key_format, (int) o.value_format);
+        return b;
+    }
+
+    /// How many leading tokens of `ids` are already in the cache. The last prompt token is always
+    /// recomputed (its logits start the answer), so k <= ids.size()-1. A rewind deeper than the window
+    /// ring cannot be served: those rows were overwritten, and 0 means "run the whole prompt again".
+    int reuse_prefix(const std::vector<int>& ids) {
+        const int n = (int) cached.size();
+        int k = 0;
+        while (k < n && k < (int) ids.size() && cached[(size_t) k] == ids[(size_t) k]) ++k;
+        if (!ids.empty()) k = std::min(k, (int) ids.size() - 1);
+        if (n > k && n - k > win - 1) {
+            std::fprintf(stderr, "dsv4_run: cannot reuse the prefix (%d cached -> %d): the window ring holds %d positions; recomputing the prompt\n", n, k, win);
+            return 0;
+        }
+        if (k < n) {   // rewind: drop the history; the recompute refills every row it reads
+            cached.resize((size_t) k);
+            ck_ok = false; ck_segs.clear(); ck_end = 0; ck_toks.assign(cached.begin(), cached.end());
+        }
+        return k;
+    }
+
     void reset() {
         for (Layer& y : L) {
             std::fill(y.ring_pos.begin(), y.ring_pos.end(), -1);
@@ -914,6 +950,7 @@ struct Model::Impl {
                 cp->scs.assign((size_t) cp->coff * cp->ratio * cp->coff * cp->d, -INFINITY);
             }
         }
+        cached.clear(); ck_ok = false; ck_segs.clear(); ck_end = 0; ck_toks.clear();
     }
 
     // ------------------------------------------------------------ attention
@@ -1399,6 +1436,7 @@ struct Model::Impl {
             for (int j = 0; j < hc; ++j) std::memcpy(h_h + (size_t) t * n + (size_t) j * dim, e, (size_t) dim * 4);
         }
         for (int t = 0; t < T; ++t) h_tk[t] = tokens[t];
+        for (int t = 0; t < T; ++t) cached.push_back(tokens[t]);
         for (int l = 0; l < nrun; ++l) block_batch(l, T, h_tk, pos0);
         chunk_routing_n = T;
         // Only the last token of the chunk needs logits: it is the one that starts the answer.
@@ -1436,6 +1474,7 @@ struct Model::Impl {
 
     void forward(int token, int pos, std::vector<float>* logits) {
         auto t0 = Clock::now();
+        cached.push_back(token);
         std::vector<float> e((size_t) dim), hres((size_t) hc * dim), x((size_t) dim), xn((size_t) dim);
         dequant_row(embd.type, embd.h + (size_t) token * embd.rb, dim, e.data());
         for (int j = 0; j < hc; ++j) std::memcpy(&hres[(size_t) j * dim], e.data(), (size_t) dim * 4);
@@ -1529,6 +1568,185 @@ int Model::forward_chunk(const int* tokens, int n, int pos0, std::vector<float>*
 int Model::max_chunk() const { return p_->pf_cap; }
 void Model::end_token() { p_->end_token(); }
 void Model::end_chunk(int n) { p_->end_chunk(n); }
+// ================================================================================================
+// KV checkpoint + prefix reuse, ported from gptoss_ext (GPKV0002 -> DSKV0002).
+// The file carries the token history plus every piece of per-layer state attention reads: the window
+// ring rows still live at each segment's end and BOTH compressors' full state (rolling buffers + the
+// compressed-entry caches, which live inside kvbuf / ic.own). Restoring is a pure memcpy - no math.
+namespace {
+struct DskvHead  { char magic[8]; uint32_t n_layer, hd, win, ctx, fp_len, nseg; uint64_t n; };   // "DSKV0002"
+struct DskvSegHd { uint64_t start, count; };
+}
+
+bool Model::save_kv(const std::string& path, std::string& err) const {
+    Impl& s = const_cast<Impl&>(*p_);                  // the checkpoint bookkeeping (ck_*) lives in the Impl; the model itself is not touched
+    if ((int) s.cached.size() > s.o.ctx) { err = "the cache holds more tokens than --ctx"; return false; }
+    const std::string fp = s.fingerprint();
+    const int n = (int) s.cached.size(), HD = s.hd, WIN = s.win;
+    auto write_header = [&](FILE* f, uint32_t nseg, uint64_t total) {
+        DskvHead h{{'D','S','K','V','0','0','0','2'}, (uint32_t) s.nrun, (uint32_t) HD, (uint32_t) WIN, (uint32_t) s.o.ctx, (uint32_t) fp.size(), nseg, total};
+        return fseeko(f, 0, SEEK_SET) == 0 && std::fwrite(&h, sizeof h, 1, f) == 1 && std::fwrite(fp.data(), 1, fp.size(), f) == fp.size();
+    };
+    auto write_seg = [&](FILE* f, int a, int e) {
+        DskvSegHd sh{(uint64_t) a, (uint64_t) (e - a)};
+        bool ok = std::fwrite(&sh, sizeof sh, 1, f) == 1 &&
+                  (e == a || std::fwrite(s.cached.data() + a, sizeof(int), (size_t) (e - a), f) == (size_t) (e - a));
+        for (Layer& y : s.L) {
+            const int lo = std::max(a, e - WIN);       // ring rows still live at the end of this segment
+            for (int p = lo; p < e && ok; ++p) ok = std::fwrite(&y.kvbuf[(size_t) ((size_t) p % WIN) * HD], sizeof(float), (size_t) HD, f) == (size_t) HD;
+            if (y.ratio > 0) {                         // rolling buffers as of e-1 + the cache entries NEW in [a, e)
+                const Comp& ac = y.ac;
+                ok = std::fwrite(ac.kvs.data(), sizeof(float), ac.kvs.size(), f) == ac.kvs.size() &&
+                     std::fwrite(ac.scs.data(), sizeof(float), ac.scs.size(), f) == ac.scs.size();
+                // entry j of the compressor cache is filled while processing position j*ratio + ratio - 1,
+                // so the entries NEW in [a, e) are j0..j1 with:
+                const int j0 = a / y.ratio;
+                const int j1 = (e > y.ratio) ? ((e - y.ratio) / y.ratio) : -1;
+                ok = ok && std::fwrite(&j0, sizeof(int), 1, f) == 1 && std::fwrite(&j1, sizeof(int), 1, f) == 1;
+                if (j1 >= j0) {
+                    const size_t cnt = (size_t) (j1 - j0 + 1);
+                    ok = ok && std::fwrite(ac.cache + (size_t) j0 * ac.d, sizeof(float), cnt * (size_t) ac.d, f) == cnt * (size_t) ac.d;
+                }
+                if (y.has_idx) {
+                    const Comp& ic = y.ic;
+                    ok = ok && std::fwrite(ic.kvs.data(), sizeof(float), ic.kvs.size(), f) == ic.kvs.size() &&
+                            std::fwrite(ic.scs.data(), sizeof(float), ic.scs.size(), f) == ic.scs.size();
+                    ok = ok && std::fwrite(&j0, sizeof(int), 1, f) == 1 && std::fwrite(&j1, sizeof(int), 1, f) == 1;
+                    if (j1 >= j0) {
+                        const size_t cnt = (size_t) (j1 - j0 + 1);
+                        ok = ok && std::fwrite(ic.cache + (size_t) j0 * ic.d, sizeof(float), cnt * (size_t) ic.d, f) == cnt * (size_t) ic.d;
+                    }
+                }
+            }
+        }
+        return ok;
+    };
+
+    // --- append: the file on disk is a valid prefix of the live cache (up to the first position where the tokens differ)
+    if (s.ck_ok && s.ck_path == path && !s.ck_segs.empty()) {
+        struct stat st;
+        const bool st_ok = ::stat(path.c_str(), &st) == 0;
+        if (st_ok && (uint64_t) st.st_size == s.ck_end) {
+            size_t c = 0;
+            while (c < s.ck_toks.size() && c < (size_t) n && s.ck_toks[c] == s.cached[c]) ++c;
+            size_t bi = s.ck_segs.size();              // first segment to drop
+            if (c < s.ck_toks.size()) {                // diverged (rewind): rewrite from the start of the segment that holds position c
+                bi = 0;
+                for (size_t i = 0; i < s.ck_segs.size(); ++i) if (s.ck_segs[i].start <= c) bi = i;
+            }
+            const uint64_t b = (bi < s.ck_segs.size()) ? s.ck_segs[bi].start : (uint64_t) s.ck_toks.size();
+            if (bi == s.ck_segs.size() && (uint64_t) n == b) return true;   // nothing new
+            FILE* f = std::fopen(path.c_str(), "r+b");
+            if (f) {
+                std::setvbuf(f, nullptr, _IOFBF, (size_t) 1 << 20);
+                bool ok = true;
+                if (bi < s.ck_segs.size()) {           // shrink first, so a kill in the middle leaves a shorter but valid file
+                    const uint64_t off = s.ck_segs[bi].off;
+                    ok = write_header(f, (uint32_t) bi, b) && std::fflush(f) == 0 && ftruncate(fileno(f), (off_t) off) == 0;
+                    if (ok) { s.ck_segs.resize(bi); s.ck_toks.resize((size_t) b); s.ck_end = off; }
+                }
+                const bool had_seg = ok && (uint64_t) n > b;
+                if (ok && had_seg) ok = fseeko(f, (off_t) s.ck_end, SEEK_SET) == 0 && write_seg(f, (int) b, n);
+                const off_t end = ok ? ftello(f) : (off_t) -1;
+                if (ok) ok = write_header(f, (uint32_t) (s.ck_segs.size() + (had_seg ? 1 : 0)), (uint64_t) n) && std::fflush(f) == 0;
+                ok = (std::fclose(f) == 0) && ok;
+                if (ok) {
+                    if (had_seg) { s.ck_segs.push_back({b, s.ck_end}); s.ck_end = (uint64_t) end; }
+                    s.ck_toks = s.cached;
+                    return true;
+                }
+            }
+            s.ck_ok = false;                           // anything went wrong: fall through to a full rewrite
+        }
+    }
+
+    // --- full rewrite (first save of a run, another file, a torn file): tmp + rename, ONE segment [0, n)
+    const std::string tmp = path + ".tmp";
+    FILE* f = std::fopen(tmp.c_str(), "wb");
+    if (!f) { err = "cannot write " + tmp; return false; }
+    std::setvbuf(f, nullptr, _IOFBF, (size_t) 1 << 20);
+    bool ok = write_header(f, 1, (uint64_t) n) && write_seg(f, 0, n);
+    const off_t end = ok ? ftello(f) : (off_t) -1;
+    ok = (std::fclose(f) == 0) && ok;
+    if (!ok) { err = "write error on " + tmp; std::remove(tmp.c_str()); return false; }
+    if (std::rename(tmp.c_str(), path.c_str()) != 0) { err = "rename failed"; return false; }
+    s.ck_path = path; s.ck_toks = s.cached; s.ck_segs.assign(1, Impl::CkSeg{0, sizeof(DskvHead) + fp.size()}); s.ck_end = (uint64_t) end; s.ck_ok = true;
+    return true;
+}
+
+bool Model::load_kv(const std::string& path, std::string& err) {
+    Impl& s = *p_;
+    s.ck_ok = false;
+    FILE* f = std::fopen(path.c_str(), "rb");
+    if (!f) { err = "cannot open " + path; return false; }
+    std::setvbuf(f, nullptr, _IOFBF, (size_t) 1 << 20);
+    DskvHead h;
+    if (std::fread(&h, sizeof h, 1, f) != 1 || std::memcmp(h.magic, "DSKV0002", 8) != 0) { std::fclose(f); err = "not a KV checkpoint"; return false; }
+    std::string fp(h.fp_len, '\0');
+    if (h.fp_len > 4096 || std::fread(&fp[0], 1, h.fp_len, f) != h.fp_len || fp != s.fingerprint() ||
+        h.n_layer != (uint32_t) s.nrun || h.hd != (uint32_t) s.hd || h.win != (uint32_t) s.win || h.ctx != (uint32_t) s.o.ctx) {
+        std::fclose(f); err = "checkpoint belongs to another model/options"; return false;
+    }
+    if (h.n > (uint64_t) s.o.ctx) { std::fclose(f); err = "checkpoint has more tokens than --ctx"; return false; }
+    const int HD = s.hd, WIN = s.win;
+    std::vector<int> toks;
+    std::vector<Impl::CkSeg> segs;
+    bool ok = true;
+    uint64_t run = 0;
+    for (uint32_t i = 0; i < h.nseg && ok; ++i) {
+        const off_t off = ftello(f);
+        DskvSegHd sh;
+        ok = std::fread(&sh, sizeof sh, 1, f) == 1 && sh.start == run && sh.start + sh.count <= h.n;
+        if (!ok) break;
+        const int a = (int) sh.start, e = (int) (sh.start + sh.count);
+        toks.resize((size_t) e);
+        ok = (e == a) || std::fread(toks.data() + a, sizeof(int), (size_t) (e - a), f) == (size_t) (e - a);
+        for (Layer& y : s.L) {
+            const int lo = std::max(a, e - WIN);
+            for (int p = lo; p < e && ok; ++p) ok = std::fread(&y.kvbuf[(size_t) ((size_t) p % WIN) * HD], sizeof(float), (size_t) HD, f) == (size_t) HD;
+            if (y.ratio > 0) {                         // rolling buffers + the cache entries new in this segment
+                Comp& ac = y.ac;
+                ok = ok && std::fread(ac.kvs.data(), sizeof(float), ac.kvs.size(), f) == ac.kvs.size() &&
+                        std::fread(ac.scs.data(), sizeof(float), ac.scs.size(), f) == ac.scs.size();
+                int j0 = 0, j1 = -1;
+                ok = ok && std::fread(&j0, sizeof(int), 1, f) == 1 && std::fread(&j1, sizeof(int), 1, f) == 1 &&
+                       (j0 >= 0 && j0 <= a / y.ratio && j1 < e / y.ratio + 1);   // sanity: the slice belongs to this segment
+                if (ok && j1 >= j0) {
+                    const size_t cnt = (size_t) (j1 - j0 + 1);
+                    ok = ok && std::fread(ac.cache + (size_t) j0 * ac.d, sizeof(float), cnt * (size_t) ac.d, f) == cnt * (size_t) ac.d;
+                }
+                if (y.has_idx) {
+                    Comp& ic = y.ic;
+                    ok = ok && std::fread(ic.kvs.data(), sizeof(float), ic.kvs.size(), f) == ic.kvs.size() &&
+                            std::fread(ic.scs.data(), sizeof(float), ic.scs.size(), f) == ic.scs.size();
+                    int i0 = 0, i1 = -1;
+                    ok = ok && std::fread(&i0, sizeof(int), 1, f) == 1 && std::fread(&i1, sizeof(int), 1, f) == 1 &&
+                           (i0 >= 0 && i0 <= a / y.ratio && i1 < e / y.ratio + 1);
+                    if (ok && i1 >= i0) {
+                        const size_t cnt = (size_t) (i1 - i0 + 1);
+                        ok = ok && std::fread(ic.cache + (size_t) i0 * ic.d, sizeof(float), cnt * (size_t) ic.d, f) == cnt * (size_t) ic.d;
+                    }
+                }
+            }
+        }
+        if (ok) { segs.push_back({sh.start, (uint64_t) off}); run = (uint64_t) e; }
+    }
+    const off_t end = ftello(f);
+    std::fclose(f);
+    if (!ok || run != h.n) { toks.clear(); err = "truncated checkpoint"; return false; }
+
+    for (Layer& y : s.L) {                             // ring_pos: slot -> the newest position it holds now
+        std::fill(y.ring_pos.begin(), y.ring_pos.end(), -1);
+        const int n = (int) toks.size();
+        for (int p = std::max(0, n - WIN); p < n; ++p) y.ring_pos[(size_t) ((size_t) p % WIN)] = p;
+    }
+    s.cached = std::move(toks);
+    s.ck_path = path; s.ck_toks = s.cached; s.ck_segs = std::move(segs); s.ck_end = (uint64_t) end; s.ck_ok = true;
+    return true;
+}
+
+std::vector<int> Model::cached_tokens() const { return p_ ? p_->cached : std::vector<int>(); }
+int Model::reuse_prefix(const std::vector<int>& ids) { return p_ ? p_->reuse_prefix(ids) : 0; }
 bool Model::save_profile(std::string& err) const { return p_->save_profile(err); }
 void Model::selfcheck() const { p_->selfcheck(); }
 uint64_t Model::model_hash() const { return p_->model_hash; }

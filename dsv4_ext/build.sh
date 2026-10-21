@@ -65,6 +65,8 @@ if [ "$CUDA_ONLY" = 0 ]; then
     # Per-operation check of the batched device kernels (matmul, gather, experts_batch): trivial on the
     # emulated device, and the one that says WHICH op is wrong when the CUDA run below disagrees.
     "$CXX" $FL $SRC tests/test_gpu_batch.cpp -o "$OUT/test_gpu_batch"
+    # KV checkpoint + prefix reuse (ported from gptoss_ext): needs a tiny GGUF, so it runs below with the model.
+    "$CXX" $FL $SRC tests/test_kv_checkpoint.cpp -o "$OUT/test_kv_checkpoint"
 
     echo "==> Compiling dsv4_plan..."
     "$CXX" $FL $SRC src/dsv4_plan_main.cpp -o "$OUT/dsv4_plan"
@@ -96,6 +98,9 @@ PB_IDS=5,9,17,23,31,7,11,3
 if [ "$CUDA_ONLY" = 0 ] && [ "$HAVE_TINY" = 1 ]; then
     echo "==> Running prefill batch parity test (CPU + emulated device)..."
     "$OUT/test_prefill_batch" --model "$TINY/tiny.gguf" --ids "$PB_IDS" --no-qat-sim --gpu
+
+    echo "==> Running KV checkpoint / prefix reuse tests..."
+    "$OUT/test_kv_checkpoint" --model "$TINY/tiny.gguf"
 fi
 
 if [ "$WITH_CUDA" = 1 ]; then
