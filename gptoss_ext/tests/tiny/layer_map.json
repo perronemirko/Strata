@@ -1,0 +1,286 @@
+{
+  "source": "tests/tiny",
+  "formats": [
+    "safetensors"
+  ],
+  "tensors": 79,
+  "layers": 4,
+  "experts_in_names": 8,
+  "gguf_metadata": {},
+  "fingerprint": {
+    "attention_sinks": true,
+    "qk_norm": false,
+    "mla_latent_kv": false,
+    "router_bias": true,
+    "shared_experts": false,
+    "mxfp4_experts": true,
+    "fp8_block_scales": false,
+    "attention_bias": true,
+    "linear_recurrent_ssm": false,
+    "sparse_indexer": false,
+    "kv_compressor": false,
+    "hash_routing_tid2eid": false,
+    "hyper_connections": false,
+    "per_layer_embeddings": false,
+    "mtp_head": false,
+    "quant_dtypes": [
+      "BF16",
+      "U8"
+    ],
+    "model_type": "gpt_oss",
+    "architectures": [
+      "GptOssForCausalLM"
+    ]
+  },
+  "layer_kinds": [
+    {
+      "count": 4,
+      "layers": [
+        0,
+        1,
+        2,
+        3
+      ],
+      "stems": [
+        "input_layernorm.weight",
+        "mlp.experts.down_proj_bias",
+        "mlp.experts.down_proj_blocks",
+        "mlp.experts.down_proj_scales",
+        "mlp.experts.gate_up_proj_bias",
+        "mlp.experts.gate_up_proj_blocks",
+        "mlp.experts.gate_up_proj_scales",
+        "mlp.router.bias",
+        "mlp.router.weight",
+        "post_attention_layernorm.weight",
+        "self_attn.k_proj.bias",
+        "self_attn.k_proj.weight",
+        "self_attn.o_proj.bias",
+        "self_attn.o_proj.weight",
+        "self_attn.q_proj.bias",
+        "self_attn.q_proj.weight",
+        "self_attn.sinks",
+        "self_attn.v_proj.bias",
+        "self_attn.v_proj.weight"
+      ]
+    }
+  ],
+  "groups": {
+    "lm_head.weight": [
+      {
+        "dtype": "BF16",
+        "shape": [
+          96,
+          64
+        ],
+        "count": 1
+      }
+    ],
+    "model.embed_tokens.weight": [
+      {
+        "dtype": "BF16",
+        "shape": [
+          96,
+          64
+        ],
+        "count": 1
+      }
+    ],
+    "model.layers.{i}.input_layernorm.weight": [
+      {
+        "dtype": "BF16",
+        "shape": [
+          64
+        ],
+        "count": 4
+      }
+    ],
+    "model.layers.{i}.mlp.experts.down_proj_bias": [
+      {
+        "dtype": "BF16",
+        "shape": [
+          8,
+          64
+        ],
+        "count": 4
+      }
+    ],
+    "model.layers.{i}.mlp.experts.down_proj_blocks": [
+      {
+        "dtype": "U8",
+        "shape": [
+          8,
+          64,
+          2,
+          16
+        ],
+        "count": 4
+      }
+    ],
+    "model.layers.{i}.mlp.experts.down_proj_scales": [
+      {
+        "dtype": "U8",
+        "shape": [
+          8,
+          64,
+          2
+        ],
+        "count": 4
+      }
+    ],
+    "model.layers.{i}.mlp.experts.gate_up_proj_bias": [
+      {
+        "dtype": "BF16",
+        "shape": [
+          8,
+          128
+        ],
+        "count": 4
+      }
+    ],
+    "model.layers.{i}.mlp.experts.gate_up_proj_blocks": [
+      {
+        "dtype": "U8",
+        "shape": [
+          8,
+          128,
+          2,
+          16
+        ],
+        "count": 4
+      }
+    ],
+    "model.layers.{i}.mlp.experts.gate_up_proj_scales": [
+      {
+        "dtype": "U8",
+        "shape": [
+          8,
+          128,
+          2
+        ],
+        "count": 4
+      }
+    ],
+    "model.layers.{i}.mlp.router.bias": [
+      {
+        "dtype": "BF16",
+        "shape": [
+          8
+        ],
+        "count": 4
+      }
+    ],
+    "model.layers.{i}.mlp.router.weight": [
+      {
+        "dtype": "BF16",
+        "shape": [
+          8,
+          64
+        ],
+        "count": 4
+      }
+    ],
+    "model.layers.{i}.post_attention_layernorm.weight": [
+      {
+        "dtype": "BF16",
+        "shape": [
+          64
+        ],
+        "count": 4
+      }
+    ],
+    "model.layers.{i}.self_attn.k_proj.bias": [
+      {
+        "dtype": "BF16",
+        "shape": [
+          32
+        ],
+        "count": 4
+      }
+    ],
+    "model.layers.{i}.self_attn.k_proj.weight": [
+      {
+        "dtype": "BF16",
+        "shape": [
+          32,
+          64
+        ],
+        "count": 4
+      }
+    ],
+    "model.layers.{i}.self_attn.o_proj.bias": [
+      {
+        "dtype": "BF16",
+        "shape": [
+          64
+        ],
+        "count": 4
+      }
+    ],
+    "model.layers.{i}.self_attn.o_proj.weight": [
+      {
+        "dtype": "BF16",
+        "shape": [
+          64,
+          64
+        ],
+        "count": 4
+      }
+    ],
+    "model.layers.{i}.self_attn.q_proj.bias": [
+      {
+        "dtype": "BF16",
+        "shape": [
+          64
+        ],
+        "count": 4
+      }
+    ],
+    "model.layers.{i}.self_attn.q_proj.weight": [
+      {
+        "dtype": "BF16",
+        "shape": [
+          64,
+          64
+        ],
+        "count": 4
+      }
+    ],
+    "model.layers.{i}.self_attn.sinks": [
+      {
+        "dtype": "BF16",
+        "shape": [
+          4
+        ],
+        "count": 4
+      }
+    ],
+    "model.layers.{i}.self_attn.v_proj.bias": [
+      {
+        "dtype": "BF16",
+        "shape": [
+          32
+        ],
+        "count": 4
+      }
+    ],
+    "model.layers.{i}.self_attn.v_proj.weight": [
+      {
+        "dtype": "BF16",
+        "shape": [
+          32,
+          64
+        ],
+        "count": 4
+      }
+    ],
+    "model.norm.weight": [
+      {
+        "dtype": "BF16",
+        "shape": [
+          64
+        ],
+        "count": 1
+      }
+    ]
+  }
+}

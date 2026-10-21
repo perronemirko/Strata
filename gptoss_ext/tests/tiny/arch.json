@@ -1,0 +1,444 @@
+{
+  "schema": "arch-spec/1",
+  "source": "tests/tiny",
+  "arch": "gpt_oss",
+  "layers": 4,
+  "experts": 8,
+  "experts_source": "dal config/metadati",
+  "components": {
+    "attention_sinks": true,
+    "qk_norm": false,
+    "mla_latent_kv": false,
+    "router_bias": true,
+    "shared_experts": false,
+    "mxfp4_experts": true,
+    "fp8_block_scales": false,
+    "attention_bias": true,
+    "linear_recurrent_ssm": false,
+    "sparse_indexer": false,
+    "kv_compressor": false,
+    "hash_routing_tid2eid": false,
+    "hyper_connections": false,
+    "per_layer_embeddings": false,
+    "mtp_head": false
+  },
+  "component_evidence": {
+    "attention_sinks": [
+      "model.layers.0.self_attn.sinks",
+      "model.layers.1.self_attn.sinks",
+      "model.layers.2.self_attn.sinks",
+      "model.layers.3.self_attn.sinks"
+    ],
+    "router_bias": [
+      "model.layers.0.mlp.router.bias",
+      "model.layers.1.mlp.router.bias",
+      "model.layers.2.mlp.router.bias",
+      "model.layers.3.mlp.router.bias"
+    ],
+    "mxfp4_experts": [
+      "model.layers.0.mlp.experts.down_proj_blocks",
+      "model.layers.0.mlp.experts.gate_up_proj_blocks",
+      "model.layers.1.mlp.experts.down_proj_blocks",
+      "model.layers.1.mlp.experts.gate_up_proj_blocks",
+      "model.layers.2.mlp.experts.down_proj_blocks",
+      "model.layers.2.mlp.experts.gate_up_proj_blocks",
+      "model.layers.3.mlp.experts.down_proj_blocks",
+      "model.layers.3.mlp.experts.gate_up_proj_blocks"
+    ],
+    "attention_bias": [
+      "model.layers.0.self_attn.q_proj.bias",
+      "model.layers.1.self_attn.q_proj.bias",
+      "model.layers.2.self_attn.q_proj.bias",
+      "model.layers.3.self_attn.q_proj.bias"
+    ]
+  },
+  "dtypes": [
+    "BF16",
+    "U8"
+  ],
+  "layer_kinds": [
+    {
+      "id": 1,
+      "layers": [
+        0,
+        1,
+        2,
+        3
+      ],
+      "stems": [
+        "input_layernorm.weight",
+        "mlp.experts.down_proj_bias",
+        "mlp.experts.down_proj_blocks",
+        "mlp.experts.down_proj_scales",
+        "mlp.experts.gate_up_proj_bias",
+        "mlp.experts.gate_up_proj_blocks",
+        "mlp.experts.gate_up_proj_scales",
+        "mlp.router.bias",
+        "mlp.router.weight",
+        "post_attention_layernorm.weight",
+        "self_attn.k_proj.bias",
+        "self_attn.k_proj.weight",
+        "self_attn.o_proj.bias",
+        "self_attn.o_proj.weight",
+        "self_attn.q_proj.bias",
+        "self_attn.q_proj.weight",
+        "self_attn.sinks",
+        "self_attn.v_proj.bias",
+        "self_attn.v_proj.weight"
+      ]
+    }
+  ],
+  "tensors": {
+    "lm_head.weight": [
+      {
+        "dtype": "BF16",
+        "shape": [
+          96,
+          64
+        ],
+        "count": 1
+      }
+    ],
+    "model.embed_tokens.weight": [
+      {
+        "dtype": "BF16",
+        "shape": [
+          96,
+          64
+        ],
+        "count": 1
+      }
+    ],
+    "model.layers.{i}.input_layernorm.weight": [
+      {
+        "dtype": "BF16",
+        "shape": [
+          64
+        ],
+        "count": 4
+      }
+    ],
+    "model.layers.{i}.mlp.experts.down_proj_bias": [
+      {
+        "dtype": "BF16",
+        "shape": [
+          8,
+          64
+        ],
+        "count": 4
+      }
+    ],
+    "model.layers.{i}.mlp.experts.down_proj_blocks": [
+      {
+        "dtype": "U8",
+        "shape": [
+          8,
+          64,
+          2,
+          16
+        ],
+        "count": 4
+      }
+    ],
+    "model.layers.{i}.mlp.experts.down_proj_scales": [
+      {
+        "dtype": "U8",
+        "shape": [
+          8,
+          64,
+          2
+        ],
+        "count": 4
+      }
+    ],
+    "model.layers.{i}.mlp.experts.gate_up_proj_bias": [
+      {
+        "dtype": "BF16",
+        "shape": [
+          8,
+          128
+        ],
+        "count": 4
+      }
+    ],
+    "model.layers.{i}.mlp.experts.gate_up_proj_blocks": [
+      {
+        "dtype": "U8",
+        "shape": [
+          8,
+          128,
+          2,
+          16
+        ],
+        "count": 4
+      }
+    ],
+    "model.layers.{i}.mlp.experts.gate_up_proj_scales": [
+      {
+        "dtype": "U8",
+        "shape": [
+          8,
+          128,
+          2
+        ],
+        "count": 4
+      }
+    ],
+    "model.layers.{i}.mlp.router.bias": [
+      {
+        "dtype": "BF16",
+        "shape": [
+          8
+        ],
+        "count": 4
+      }
+    ],
+    "model.layers.{i}.mlp.router.weight": [
+      {
+        "dtype": "BF16",
+        "shape": [
+          8,
+          64
+        ],
+        "count": 4
+      }
+    ],
+    "model.layers.{i}.post_attention_layernorm.weight": [
+      {
+        "dtype": "BF16",
+        "shape": [
+          64
+        ],
+        "count": 4
+      }
+    ],
+    "model.layers.{i}.self_attn.k_proj.bias": [
+      {
+        "dtype": "BF16",
+        "shape": [
+          32
+        ],
+        "count": 4
+      }
+    ],
+    "model.layers.{i}.self_attn.k_proj.weight": [
+      {
+        "dtype": "BF16",
+        "shape": [
+          32,
+          64
+        ],
+        "count": 4
+      }
+    ],
+    "model.layers.{i}.self_attn.o_proj.bias": [
+      {
+        "dtype": "BF16",
+        "shape": [
+          64
+        ],
+        "count": 4
+      }
+    ],
+    "model.layers.{i}.self_attn.o_proj.weight": [
+      {
+        "dtype": "BF16",
+        "shape": [
+          64,
+          64
+        ],
+        "count": 4
+      }
+    ],
+    "model.layers.{i}.self_attn.q_proj.bias": [
+      {
+        "dtype": "BF16",
+        "shape": [
+          64
+        ],
+        "count": 4
+      }
+    ],
+    "model.layers.{i}.self_attn.q_proj.weight": [
+      {
+        "dtype": "BF16",
+        "shape": [
+          64,
+          64
+        ],
+        "count": 4
+      }
+    ],
+    "model.layers.{i}.self_attn.sinks": [
+      {
+        "dtype": "BF16",
+        "shape": [
+          4
+        ],
+        "count": 4
+      }
+    ],
+    "model.layers.{i}.self_attn.v_proj.bias": [
+      {
+        "dtype": "BF16",
+        "shape": [
+          32
+        ],
+        "count": 4
+      }
+    ],
+    "model.layers.{i}.self_attn.v_proj.weight": [
+      {
+        "dtype": "BF16",
+        "shape": [
+          32,
+          64
+        ],
+        "count": 4
+      }
+    ],
+    "model.norm.weight": [
+      {
+        "dtype": "BF16",
+        "shape": [
+          64
+        ],
+        "count": 1
+      }
+    ]
+  },
+  "params": {
+    "layers": {
+      "value": 4,
+      "from": "config.json:num_hidden_layers",
+      "how": "declared"
+    },
+    "hidden": {
+      "value": 64,
+      "from": "config.json:hidden_size",
+      "how": "declared"
+    },
+    "vocab": {
+      "value": 96,
+      "from": "config.json:vocab_size",
+      "how": "declared"
+    },
+    "heads": {
+      "value": 4,
+      "from": "config.json:num_attention_heads",
+      "how": "declared"
+    },
+    "kv_heads": {
+      "value": 2,
+      "from": "config.json:num_key_value_heads",
+      "how": "declared"
+    },
+    "head_dim": {
+      "value": 16,
+      "from": "config.json:head_dim",
+      "how": "declared"
+    },
+    "ffn_intermediate": {
+      "value": 64,
+      "from": "config.json:intermediate_size",
+      "how": "declared"
+    },
+    "n_experts": {
+      "value": 8,
+      "from": "config.json:num_local_experts",
+      "how": "declared"
+    },
+    "window": {
+      "value": 4,
+      "from": "config.json:sliding_window",
+      "how": "declared"
+    },
+    "pos_max": {
+      "value": 4096,
+      "from": "config.json:max_position_embeddings",
+      "how": "declared"
+    },
+    "rope_theta": {
+      "value": 150000.0,
+      "from": "config.json:rope_theta",
+      "how": "declared"
+    },
+    "rope_type": {
+      "value": "yarn",
+      "from": "config.json:rope_scaling.rope_type",
+      "how": "declared"
+    },
+    "yarn_factor": {
+      "value": 4.0,
+      "from": "config.json:rope_scaling.factor",
+      "how": "declared"
+    },
+    "yarn_beta_fast": {
+      "value": 32.0,
+      "from": "config.json:rope_scaling.beta_fast",
+      "how": "declared"
+    },
+    "yarn_beta_slow": {
+      "value": 1.0,
+      "from": "config.json:rope_scaling.beta_slow",
+      "how": "declared"
+    },
+    "yarn_orig": {
+      "value": 8,
+      "from": "config.json:rope_scaling.original_max_position_embeddings",
+      "how": "declared"
+    },
+    "rms_eps": {
+      "value": 1e-05,
+      "from": "config.json:rms_norm_eps",
+      "how": "declared"
+    },
+    "swiglu_limit": {
+      "value": 3.0,
+      "from": "config.json:swiglu_limit",
+      "how": "declared"
+    },
+    "attention_bias": {
+      "value": true,
+      "from": "config.json:attention_bias",
+      "how": "declared"
+    },
+    "tie_word_embeddings": {
+      "value": false,
+      "from": "config.json:tie_word_embeddings",
+      "how": "declared"
+    },
+    "eos": {
+      "value": 2,
+      "from": "config.json:eos_token_id",
+      "how": "declared"
+    },
+    "pad": {
+      "value": 11,
+      "from": "config.json:pad_token_id",
+      "how": "declared"
+    }
+  },
+  "unknown_params": [
+    "topk",
+    "swiglu_alpha",
+    "bos"
+  ],
+  "layer_types": {
+    "value": [
+      "sliding",
+      "full",
+      "sliding",
+      "full"
+    ],
+    "from": "config.json:layer_types"
+  },
+  "unbound_tensors": [],
+  "routing": {
+    "algorithm": "unknown",
+    "topk": null,
+    "note": "the algorithm (softmax/renorm/bias order) is not declared by the model files; read it from the reference code"
+  },
+  "missing": [],
+  "engine_ready": true
+}
