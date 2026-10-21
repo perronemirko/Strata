@@ -3,12 +3,16 @@
 #include "dsv4/dequant.hpp"
 #include "dsv4/gpu.hpp"
 #include "dsv4/mem_plan.hpp"
+#include "dsv4/mtp_adapter.hpp"
 #include "dsv4/ops.hpp"
+#include "dsv4/st_header.hpp"
 
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
+
+#include <dirent.h>
 
 #include <algorithm>
 #include <chrono>
@@ -28,6 +32,32 @@
 #include "dsv4/ops.hpp"
 namespace dsv4 {
 namespace {
+
+// ------------------------------------------------------------------ small path helpers for the MTP bridge
+// A safetensors source is either one .safetensors file or a directory holding them (an HF snapshot).
+bool is_dir(const std::string& p) {
+    struct stat st;
+    return ::stat(p.c_str(), &st) == 0 && S_ISDIR(st.st_mode);
+}
+bool st_discover(const std::string& path, std::vector<std::string>& out, std::string& err) {
+    struct stat st;
+    if (::stat(path.c_str(), &st) != 0) { err = "no such path: " + path; return false; }
+    if (S_ISREG(st.st_mode)) { out.push_back(path); return true; }
+    DIR* d = ::opendir(path.c_str());
+    if (!d) { err = "cannot read directory " + path; return false; }
+    std::vector<std::string> model, other;
+    while (dirent* e = ::readdir(d)) {
+        const std::string n = e->d_name;
+        if (n.size() < 13 || n.compare(n.size() - 12, 12, ".safetensors") != 0) continue;
+        if (n.rfind("model-", 0) == 0) model.push_back(path + "/" + n);
+        else if (n.rfind("consolidated", 0) != 0) other.push_back(path + "/" + n);
+    }
+    ::closedir(d);
+    out = !model.empty() ? model : other;
+    std::sort(out.begin(), out.end());
+    if (out.empty()) { err = "no *.safetensors in " + path; return false; }
+    return true;
+}
 
 using Clock = std::chrono::steady_clock;
 double secs(Clock::time_point a, Clock::time_point b) { return std::chrono::duration<double>(b - a).count(); }
@@ -186,8 +216,15 @@ struct Model::Impl {
     // ---- MTP / speculative decoding (see spec_step) ----
     int nmtp = 0;                          // extra layers loaded: canonical indices [c.n_layer, c.n_layer+nmtp) in L
     std::vector<int> all_layers;           // every layer index that owns weights/state: main [0,nrun) + MTP extras
-    Tn mtp_enorm, mtp_hnorm, mtp_eh_proj;  // fusion tensors (empty when the model has no MTP fusion module)
-    bool mtp_fused = false;                // true: draft input = eh_proj(concat(enorm(embd), hnorm(hidden)))
+    Tn mtp_enorm, mtp_hnorm, mtp_eh_proj;  // concat fusion (DeepSeek-V3 style): eh_proj(concat(enorm(embd), hnorm(hidden)))
+    Tn mtp_e_proj, mtp_h_proj, mtp_hc_head_fn, mtp_hc_head_base, mtp_hc_head_scale;
+    // additive fusion (what the DeepSeek-V4 HF checkpoint ships): the module combines its own residual
+    // streams with hc_head_*, normalises and projects the result, and ADDS e_proj(enorm(embedding)).
+    int mtp_fusion = 0;                    // 0 = none (hidden-state input), 1 = concat, 2 = additive
+    bool mtp_fused = false;                // true for any fusion module at all (kept for existing callers)
+    // ---- the adapted MTP module of a safetensors checkpoint (see mtp_adapter.hpp) ----
+    std::vector<uint8_t> mtp_arena;        // the converted bytes: one synthetic last "shard"
+    int mtp_synthetic = -1;                // index in h.files of that synthetic shard (-1 = none)
     std::vector<float> last_hidden;        // [hc*dim] main hidden state left by the last forward()/forward_chunk()
     bool mtp_suspended = false;            // true while a verify chunk runs: forward() must not touch MTP state
     std::vector<float> verify_hs;          // [T][hc*dim] residual streams left by the last forward_chunk_all (verify)
@@ -402,7 +439,8 @@ struct Model::Impl {
 
     ~Impl() {
         for (void* p : allocs) gpu::release(p);
-        for (size_t i = 0; i < maps.size(); ++i) if (maps[i]) munmap((void*) maps[i], map_len[i]);
+        // The adapted MTP module is a host arena, not a mapping: only the real shards are unmapped.
+        for (size_t i = 0; i < maps.size(); ++i) if (maps[i] && (int) i != mtp_synthetic) munmap((void*) maps[i], map_len[i]);
     }
     // vram_used counts every byte handed out by the device layer, so the residency plan can subtract the
     // Sizes of the allocations in allocs[], index for index: the prefill arena has to give its VRAM
@@ -600,7 +638,11 @@ struct Model::Impl {
         if (!config_from_gguf(h, c, err)) return false;
         // --mtp FILE: the MTP module lives in a separate GGUF; only its tensors are merged into this model
         // (its metadata is ignored - the main shards' config stays authoritative). "auto" = look for them here.
-        if (!o.mtp_path.empty() && o.mtp_path != "auto") {
+        // A safetensors source (one .safetensors file or a directory of them) is the HF bridge;
+        // anything else is a GGUF, as before.
+        const bool mtp_is_safetensors = !o.mtp_path.empty() && o.mtp_path != "auto" &&
+            ((o.mtp_path.size() >= 12 && o.mtp_path.compare(o.mtp_path.size() - 12, 12, ".safetensors") == 0) || is_dir(o.mtp_path));
+        if (!o.mtp_path.empty() && o.mtp_path != "auto" && !mtp_is_safetensors) {
             GgufHeader mh; std::string merr;
             if (!gguf_read_header({o.mtp_path}, mh, merr)) { err = "cannot read --mtp file: " + merr; return false; }
             const GgufValue* ma = mh.find("general.architecture");
@@ -617,6 +659,54 @@ struct Model::Impl {
             }
             for (const std::string& f : mh.files) h.files.push_back(f);
         }
+        // --mtp FILE with a .safetensors suffix (or a directory of them): the draft module comes from a
+        // Hugging Face checkpoint while the main model stays this GGUF. The adapter converts the
+        // checkpoint's dtypes to ggml types and its names to the engine's, checking every step by shape;
+        // the result is appended as one synthetic extra "shard" whose bytes live in mtp_arena.
+        if (mtp_is_safetensors) {
+            std::vector<std::string> st_shards; std::string serr;
+            if (!st_discover(o.mtp_path, st_shards, serr)) { err = "cannot list the MTP safetensors of " + o.mtp_path + ": " + serr; return false; }
+            StHeader sh;
+            if (!st_read_header(st_shards, sh, serr)) { err = "cannot read the MTP safetensors: " + serr; return false; }
+            MtpAdapted ad;
+            if (!mtp_adapt_safetensors(sh, c, ad, serr)) { err = "the MTP module of " + o.mtp_path + " cannot be used by this model: " + serr; return false; }
+            if (ad.n_layers > 0) {
+                // The checkpoint's draft module REPLACES whatever the GGUF had for those layers: a
+                // GGUF converted with --no-mtp has none, one converted with MTP has its own. Keeping
+                // both would double-count the expert bytes in the inventory and leave the choice of
+                // winner to the order of a map.
+                std::set<std::string> drop;
+                for (int j = 0; j < ad.n_layers; ++j) drop.insert("blk." + std::to_string(c.n_layer + j) + ".");
+                drop.insert("mtp.");
+                h.tensors.erase(std::remove_if(h.tensors.begin(), h.tensors.end(),
+                    [&](const GgufTensor& t) {
+                        for (const std::string& p : drop) if (t.name.rfind(p, 0) == 0) return true;
+                        return false;
+                    }), h.tensors.end());
+                // the checkpoint's draft layers extend the model: the GGUF may declare none (a GGUF
+                // converted with --no-mtp) or one. Their ratios come from the checkpoint itself.
+                c.n_extra_layers = ad.n_layers;
+                c.compress_ratios.resize((size_t) (c.n_layer + ad.n_layers), 0);
+                for (int j = 0; j < ad.n_layers; ++j) c.compress_ratios[(size_t) (c.n_layer + j)] = ad.inferred_ratios[(size_t) j];
+                // one arena holds every converted tensor; the engine addresses it as a shard
+                size_t need = 0;
+                for (const auto& it : ad.items) need += it.t.nbytes;
+                mtp_arena.assign(need, 0);
+                size_t at = 0;
+                for (auto& it : ad.items) {
+                    it.t.shard = (int) h.files.size();
+                    it.t.abs_offset = at;
+                    std::memcpy(&mtp_arena[at], it.blob.data(), it.t.nbytes);
+                    at += it.t.nbytes;
+                    h.tensors.push_back(it.t);
+                }
+                mtp_synthetic = (int) h.files.size();
+                h.files.push_back(o.mtp_path + " (adapted MTP module)");
+                if (o.verbose)
+                    std::fprintf(stderr, "MTP module adapted from safetensors: %s | %d draft layer(s), %s fusion, %.2f MiB converted\n",
+                                 ad.source.c_str(), ad.n_layers, ad.fusion_mode == 2 ? "additive" : "concat", ad.bytes / 1048576.0);
+            }
+        }
         if (!inventory_from_gguf(h, c, inv, err)) return false;
         if (c.gating_func != 1 && c.gating_func != 2 && c.gating_func != 4) { err = "unsupported expert_gating_func " + std::to_string(c.gating_func); return false; }
         if (c.idx_key_len & (c.idx_key_len - 1)) { err = "indexer key length must be a power of two (Hadamard)"; return false; }
@@ -632,7 +722,12 @@ struct Model::Impl {
         if (o.verbose) std::fprintf(stderr, "warning: this build has NO OpenMP: every matvec runs on a single thread (expect ~20x slower)\n");
 #endif
         for (const GgufTensor& t : h.tensors) by_name[t.name] = &t;
-        for (const std::string& f : h.files) {
+        for (size_t fi = 0; fi < h.files.size(); ++fi) {
+            const std::string& f = h.files[fi];
+            if ((int) fi == mtp_synthetic) {   // the adapted MTP module: its bytes are already in RAM
+                maps.push_back(mtp_arena.data()); map_len.push_back(mtp_arena.size());
+                continue;
+            }
             int fd = ::open(f.c_str(), O_RDONLY);
             struct stat sb;
             if (fd < 0 || fstat(fd, &sb) != 0) { err = "cannot open " + f; return false; }
@@ -773,17 +868,41 @@ struct Model::Impl {
             L.resize((size_t)(c.n_layer + c.n_extra_layers));
             for (int j = 0; j < c.n_extra_layers; ++j) if (!init_layer(c.n_layer + j)) return false;
             nmtp = c.n_extra_layers;
-            // Fusion module (DeepSeek-V3 style), auto-detected: eh_proj(concat(enorm(embedding), hnorm(hidden))).
+            // Fusion module, auto-detected. Two layouts, chosen by which tensors exist:
+            //  concat (DeepSeek-V3 style, what the GGUF fixtures use):
+            //     eh_proj(concat(enorm(embedding), hnorm(hidden))), hnorm over [hc*dim]
+            //  additive (what the DeepSeek-V4 HF checkpoint ships): the module combines its own
+            //     residual streams with hc_head_*, normalises and projects the result, and ADDS
+            //     e_proj(enorm(embedding)). hnorm is over [dim] there - the shape says which one.
             mtp_enorm = tn("mtp.enorm.weight", false, err);
             mtp_hnorm = tn("mtp.hnorm.weight", false, err);
             mtp_eh_proj = tn("mtp.eh_proj.weight", false, err);
+            mtp_e_proj = tn("mtp.e_proj.weight", false, err);
+            mtp_h_proj = tn("mtp.h_proj.weight", false, err);
+            mtp_hc_head_fn = tn("mtp.hc_head_fn.weight", false, err);
+            mtp_hc_head_base = tn("mtp.hc_head_base.weight", false, err);
+            mtp_hc_head_scale = tn("mtp.hc_head_scale.weight", false, err);
             if (!err.empty()) return false;
-            if ((bool) mtp_enorm && (bool) mtp_hnorm && (bool) mtp_eh_proj) {
+            const bool have_concat = (bool) mtp_enorm && (bool) mtp_hnorm && (bool) mtp_eh_proj;
+            const bool have_add = (bool) mtp_enorm && (bool) mtp_hnorm && (bool) mtp_e_proj &&
+                                  (bool) mtp_h_proj && (bool) mtp_hc_head_fn && (bool) mtp_hc_head_base && (bool) mtp_hc_head_scale;
+            if (have_concat) {
                 if ((int64_t) mtp_enorm.in != dim || (int64_t) mtp_hnorm.in != hc * dim ||
                     (int64_t) mtp_eh_proj.in != (dim + hc * dim) || (int64_t) mtp_eh_proj.out != dim) {
                     err = "MTP fusion tensor shapes do not match the model dimensions"; return false;
                 }
-                mtp_fused = true;
+                mtp_fusion = 1; mtp_fused = true;
+            } else if (have_add) {
+                if ((int64_t) mtp_enorm.in != dim || (int64_t) mtp_hnorm.in != dim ||
+                    (int64_t) mtp_e_proj.in != dim || (int64_t) mtp_e_proj.out != dim ||
+                    (int64_t) mtp_h_proj.in != dim || (int64_t) mtp_h_proj.out != dim ||
+                    (int64_t) mtp_hc_head_fn.in != hc * dim || (int64_t) mtp_hc_head_fn.out != hc ||
+                    (int64_t) mtp_hc_head_base.in != hc || (int64_t) mtp_hc_head_scale.in != 1) {
+                    err = "MTP fusion tensor shapes do not match the model dimensions"; return false;
+                }
+                mtp_fusion = 2; mtp_fused = true;
+            } else if ((bool) mtp_enorm || (bool) mtp_hnorm) {
+                err = "MTP fusion tensors are present but incomplete (need enorm + hnorm + eh_proj, or enorm + hnorm + e_proj + h_proj + hc_head_*)"; return false;
             }
         }
         all_layers.clear();
@@ -898,7 +1017,7 @@ struct Model::Impl {
         // contiguous runs, so pread() issues MiB-sized reads and keeps the NVMe queue full.
         uint64_t ram_bytes = 0; int ram_n = 0;
         std::vector<int> sfd;
-        for (const std::string& f : h.files) sfd.push_back(::open(f.c_str(), O_RDONLY));
+        for (size_t fi = 0; fi < h.files.size(); ++fi) sfd.push_back((int) fi == mtp_synthetic ? -1 : ::open(h.files[fi].c_str(), O_RDONLY));
         auto rd = [&](const Tn& t, size_t off, uint8_t* dst, size_t len) {
             const int fd = sfd[(size_t) t.g->shard];
             size_t done = 0;
@@ -986,8 +1105,9 @@ struct Model::Impl {
     /// What a checkpoint must match to be loadable: model identity + every option that changes the math.
     std::string fingerprint() const {
         char b[512];
-        std::snprintf(b, sizeof b, "hash=%llu|layers=%d|dim=%d|win=%d|hd=%d|ctx=%d|qat=%d|kvf=%d|mtp=%d|%d",
-                      (unsigned long long) model_hash, nrun, dim, win, hd, o.ctx, (int) o.qat_sim, (int) o.key_format, nmtp, (int) o.value_format);
+        // mtp_fusion is part of the identity: a different draft input is a different MTP state.
+        std::snprintf(b, sizeof b, "hash=%llu|layers=%d|dim=%d|win=%d|hd=%d|ctx=%d|qat=%d|kvf=%d|mtp=%d/%d|%d",
+                      (unsigned long long) model_hash, nrun, dim, win, hd, o.ctx, (int) o.qat_sim, (int) o.key_format, nmtp, mtp_fusion, (int) o.value_format);
         return b;
     }
 
@@ -1574,7 +1694,20 @@ struct Model::Impl {
     /// module, otherwise the head-combined hidden state. `hidden` is [hc*dim] (the main model's output at that
     /// position - or the previous MTP step's output while chaining drafts).
     void mtp_fused_input(int token, const float* hidden, float* x) {
-        if (mtp_fused) {
+        if (mtp_fusion == 2) {
+            // additive fusion (the DeepSeek-V4 checkpoint's layout): the module first combines its own
+            // residual streams with its hc_head_*, normalises and projects that, and adds the projected
+            // embedding. Both halves are [dim]; the sum is the draft input.
+            std::vector<float> e((size_t) dim), en((size_t) dim), hn((size_t) dim), pe((size_t) dim), ph((size_t) dim);
+            dequant_row(embd.type, embd.h + (size_t) token * embd.rb, dim, e.data());
+            rmsnorm(e.data(), mtp_enorm.f(), c.rms_eps, dim, en.data());
+            mv(mtp_e_proj, en.data(), pe.data());
+            std::vector<float> comb((size_t) dim);
+            hc_head(hidden, hc, dim, mtp_hc_head_fn.f(), mtp_hc_head_scale.f(), mtp_hc_head_base.f(), c.rms_eps, c.hc_eps, comb.data());
+            rmsnorm(comb.data(), mtp_hnorm.f(), c.rms_eps, dim, hn.data());
+            mv(mtp_h_proj, hn.data(), ph.data());
+            for (int64_t i = 0; i < dim; ++i) x[i] = pe[(size_t) i] + ph[(size_t) i];
+        } else if (mtp_fusion == 1) {
             std::vector<float> e((size_t) dim), en((size_t) dim), hn((size_t)(hc * dim)), cat((size_t)(dim + hc * dim));
             dequant_row(embd.type, embd.h + (size_t) token * embd.rb, dim, e.data());
             rmsnorm(e.data(), mtp_enorm.f(), c.rms_eps, dim, en.data());

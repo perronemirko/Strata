@@ -49,7 +49,7 @@ fi
 # Sorgenti condivisi della libreria core (incluso model.cpp)
 # src/iq_tables.cpp e' generato: python3 tools/extract_iq_tables.py
 # SRC_NO_GPU = the same without any device backend: the CUDA build adds src/gpu_cuda.cu to it.
-CORE="src/gguf_header.cpp src/config.cpp src/mem_plan.cpp src/ops.cpp src/dequant.cpp src/iq_tables.cpp src/sampler.cpp src/serve_loop.cpp src/model.cpp"
+CORE="src/gguf_header.cpp src/config.cpp src/mem_plan.cpp src/mtp_adapter.cpp src/ops.cpp src/dequant.cpp src/iq_tables.cpp src/serve_loop.cpp src/st_header.cpp src/model.cpp src/sampler.cpp"
 SRC="$CORE src/gpu.cpp"
 SRC_NO_GPU="$CORE"
 
@@ -69,6 +69,8 @@ if [ "$CUDA_ONLY" = 0 ]; then
     "$CXX" $FL $SRC tests/test_kv_checkpoint.cpp -o "$OUT/test_kv_checkpoint"
     # MTP / speculative decoding golden test (needs the tiny GGUF, run below with the model).
     "$CXX" $FL $SRC tests/test_mtp.cpp -o "$OUT/test_mtp"
+    # The MTP bridge: a Hugging Face safetensors draft module on top of the GGUF model.
+    "$CXX" $FL $SRC tests/test_mtp_safetensors.cpp -o "$OUT/test_mtp_safetensors"
 
     echo "==> Compiling dsv4_plan..."
     "$CXX" $FL $SRC src/dsv4_plan_main.cpp -o "$OUT/dsv4_plan"
@@ -106,6 +108,14 @@ if [ "$CUDA_ONLY" = 0 ] && [ "$HAVE_TINY" = 1 ]; then
 
     echo "==> Running MTP / speculative decoding tests (draft parity, greedy parity, determinism, checkpoint)..."
     "$OUT/test_mtp" --model "$TINY/tiny.gguf" --refdir "$TINY"
+
+    ST="$OUT/tiny_mtp"
+    if python3 tools/tiny_mtp_checkpoint.py "$ST" >/dev/null 2>&1; then
+        echo "==> Running the MTP bridge tests (safetensors draft module on the GGUF model)..."
+        "$OUT/test_mtp_safetensors" --model "$TINY/tiny.gguf" --refdir "$TINY" --ckpt "$ST/model-00001-of-00001.safetensors"
+    else
+        echo "WARNING: the tiny MTP checkpoint could not be generated: bridge test skipped."
+    fi
 fi
 
 if [ "$WITH_CUDA" = 1 ]; then
