@@ -31,6 +31,8 @@ void Sampler::init_rng() {
     for (int i = 0; i < 8; ++i) xs_next(st_);  // warm up: a seed of 1 must not start near 0
 }
 
+float Sampler::next_uniform() { return uniform(); }
+
 float Sampler::uniform() {
     // 53 bits of mantissa, like every real RNG: (a >> 11) * 2^-53 in [0,1).
     return (float) ((double) (xs_next(st_) >> 11) * (1.0 / 9007199254740992.0));

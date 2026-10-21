@@ -1,9 +1,21 @@
 #!/usr/bin/env python3
 """Builds a tiny DeepSeek-V4-shaped GGUF (same tensor names as the real UD-IQ1_M file) with random weights and runs a
 float64 numpy forward (decode path of the official model.py) to produce reference logits.
-  python3 tests/tiny_model.py OUTDIR      ->  OUTDIR/tiny.gguf, OUTDIR/ref_logits.bin, OUTDIR/tokens.txt
-QAT activation simulation is OFF in the reference: run dsv4_run with --no-qat-sim to compare."""
+  python3 tools/tiny_model.py OUTDIR      ->  OUTDIR/tiny.gguf, OUTDIR/ref_logits.bin, OUTDIR/tokens.txt + MTP references
+QAT activation simulation is OFF in the reference: run dsv4_run with --no-qat-sim to compare.
+
+MTP (speculative decoding) support: layer NL (= len(RATIOS)-1) is an EXTRA layer - the MTP module. It has the same
+schema as a normal layer (attention + MoE + its own KV ring/compressor, ratio 8 here so the compressor path is
+exercised without an indexer) plus the DeepSeek-V3-style fusion tensors mtp.enorm/hnorm/eh_proj that combine the
+token embedding with the main model's final hidden state. The reference writes:
+  ref_mtp_hidden.bin      [HC*DIM] f32   main-model hidden state after the last prompt token (feeds draft step 0)
+  ref_mtp_draft_logits    [NDRAFT][VOCAB] f32, one per chained draft step (greedy argmax = the draft token)
+  ref_mtp_hidden_out      [NDRAFT][HC*DIM] f32, MTP hidden state after each step (feeds the next chained step)
+  ref_mtp_draft_toks.txt  NDRAFT comma-separated greedy draft tokens
+  ref_verify_logits       [NDRAFT][VOCAB] f32, main-model logits at every verify position (chunk forward over the drafts)
+"""
 import math, os, struct, sys
+import copy
 import numpy as np
 
 rng = np.random.default_rng(7)
@@ -13,7 +25,8 @@ HC, ITERS, EPS, HEPS = 4, 5, 1e-6, 1e-6
 E, K, FF, NHASH = 8, 2, 32, 1
 IH, ID, ITOPK = 4, 32, 2
 NL, VOCAB, CTX = 4, 40, 64
-RATIOS = [0, 4, 8, 4, 0]
+RATIOS = [0, 4, 8, 4, 8]   # last entry (index NL) is the EXTRA MTP layer: ratio 8 -> compressor, no indexer
+NDRAFT = 4                 # chained draft steps in the reference
 YORIG, YFACT, BFAST, BSLOW, BASE_C, BASE_P = 32, 4.0, 32.0, 1.0, 1000.0, 100.0
 ESCALE, CLAMP_E, CLAMP_S = 1.5, 3.0, 4.0
 GIN = NH * HD // G
@@ -77,12 +90,12 @@ for k, v in [("expert_weights_scale", ESCALE), ("hyper_connection.epsilon", HEPS
     gw.f32("deepseek4." + k, v)
 gw.b("deepseek4.expert_weights_norm", True)
 gw.ai32("deepseek4.attention.compress_ratios", RATIOS)
-gw.af32("deepseek4.swiglu_clamp_exp", [CLAMP_E] * NL); gw.af32("deepseek4.swiglu_clamp_shexp", [CLAMP_S] * NL)
+gw.af32("deepseek4.swiglu_clamp_exp", [CLAMP_E] * len(RATIOS)); gw.af32("deepseek4.swiglu_clamp_shexp", [CLAMP_S] * len(RATIOS))
 gw.astr("tokenizer.ggml.tokens", ["t%d" % i for i in range(VOCAB)]); gw.u32("tokenizer.ggml.bos_token_id", 0); gw.u32("tokenizer.ggml.eos_token_id", VOCAB - 1)
 
 add("token_embd.weight", rng.normal(0, 1, (VOCAB, DIM))); add("output.weight", mat(VOCAB, DIM)); add("output_norm.weight", nrm(DIM))
 add("output_hc_fn.weight", rng.normal(0, 0.05, (HC, HC * DIM))); add("output_hc_base.weight", rng.normal(0, 0.5, HC)); add("output_hc_scale.weight", [0.8])
-for l in range(NL):
+for l in range(len(RATIOS)):   # NL main layers + the extra MTP layer (same schema; ratio from RATIOS)
     p = "blk.%d." % l; r = RATIOS[l]; coff = 1 + (r == 4)
     add(p + "attn_norm.weight", nrm(DIM)); add(p + "attn_q_a.weight", mat(QL, DIM)); add(p + "attn_q_a_norm.weight", nrm(QL))
     add(p + "attn_q_b.weight", mat(NH * HD, QL), "q8"); add(p + "attn_kv.weight", mat(HD, DIM), "q8"); add(p + "attn_kv_a_norm.weight", nrm(HD))
@@ -102,6 +115,9 @@ for l in range(NL):
             add(p + "indexer.attn_q_b.weight", mat(IH * ID, QL)); add(p + "indexer.proj.weight", mat(IH, DIM))
             add(p + "indexer_compressor_kv.weight", mat(2 * ID, DIM)); add(p + "indexer_compressor_gate.weight", mat(2 * ID, DIM))
             add(p + "indexer_compressor_ape.weight", rng.normal(0, 0.5, (4, 2 * ID))); add(p + "indexer_compressor_norm.weight", nrm(ID))
+
+# MTP fusion tensors (DeepSeek-V3 style): the draft input is eh_proj(concat(enorm(embedding), hnorm(hidden)))
+add("mtp.enorm.weight", nrm(DIM)); add("mtp.hnorm.weight", nrm(HC * DIM)); add("mtp.eh_proj.weight", mat(DIM, DIM + HC * DIM))
 
 # ---------------- numpy reference (float64) ----------------
 def rmsn(x, w=None, eps=EPS): y = x / np.sqrt((x * x).mean(-1, keepdims=True) + eps); return y * w if w is not None else y
@@ -148,7 +164,7 @@ class Comp:
         s.cache.append(out)
 
 state = []
-for l in range(NL):
+for l in range(len(RATIOS)):   # main layers AND the extra MTP layer (its own ring + compressor state)
     p = "blk.%d." % l; r = RATIOS[l]; st = {"ring": np.zeros((WIN, HD))}
     if r:
         st["ac"] = Comp(r, HD, False, W[p + "attn_compressor_kv.weight"], W[p + "attn_compressor_gate.weight"], W[p + "attn_compressor_ape.weight"], W[p + "attn_compressor_norm.weight"])
@@ -191,7 +207,12 @@ def moe(l, x, tok):
     g = W[p + "ffn_gate_shexp.weight"] @ x; u = W[p + "ffn_up_shexp.weight"] @ x
     return y + W[p + "ffn_down_shexp.weight"] @ sw(g, u, CLAMP_S)
 
-def forward(tok, pos):
+def head(h):  # shared output head: hc_head -> rmsnorm(output_norm) -> output projection
+    x = h.reshape(-1); mixes = W["output_hc_fn.weight"] @ x / np.sqrt((x * x).mean() + EPS)
+    pre = sig(mixes * W["output_hc_scale.weight"][0] + W["output_hc_base.weight"]) + HEPS
+    return W["output.weight"] @ rmsn((pre[:, None] * h).sum(0), W["output_norm.weight"])
+
+def main_forward(tok, pos):  # the NL main layers; returns (logits [VOCAB], hidden [HC*DIM])
     h = np.tile(W["token_embd.weight"][tok], (HC, 1))
     for l in range(NL):
         p = "blk.%d." % l
@@ -199,13 +220,59 @@ def forward(tok, pos):
         a = attention(l, rmsn(y, W[p + "attn_norm.weight"]), pos); h = post[:, None] * a[None, :] + (comb[:, :, None] * h[:, None, :]).sum(0)
         y, post, comb = hc_pre(h, W[p + "hc_ffn_fn.weight"], W[p + "hc_ffn_scale.weight"], W[p + "hc_ffn_base.weight"])
         a = moe(l, rmsn(y, W[p + "ffn_norm.weight"]), tok); h = post[:, None] * a[None, :] + (comb[:, :, None] * h[:, None, :]).sum(0)
-    x = h.reshape(-1); mixes = W["output_hc_fn.weight"] @ x / np.sqrt((x * x).mean() + EPS)
-    pre = sig(mixes * W["output_hc_scale.weight"][0] + W["output_hc_base.weight"]) + HEPS
-    return W["output.weight"] @ rmsn((pre[:, None] * h).sum(0), W["output_norm.weight"])
+    return head(h), h
+
+def mtp_step(tok, hidden_in, pos):  # one chained draft step at absolute position `pos` on the extra layer
+    x = np.concatenate([rmsn(W["token_embd.weight"][tok], W["mtp.enorm.weight"]), rmsn(hidden_in.reshape(-1), W["mtp.hnorm.weight"])])
+    h = np.tile(W["mtp.eh_proj.weight"] @ x, (HC, 1))
+    l = NL; p = "blk.%d." % l
+    y, post, comb = hc_pre(h, W[p + "hc_attn_fn.weight"], W[p + "hc_attn_scale.weight"], W[p + "hc_attn_base.weight"])
+    a = attention(l, rmsn(y, W[p + "attn_norm.weight"]), pos); h = post[:, None] * a[None, :] + (comb[:, :, None] * h[:, None, :]).sum(0)
+    y, post, comb = hc_pre(h, W[p + "hc_ffn_fn.weight"], W[p + "hc_ffn_scale.weight"], W[p + "hc_ffn_base.weight"])
+    a = moe(l, rmsn(y, W[p + "ffn_norm.weight"]), tok); h = post[:, None] * a[None, :] + (comb[:, :, None] * h[:, None, :]).sum(0)
+    return head(h), h
 
 out = sys.argv[1] if len(sys.argv) > 1 else "/tmp/tiny"; os.makedirs(out, exist_ok=True)
 gw.write(os.path.join(out, "tiny.gguf"))
 toks = [int(t) for t in rng.integers(1, VOCAB - 1, 26)]
-logits = np.array([forward(t, i) for i, t in enumerate(toks)], dtype=np.float32)
-logits.tofile(os.path.join(out, "ref_logits.bin")); open(os.path.join(out, "tokens.txt"), "w").write(",".join(map(str, toks)))
-print("tiny model written to %s: %d tokens, logits %s, compress events: ratio4 every 4, ratio8 every 8, window wrap at 4" % (out, len(toks), logits.shape))
+
+# ---- main-model reference over the prompt (unchanged layout: one logit vector per position).
+# When speculative decoding is on, the MTP layer runs at EVERY position with input (embedding, hidden) -
+# exactly like a normal layer - so its KV ring/compressor stay aligned with the main history. ----
+logits = []; h_last = None
+for i, t in enumerate(toks):
+    lg, h = main_forward(t, i); logits.append(lg); h_last = h
+    mtp_step(t, h, i)   # MTP prefill alignment: output discarded, KV state advanced
+np.array(logits, dtype=np.float32).tofile(os.path.join(out, "ref_logits.bin"))
+open(os.path.join(out, "tokens.txt"), "w").write(",".join(map(str, toks)))
+
+# ---- MTP reference: chained draft steps (greedy), then the main-model verify over the drafts ----
+state_before = copy.deepcopy(state)   # prompt-end KV state: rolled back for the correction reference below
+h_in = h_last; tok_in = toks[-1]; pos0 = len(toks)
+draft_logits = []; mtp_houts = []; drafts = []
+for j in range(NDRAFT):
+    lg, h_out = mtp_step(tok_in, h_in, pos0 + j)
+    d = int(np.argmax(lg))
+    draft_logits.append(lg); mtp_houts.append(h_out); drafts.append(d)
+    tok_in, h_in = d, h_out
+verify = []
+for j in range(NDRAFT):   # main model over the draft chain: logits at EVERY verify position
+    lg, _ = main_forward(drafts[j], pos0 + j)
+    verify.append(lg)
+
+# ---- greedy correction reference: when NOTHING is accepted, spec_step emits argmax(cur) itself and its logits.
+# C++ rolls the KV state (main AND MTP rings/compressors) back to the prompt end before that forward - numpy must do
+# the same, or this reference would be computed on a cache already advanced by the verify above. ----
+state[:] = copy.deepcopy(state_before)
+corr = int(np.argmax(logits[-1]))
+lg_c, _ = main_forward(corr, len(toks))
+open(os.path.join(out, "ref_corr_tok.txt"), "w").write(str(corr))
+
+h_last.astype(np.float32).tofile(os.path.join(out, "ref_mtp_hidden.bin"))
+np.array(draft_logits, dtype=np.float32).tofile(os.path.join(out, "ref_mtp_draft_logits.bin"))
+np.array(mtp_houts, dtype=np.float32).tofile(os.path.join(out, "ref_mtp_hidden_out.bin"))
+open(os.path.join(out, "ref_mtp_draft_toks.txt"), "w").write(",".join(map(str, drafts)))
+np.array(verify, dtype=np.float32).tofile(os.path.join(out, "ref_verify_logits.bin"))
+lg_c.astype(np.float32).tofile(os.path.join(out, "ref_correction_logits.bin"))
+print("tiny model written to %s: %d tokens, logits %s, compress events: ratio4 every 4, ratio8 every 8, window wrap at 4" % (out, len(toks), np.array(logits).shape))
+print("MTP: extra layer blk.%d (ratio %d) + mtp.enorm/hnorm/eh_proj | %d draft steps -> drafts %s" % (NL, RATIOS[NL], NDRAFT, ",".join(map(str, drafts))))

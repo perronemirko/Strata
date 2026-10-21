@@ -1,4 +1,5 @@
 #include "dsv4/config.hpp"
+#include <algorithm>
 
 #include <cstdio>
 #include <cstdlib>
@@ -84,11 +85,11 @@ bool config_from_gguf(const GgufHeader& h, Dsv4Config& c, std::string& err) {
     if (c.n_layer <= 0 || c.n_embd <= 0 || c.n_expert <= 0 || c.ff_exp <= 0) { err = "non-positive core dimension"; return false; }
     if (c.n_expert_used <= 0 || c.n_expert_used > c.n_expert) { err = "expert_used_count out of range"; return false; }
     if ((int) c.compress_ratios.size() < c.n_layer) { err = "compress_ratios shorter than block_count"; return false; }
-    if ((int) c.swiglu_clamp_exp.size() != c.n_layer || (int) c.swiglu_clamp_shexp.size() != c.n_layer) {
-        err = "swiglu_clamp arrays must have block_count entries"; return false;
+    c.n_extra_layers = (int) c.compress_ratios.size() - c.n_layer;   // extra (MTP) layers declared beyond block_count
+    if ((int) c.swiglu_clamp_exp.size() < c.n_layer || (int) c.swiglu_clamp_shexp.size() < c.n_layer) {
+        err = "swiglu_clamp arrays shorter than block_count"; return false;
     }
     if (c.n_hash_layers < 0 || c.n_hash_layers > c.n_layer) { err = "hash_layer_count out of range"; return false; }
-    c.n_extra_layers = (int) c.compress_ratios.size() - c.n_layer;
 
     if (const GgufValue* t = h.find("tokenizer.ggml.tokens")) c.vocab = (int64_t) t->arr_len;
     if (const GgufValue* v = h.find("tokenizer.ggml.bos_token_id")) c.bos = (int) v->i;
