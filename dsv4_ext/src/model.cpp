@@ -122,6 +122,12 @@ struct Comp {  // KV compressor state (model.py Compressor), decode-only
     bool overlap = false, rotate = false;
     Tn wkv, wg, ape, norm;
     std::vector<float> kvs, scs;   // [coff*ratio][coff*d]
+    // What one comp_step did, recorded during speculative drafting so a partial acceptance can
+    // replay exactly the accepted positions (a rejected write may have overwritten an accepted
+    // row of the same residue, so the snapshot alone cannot restore it).
+    struct Rec { int pos, row; bool shifted; std::vector<float> kv, sc; };
+    std::vector<Rec> rec;   // filled ONLY while spec_step is drafting (see set_recording)
+    bool rec_on = false;
     float* cache = nullptr;        // [ctx/ratio + 1][d]
     std::vector<float> own;        // storage when cache is not shared with the attention kv buffer
 };
@@ -229,7 +235,10 @@ struct Model::Impl {
     bool mtp_suspended = false;            // true while a verify chunk runs: forward() must not touch MTP state
     std::vector<float> verify_hs;          // [T][hc*dim] residual streams left by the last forward_chunk_all (verify)
     struct CompSnap { Comp* cp; std::vector<float> kvs, scs; };   // rolling-buffer snapshot for speculative rollback
-    struct RingSnap { Layer* ly; std::vector<int> slots; std::vector<float> rows; };
+    // `last_pos[i]` is the LAST draft position that writes slot `slots[i]`. A slot whose last draft
+    // write came from an ACCEPTED position already holds the right row (the accepted token is the
+    // verified token) and must be kept; only slots last written by a REJECTED position are stale.
+    struct RingSnap { Layer* ly; std::vector<int> slots; std::vector<int> last_pos; std::vector<float> rows; };
     std::vector<RingSnap> ring_snaps;      // window-ring rows touched by the draft span: restored on partial acceptance
     std::vector<CompSnap> ck_snaps;        // filled by spec_step before drafting, consumed by rollback_kv()
     Tn embd, outw, outnorm, out_hc_fn, out_hc_base, out_hc_scale;
@@ -1149,9 +1158,14 @@ struct Model::Impl {
         const float* ape = cp.ape.f() + (size_t) (pos % ratio) * W;
         for (int i = 0; i < W; ++i) sc[(size_t) i] += ape[i];
         const int row = (cp.overlap ? ratio : 0) + pos % ratio;
+        // While a speculative round is running, remember what this step did: a partial acceptance
+        // replays ONLY the accepted positions (a rejected write can land on the same residue row as
+        // an accepted one, so the pre-draft snapshot alone cannot restore it).
+        if (cp.rec_on) { cp.rec.push_back(Comp::Rec{pos, row, false, kv, sc}); }
         std::memcpy(&cp.kvs[(size_t) row * W], kv.data(), (size_t) W * 4);
         std::memcpy(&cp.scs[(size_t) row * W], sc.data(), (size_t) W * 4);
         if ((pos + 1) % ratio) return false;
+        if (cp.rec_on && !cp.rec.empty()) cp.rec.back().shifted = true;
         std::vector<float> out((size_t) d);
         const int T = cp.overlap ? 2 * ratio : ratio;
         for (int ch = 0; ch < d; ++ch) {
@@ -1757,26 +1771,39 @@ struct Model::Impl {
         ring_snaps.clear();
         for (int l : all_layers) {
             Layer& y = L[(size_t) l];
-            RingSnap rs{&y, {}, {}};
-            std::vector<char> seen((size_t) win, 0);
+            RingSnap rs{&y, {}, {}, {}};
+            std::vector<int> at((size_t) win, -1);   // slot -> index in rs.slots
             for (int p = pos; p < pos + N; ++p) {
                 const int s = ((size_t) p % win);
-                if (seen[(size_t) s]) continue;
-                seen[(size_t) s] = 1;
-                rs.slots.push_back(s);
-                rs.rows.insert(rs.rows.end(), &y.kvbuf[(size_t) s * hd], &y.kvbuf[(size_t) (s + 1) * hd]);
+                if (at[(size_t) s] < 0) {
+                    at[(size_t) s] = (int) rs.slots.size();
+                    rs.slots.push_back(s);
+                    // the row as it was BEFORE the draft span: what a rejected slot goes back to
+                    rs.rows.insert(rs.rows.end(), &y.kvbuf[(size_t) s * hd], &y.kvbuf[(size_t) (s + 1) * hd]);
+                    rs.last_pos.push_back(-1);
+                }
+                // the LAST draft position that writes this slot decides whether its row is stale:
+                // a slot whose last write came from an ACCEPTED position already holds the right row.
+                rs.last_pos[at[(size_t) s]] = p;
             }
             ring_snaps.push_back(std::move(rs));
         }
     }
 
     /// Snapshot every compressor's rolling buffers (main AND MTP layers): on partial acceptance they are restored.
+    // The snapshot is the state BEFORE the round; each comp_step also records what it did (see
+    // comp_step), so a partial acceptance can replay exactly the accepted positions. Recording is
+    // on only for the duration of one speculative round.
     void snap_comps() {
         ck_snaps.clear();
         for (int l : all_layers) {
             Layer& y = L[(size_t) l];
             if (!y.ratio) continue;
-            for (Comp* cp : {&y.ac, &y.ic}) if (cp->ratio) { CompSnap s{cp, {}, {}}; s.kvs = cp->kvs; s.scs = cp->scs; ck_snaps.push_back(std::move(s)); }
+            for (Comp* cp : {&y.ac, &y.ic}) if (cp->ratio) {
+                cp->rec_on = true;
+                cp->rec.clear();
+                CompSnap s{cp, {}, {}}; s.kvs = cp->kvs; s.scs = cp->scs; ck_snaps.push_back(std::move(s));
+            }
         }
     }
 
@@ -1786,11 +1813,36 @@ struct Model::Impl {
     /// recomputed exactly at the position where it first becomes readable (comp_step runs before index generation).
     void rollback_kv(int n) {
         cached.resize((size_t) n);
+        // A slot goes back to its pre-draft row ONLY when its last draft write came from a REJECTED
+        // position (>= n). A slot last written by an accepted position already holds the verified
+        // token's row - the accepted draft IS the token the main model confirmed there - and must
+        // be kept, or the live window loses a row it still has to read.
         for (const RingSnap& rs : ring_snaps)
             for (size_t i = 0; i < rs.slots.size(); ++i)
-                std::memcpy(&rs.ly->kvbuf[(size_t) rs.slots[i] * hd], &rs.rows[i * hd], (size_t) hd * 4);
+                if (rs.last_pos[i] >= n)
+                    std::memcpy(&rs.ly->kvbuf[(size_t) rs.slots[i] * hd], &rs.rows[i * hd], (size_t) hd * 4);
         ring_snaps.clear();
-        for (const CompSnap& s : ck_snaps) { s.cp->kvs = s.kvs; s.cp->scs = s.scs; }
+        // The compressor's rolling buffer is not a per-slot overwrite: one step writes one row AND
+        // may shift the whole window, so a rejected position can have clobbered a row an accepted
+        // position wrote (same residue when the draft span reaches the ratio). The snapshot alone
+        // cannot put the accepted rows back. So: go back to the snapshot, then replay exactly the
+        // steps of the ACCEPTED positions, in order - which is bit-for-bit what plain decoding has.
+        for (const CompSnap& s : ck_snaps) {
+            Comp* cp = s.cp;
+            cp->kvs = s.kvs; cp->scs = s.scs;
+            const int W = cp->coff * cp->d;
+            for (const Comp::Rec& r : cp->rec) {
+                if (r.pos >= n) continue;
+                std::memcpy(&cp->kvs[(size_t) r.row * W], r.kv.data(), (size_t) W * 4);
+                std::memcpy(&cp->scs[(size_t) r.row * W], r.sc.data(), (size_t) W * 4);
+                if (r.shifted && cp->overlap) {
+                    const int ratio = cp->ratio;
+                    std::memmove(&cp->kvs[0], &cp->kvs[(size_t) ratio * W], (size_t) ratio * W * 4);
+                    std::memmove(&cp->scs[0], &cp->scs[(size_t) ratio * W], (size_t) ratio * W * 4);
+                }
+            }
+            cp->rec_on = false; cp->rec.clear();
+        }
         ck_snaps.clear();
         for (Layer& y : L) {
             std::fill(y.ring_pos.begin(), y.ring_pos.end(), -1);

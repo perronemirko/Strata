@@ -71,6 +71,16 @@ if [ "$CUDA_ONLY" = 0 ]; then
     "$CXX" $FL $SRC tests/test_mtp.cpp -o "$OUT/test_mtp"
     # The MTP bridge: a Hugging Face safetensors draft module on top of the GGUF model.
     "$CXX" $FL $SRC tests/test_mtp_safetensors.cpp -o "$OUT/test_mtp_safetensors"
+    # dsv4_mtp_ckpt: the bridge's diagnostic. Reads ONLY the headers of a real GGUF + a real
+    # safetensors and prints which engine tensors the adapter produced (or the refusal). It links
+    # the header readers + the adapter only - no device backend, no model.cpp - so it never touches
+    # the GPU and is safe to run while the serve engine holds the whole VRAM.
+    MTPDIAG="src/gguf_header.cpp src/config.cpp src/mtp_adapter.cpp src/st_header.cpp src/dequant.cpp src/iq_tables.cpp"
+    "$CXX" $FL $MTPDIAG tests/test_mtp_ckpt_shapes.cpp -o "$OUT/dsv4_mtp_ckpt"
+    # The same bridge, MLX spelling: decoder.* names, int8-in-U32 dense weights and fused e2m1
+    # experts. Every element is checked against the checkpoint's own codes, and the draft it
+    # proposes must give the same answer as plain decoding.
+    "$CXX" $FL $SRC tests/test_mtp_mlx.cpp -o "$OUT/test_mtp_mlx"
 
     echo "==> Compiling dsv4_plan..."
     "$CXX" $FL $SRC src/dsv4_plan_main.cpp -o "$OUT/dsv4_plan"
@@ -115,6 +125,14 @@ if [ "$CUDA_ONLY" = 0 ] && [ "$HAVE_TINY" = 1 ]; then
         "$OUT/test_mtp_safetensors" --model "$TINY/tiny.gguf" --refdir "$TINY" --ckpt "$ST/model-00001-of-00001.safetensors"
     else
         echo "WARNING: the tiny MTP checkpoint could not be generated: bridge test skipped."
+    fi
+    # The MLX spelling of the same module (decoder.*, int8-in-U32, fused e2m1 experts).
+    MLX="$OUT/tiny_mlx"
+    if python3 tools/tiny_mlx_checkpoint.py "$MLX" >/dev/null 2>&1; then
+        echo "==> Running the MTP bridge tests, MLX layout (the checkpoint DeepSeek-V4 ships as mlx)..."
+        "$OUT/test_mtp_mlx" --model "$TINY/tiny.gguf" --refdir "$TINY" --ckpt "$MLX/model-00001-of-00001.safetensors"
+    else
+        echo "WARNING: the tiny MLX checkpoint could not be generated: MLX bridge test skipped."
     fi
 fi
 

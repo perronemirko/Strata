@@ -104,10 +104,52 @@ bool conv_1d(const Src& w, int64_t n, const std::string& name, Eng& e, std::stri
     return true;
 }
 
+// An MLX dense weight: int8 codes four per U32 element, one e8m0 scale byte per 32 columns.
+// The header's shape counts U32 elements, so the logical [rows][cols] is folded from it: a
+// [8,1024,1024] U32 tensor is 8192 rows of 4096 int8 codes. The value is code * 2^(scale-127),
+// exact in float32 (an e8m0 scale is a power of two, an int8 code is an integer).
+static bool conv_2d_int8_f32(const Src& w, const Src* sc, int64_t rows, int64_t cols, const std::string& name, Eng& e, std::string& err) {
+    // The header counts U32 elements; the logical matrix is four int8 codes per element, and any
+    // leading dimensions (an MLX wo_a is [8][1024][1024]) fold into the row count.
+    int64_t lr = -1;
+    if (w.shape.size() >= 2) { lr = 1; for (size_t i = 0; i + 1 < w.shape.size(); ++i) lr *= (int64_t) w.shape[i]; }
+    const int64_t lc = w.shape.empty() ? 0 : (int64_t) w.shape.back() * 4;
+    if (w.dtype != "U32" || lr != rows || lc != cols) {
+        err = name + ": the checkpoint's tensor for it is " + w.dtype + " [" + std::to_string(lr) + "," +
+              std::to_string(lc) + " int8 codes], expected [" + std::to_string(rows) + "," + std::to_string(cols) + "]";
+        return false;
+    }
+    // The scale grid folds the same way: its last axis counts 32-column blocks.
+    int64_t sr = -1, scols = -1;
+    if (sc && sc->shape.size() >= 2) {
+        sr = 1; for (size_t i = 0; i + 1 < sc->shape.size(); ++i) sr *= (int64_t) sc->shape[i];
+        scols = (int64_t) sc->shape.back();
+    }
+    if (!sc || sc->dtype != "U8" || sr != rows || scols * 32 != cols) {
+        err = name + ": scale grid [" + std::to_string(sr) + "," + std::to_string(scols * (scols > 0 ? 32 : 0)) +
+              "] is not a 32-element tiling of [" + std::to_string(rows) + "," + std::to_string(cols) + "]";
+        return false;
+    }
+    if (w.bytes.size() != (size_t) rows * cols || sc->bytes.size() != (size_t) rows * (cols / 32)) {
+        err = name + ": byte count does not match its shape"; return false;
+    }
+    e.name = name; e.dims = {(uint64_t) cols, (uint64_t) rows}; e.type = T_F32;
+    e.blob.resize((size_t) rows * cols * 4);
+    const int64_t sb = scols;
+    for (int64_t r = 0; r < rows; ++r) for (int64_t c = 0; c < cols; ++c) {
+        const int s = sc->bytes[(size_t) (r * sb + c / 32)];
+        const float v = (float) (int) (int8_t) w.bytes[(size_t) (r * cols + c)] * (float) std::ldexp(1.0, s - 127);
+        std::memcpy(&e.blob[(size_t) (4 * (r * cols + c))], &v, 4);
+    }
+    return true;
+}
+
 // A dense 2-D weight, row-major [rows][cols] in the checkpoint, as F32 for the engine.
 // Plain F32/BF16/F16 convert element by element; F8_E4M3 + F8_E8M0 (a 128-element block grid)
-// converts exactly, because an e8m0 scale is a power of two.
+// converts exactly, because an e8m0 scale is a power of two. An MLX checkpoint reaches this
+// through conv_2d_int8_f32 (int8 codes in U32 elements, 32-column scales).
 bool conv_2d_f32(const Src& w, const Src* sc, int64_t rows, int64_t cols, const std::string& name, Eng& e, std::string& err) {
+    if (w.dtype == "U32") return conv_2d_int8_f32(w, sc, rows, cols, name, e, err);
     if (w.shape.size() != 2 || w.r0() != rows || w.r1() != cols) {
         err = name + ": the checkpoint's tensor for it is " + w.dtype + " [" + std::to_string(w.r0()) + "," +
               std::to_string(w.r1()) + "], expected [" + std::to_string(rows) + "," + std::to_string(cols) + "]";
@@ -189,6 +231,50 @@ bool conv_experts(const std::vector<Src>& w, const std::vector<Src>& sc, int64_t
     return true;
 }
 
+// The routed experts of an MLX checkpoint: ONE fused tensor per matrix, [E, rows, cols/8] of U32
+// (eight 4-bit codes per element, element 2k in the low nibble of byte k) plus one e8m0 scale
+// byte per 32 columns. The codes are e2m1 (bit 3 = sign, magnitudes 0,.5,1,1.5,2,3,4,6), which
+// is exactly ggml's MXFP4: its table stores the values doubled and its scale helper halves them,
+// so value = e2m1(code) * 2^(s-127) = 0.5*2^(s-127) * (2*e2m1(code)) holds bit for bit.
+bool conv_experts_fused(const Src& w, const Src& sc, int64_t E, int64_t rows, int64_t cols,
+                        const std::string& name, Eng& e, std::string& err) {
+    const int64_t lr = w.shape.size() >= 2 ? (int64_t) w.shape[1] : -1;
+    const int64_t lc = w.shape.size() >= 3 ? (int64_t) w.shape[2] * 8 : -1;
+    if (w.dtype != "U32" || w.shape.size() != 3 || (int64_t) w.shape[0] != E || lr != rows || lc != cols) {
+        err = name + ": the checkpoint's expert tensor is " + w.dtype + " [" +
+              std::to_string(w.shape.size() >= 1 ? (int64_t) w.shape[0] : -1) + "," +
+              std::to_string(lr) + "," + std::to_string(lc) + " codes], expected [" +
+              std::to_string(E) + "," + std::to_string(rows) + "," + std::to_string(cols) + "]";
+        return false;
+    }
+    if (sc.dtype != "U8" || sc.shape.size() != 3 || (int64_t) sc.shape[0] != E || (int64_t) sc.shape[1] != rows ||
+        (int64_t) sc.shape[2] * 32 != cols) {
+        err = name + ": scale grid " + (sc.shape.size() >= 1 ? std::to_string(sc.r0()) : std::string("?")) +
+              " x " + (sc.shape.size() >= 3 ? std::to_string(sc.r1() * 32) : std::string("?")) +
+              " is not a 32-column tiling of the experts";
+        return false;
+    }
+    if (cols % 32) { err = name + ": " + std::to_string(cols) + " columns is not a whole number of 32-element blocks"; return false; }
+    const int64_t nblk = cols / 32;
+    if (w.bytes.size() != (size_t) E * rows * (cols / 2) || sc.bytes.size() != (size_t) E * rows * nblk) {
+        err = name + ": expert byte count does not match its shape"; return false;
+    }
+    e.name = name; e.dims = {(uint64_t) cols, (uint64_t) rows, (uint64_t) E}; e.type = T_MXFP4;
+    e.blob.assign((size_t) E * rows * (nblk * 17), 0);
+    for (int64_t i = 0; i < E * rows * nblk; ++i) {
+        const uint8_t* src = w.bytes.data() + (size_t) i * 16;
+        uint8_t* q = &e.blob[(size_t) i * 17];
+        q[0] = sc.bytes[(size_t) i];
+        // The source packs element 2k in the low nibble and 2k+1 in the high one of byte k;
+        // ggml's MXFP4 puts element j in the low nibble of qs[j] and element j+16 in its high one.
+        for (int j = 0; j < 16; ++j) {
+            const uint8_t a = src[j >> 1], b = src[8 + (j >> 1)];
+            q[1 + j] = (uint8_t) ((j & 1) ? ((a >> 4) | (b & 0xF0)) : ((a & 0x0F) | ((b & 0x0F) << 4)));
+        }
+    }
+    return true;
+}
+
 // ------------------------------------------------------------------ the slot table
 // The name table. The logical shapes are computed from the model config where the call happens
 // (a shape that does not match is refused there), so this table only carries the names.
@@ -203,6 +289,79 @@ const Slot1 k_1d[] = {
     {"attn.compressor.norm.weight", "attn_compressor_norm.weight", false},
     {"indexer.compressor.norm.weight", "indexer_compressor_norm.weight", false},
 };
+
+// An MLX checkpoint (mlx-quantize / mlx-to-hf) spells the same module differently: one draft
+// layer under `decoder.*`, fused expert matrices under `decoder.ffn.switch_mlp.*`, and the
+// fusion tensors at the top level. Rather than a second adapter, this table renames those
+// tensors into the HF suffixes the code below already groups by; every mapping is still
+// confirmed by shape, so a wrong rename is still a load error, never a wrong draft.
+// A name mapped to "" is read and dropped on purpose: the module's own final head is not used,
+// because draft logits come from the main model's head.
+struct SlotMlx { const char* mlx; const char* hf; };
+const SlotMlx k_mlx[] = {
+    {"decoder.attn.attn_sink", "attn.attn_sink"},
+    {"decoder.attn.q_norm.weight", "attn.q_norm.weight"},
+    {"decoder.attn.kv_norm.weight", "attn.kv_norm.weight"},
+    {"decoder.attn_norm.weight", "attn_norm.weight"},
+    {"decoder.ffn_norm.weight", "ffn_norm.weight"},
+    {"decoder.ffn.gate.e_score_correction_bias", "ffn.gate.bias"},
+    {"decoder.ffn.gate.weight", "ffn.gate.weight"},
+    // A matrix is spelled "<name>" or "<name>.weight" depending on the exporter (mlx-to-hf keeps
+    // the mlx nn.Parameter dict key, mlx 0.x writes the module path); both are accepted, and the
+    // scale tensor is always "<name>.scales". The shape check below is what decides.
+    {"decoder.attn.wq_a", "attn.wq_a"}, {"decoder.attn.wq_a.weight", "attn.wq_a"}, {"decoder.attn.wq_a.scales", "attn.wq_a.scale"},
+    {"decoder.attn.wq_b", "attn.wq_b"}, {"decoder.attn.wq_b.weight", "attn.wq_b"}, {"decoder.attn.wq_b.scales", "attn.wq_b.scale"},
+    {"decoder.attn.wkv", "attn.wkv"}, {"decoder.attn.wkv.weight", "attn.wkv"}, {"decoder.attn.wkv.scales", "attn.wkv.scale"},
+    {"decoder.attn.wo_a", "attn.wo_a"}, {"decoder.attn.wo_a.weight", "attn.wo_a"}, {"decoder.attn.wo_a.scales", "attn.wo_a.scale"},
+    {"decoder.attn.wo_b", "attn.wo_b"}, {"decoder.attn.wo_b.weight", "attn.wo_b"}, {"decoder.attn.wo_b.scales", "attn.wo_b.scale"},
+    {"decoder.attn.compressor.norm.weight", "attn.compressor.norm.weight"},
+    {"decoder.attn.compressor.wkv", "attn.compressor.wkv"}, {"decoder.attn.compressor.wkv.weight", "attn.compressor.wkv"},
+    {"decoder.attn.compressor.wkv.scales", "attn.compressor.wkv.scale"},
+    {"decoder.attn.compressor.wgate", "attn.compressor.wgate"}, {"decoder.attn.compressor.wgate.weight", "attn.compressor.wgate"},
+    {"decoder.attn.compressor.wgate.scales", "attn.compressor.wgate.scale"},
+    {"decoder.attn.compressor.ape", "attn.compressor.ape"}, {"decoder.attn.compressor.ape.weight", "attn.compressor.ape"},
+    {"decoder.indexer.wq_b", "indexer.wq_b"}, {"decoder.indexer.wq_b.weight", "indexer.wq_b"}, {"decoder.indexer.wq_b.scales", "indexer.wq_b.scale"},
+    {"decoder.indexer.weights_proj", "indexer.weights_proj"}, {"decoder.indexer.weights_proj.weight", "indexer.weights_proj"},
+    {"decoder.indexer.compressor.norm.weight", "indexer.compressor.norm.weight"},
+    {"decoder.indexer.compressor.wkv", "indexer.compressor.wkv"}, {"decoder.indexer.compressor.wkv.weight", "indexer.compressor.wkv"},
+    {"decoder.indexer.compressor.wkv.scales", "indexer.compressor.wkv.scale"},
+    {"decoder.indexer.compressor.wgate", "indexer.compressor.wgate"}, {"decoder.indexer.compressor.wgate.weight", "indexer.compressor.wgate"},
+    {"decoder.indexer.compressor.wgate.scales", "indexer.compressor.wgate.scale"},
+    {"decoder.indexer.compressor.ape", "indexer.compressor.ape"}, {"decoder.indexer.compressor.ape.weight", "indexer.compressor.ape"},
+    {"decoder.ffn.shared_experts.gate_proj", "ffn.shared_experts.w1"}, {"decoder.ffn.shared_experts.gate_proj.weight", "ffn.shared_experts.w1"},
+    {"decoder.ffn.shared_experts.gate_proj.scales", "ffn.shared_experts.w1.scale"},
+    {"decoder.ffn.shared_experts.up_proj", "ffn.shared_experts.w3"}, {"decoder.ffn.shared_experts.up_proj.weight", "ffn.shared_experts.w3"},
+    {"decoder.ffn.shared_experts.up_proj.scales", "ffn.shared_experts.w3.scale"},
+    {"decoder.ffn.shared_experts.down_proj", "ffn.shared_experts.w2"}, {"decoder.ffn.shared_experts.down_proj.weight", "ffn.shared_experts.w2"},
+    {"decoder.ffn.shared_experts.down_proj.scales", "ffn.shared_experts.w2.scale"},
+    {"decoder.attn_hc.base", "hc_attn_base"}, {"decoder.attn_hc.scale", "hc_attn_scale"}, {"decoder.attn_hc.fn", "hc_attn_fn"},
+    {"decoder.ffn_hc.base", "hc_ffn_base"}, {"decoder.ffn_hc.scale", "hc_ffn_scale"}, {"decoder.ffn_hc.fn", "hc_ffn_fn"},
+    {"decoder.ffn.switch_mlp.gate_proj", "ffn.experts.w1.fused"}, {"decoder.ffn.switch_mlp.gate_proj.weight", "ffn.experts.w1.fused"},
+    {"decoder.ffn.switch_mlp.gate_proj.scales", "ffn.experts.w1.fusedscale"},
+    {"decoder.ffn.switch_mlp.up_proj", "ffn.experts.w3.fused"}, {"decoder.ffn.switch_mlp.up_proj.weight", "ffn.experts.w3.fused"},
+    {"decoder.ffn.switch_mlp.up_proj.scales", "ffn.experts.w3.fusedscale"},
+    {"decoder.ffn.switch_mlp.down_proj", "ffn.experts.w2.fused"}, {"decoder.ffn.switch_mlp.down_proj.weight", "ffn.experts.w2.fused"},
+    {"decoder.ffn.switch_mlp.down_proj.scales", "ffn.experts.w2.fusedscale"},
+    {"enorm.weight", "enorm.weight"}, {"hnorm.weight", "hnorm.weight"},
+    {"e_proj", "e_proj.weight"}, {"e_proj.weight", "e_proj.weight"}, {"e_proj.scales", "e_proj.scale"},
+    {"h_proj", "h_proj.weight"}, {"h_proj.weight", "h_proj.weight"}, {"h_proj.scales", "h_proj.scale"},
+    {"hc_head.base", "hc_head_base"}, {"hc_head.scale", "hc_head_scale"}, {"hc_head.fn", "hc_head_fn"},
+    // the module's own final head: draft logits come from the main model's head, so it is dropped
+    {"decoder.norm.weight", ""}, {"norm.weight", ""},
+};
+
+// Group an MLX checkpoint's tensors as the HF path would: one draft layer (index 0), keyed by the
+// HF suffix. Returns false when the file holds no draft module at all (no decoder.* tensors).
+bool mlx_group_layers(const StHeader& sh, std::map<int, std::map<std::string, const StTensor*>>& layers) {
+    for (const StTensor& t : sh.tensors) {
+        const std::string n = t.name;
+        const char* hf = nullptr;
+        for (const SlotMlx& s : k_mlx) if (s.mlx == n) { hf = s.hf; break; }
+        if (!hf || !*hf) continue;
+        layers[0][hf] = &t;
+    }
+    return !layers.empty();
+}
 
 }  // namespace
 
@@ -224,7 +383,11 @@ bool mtp_adapt_safetensors(const StHeader& sh, const Dsv4Config& c, MtpAdapted& 
         if (dot == std::string::npos) continue;
         layers[std::atoi(rest.c_str())][rest.substr(dot + 1)] = &t;
     }
-    if (layers.empty()) { err = "no mtp.<J>.* tensors in " + (sh.files.empty() ? std::string() : sh.files[0]); return false; }
+    const bool mlx_layout = layers.empty() && mlx_group_layers(sh, layers);
+    if (layers.empty()) {
+        err = "no draft module (no mtp.<J>.* and no decoder.* tensors) in " + (sh.files.empty() ? std::string() : sh.files[0]);
+        return false;
+    }
     out.n_layers = (int) layers.size();
     out.source = sh.files[0];
 
@@ -363,9 +526,32 @@ bool mtp_adapt_safetensors(const StHeader& sh, const Dsv4Config& c, MtpAdapted& 
             emit(e);
             return true;
         };
-        if (!experts_ok(g, gs, "ffn_gate_exps.weight")) return false;
-        if (!experts_ok(u, us, "ffn_up_exps.weight")) return false;
-        if (!experts_ok(d, ds, "ffn_down_exps.weight")) return false;
+        // The routed experts, in whichever layout the checkpoint used: HF ships one packed tensor
+        // per expert; an MLX checkpoint ships one fused tensor per matrix, already e2m1 + e8m0.
+        if (mlx_layout) {
+            // gate/up/down are told apart by their logical shape, exactly as the HF path does.
+            struct Want2 { const char* hf; const char* eng; bool down; };
+            const Want2 fused[] = {
+                {"ffn.experts.w1.fused", "ffn_gate_exps.weight", false},
+                {"ffn.experts.w3.fused", "ffn_up_exps.weight", false},
+                {"ffn.experts.w2.fused", "ffn_down_exps.weight", true},
+            };
+            for (const Want2& wv : fused) {
+                const StTensor* t = fnd(wv.hf);
+                const StTensor* st = fnd(std::string(wv.hf) + "scale");
+                if (!t) { err = "draft layer " + std::to_string(kv.first) + " has no " + wv.hf; return false; }
+                if (!st) { err = std::string(wv.hf) + ": no scale tensor for the fused experts"; return false; }
+                const Src* w = get_src(t), *sc = get_src(st);
+                if (!w || !sc) { err = "cannot read an expert tensor of " + std::string(wv.eng); return false; }
+                Eng e;
+                if (!conv_experts_fused(*w, *sc, E, wv.down ? dim : ff, wv.down ? ff : dim, P + wv.eng, e, err)) return false;
+                emit(e);
+            }
+        } else {
+            if (!experts_ok(g, gs, "ffn_gate_exps.weight")) return false;
+            if (!experts_ok(u, us, "ffn_up_exps.weight")) return false;
+            if (!experts_ok(d, ds, "ffn_down_exps.weight")) return false;
+        }
 
         // ---- the fusion module: two layouts, chosen by which tensors exist
         const Src* enorm = get_src(fnd("enorm.weight")), *hnorm = get_src(fnd("hnorm.weight"));

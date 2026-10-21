@@ -14,6 +14,18 @@
  *   a tensor whose rows/cols do not match the layer it would fill is refused with a message.
  *   A wrong name mapping is therefore a load error, never a silently wrong draft.
  *
+ * @par Two checkpoint spellings, one adapter
+ *   - HF (transformers): one draft layer per `mtp.<J>.*` index, one packed tensor per expert
+ *     (`ffn.experts.<e>.w1.weight` + `.scale`, 4-bit signed codes, 128-element F8_E8M0 blocks).
+ *   - MLX (mlx-quantize / mlx-to-hf, metadata `{"format":"mlx"}`): ONE draft layer under
+ *     `decoder.*`, the fusion tensors at the top level, dense weights as int8 codes four per U32
+ *     with one e8m0 scale per 32 columns, and the routed experts as ONE fused matrix per
+ *     `decoder.ffn.switch_mlp.{gate,up,down}_proj.weight` ([E][rows][cols/8] U32 of e2m1 codes,
+ *     eight per element) — exactly ggml's MXFP4, so the binding is bit-exact. A rename table
+ *     turns those names into the HF suffixes the code below already groups by; a matrix may be
+ *     spelled `<name>` or `<name>.weight` depending on the exporter, and both are accepted.
+ *   The layout is chosen by which tensors exist, never by the metadata string.
+ *
  * @par What it converts
  *   - F32 / BF16 / F16 copy straight to the matching ggml type.
  *   - I8 or F8_E4M3 weights with F8_E8M0 block scales dequantise to F32 (scale = 2^(byte-127)).
