@@ -1,0 +1,115 @@
+Spiega la differenza tra RAM e memoria SSD in modo semplice, con un esempio pratico.
+Riassumi questo testo in massimo cinque punti, mantenendo tutte le informazioni importanti: [inserisci qui un testo di esempio].
+Scrivi una funzione Python che verifichi se una stringa è palindroma e includi alcuni test.
+Analizza questa funzione Python, individua eventuali bug e proponi una versione corretta: `def average(nums): return sum(nums) / len(nums)`.
+Un negozio vende un prodotto a 80 euro con uno sconto del 15%. Calcola il prezzo finale e spiega i passaggi.
+Confronta i vantaggi e gli svantaggi di utilizzare un modello linguistico locale rispetto a un modello tramite API cloud.
+Scrivi una query SQL per trovare i cinque clienti con la spesa totale più alta, ipotizzando le tabelle customers e orders.
+Spiega passo dopo passo come risolvere un sistema di equazioni lineari con due incognite e mostra un esempio.
+Genera un file JSON valido che descriva tre prodotti, ciascuno con id, nome, prezzo e disponibilità.
+Individua i possibili problemi di sicurezza in questo frammento di codice e suggerisci come correggerli: `query = "SELECT * FROM users WHERE name = '" + name + "'"`.
+Scrivi un'email professionale per comunicare a un cliente che una consegna subirà un ritardo di due giorni, proponendo una soluzione.
+Analizza questi dati di vendita mensili: gennaio 120, febbraio 135, marzo 110, aprile 160, maggio 175. Individua l'andamento e calcola la media.
+Progetta un algoritmo che deduplichi una lista di elementi mantenendo l'ordine originale. Spiega complessità temporale e spaziale.
+Leggi il seguente scenario e proponi tre soluzioni alternative, confrontandole per costo, complessità e rischi: un'applicazione web diventa lenta quando aumenta il numero di utenti.
+Analizza un testo lungo suddividendolo in sezioni tematiche, individua le contraddizioni interne e formula una conclusione che distingua fatti, ipotesi e informazioni mancanti.
+Spiega la differenza tra HTTP e HTTPS in modo semplice, con un esempio pratico.
+Spiega il concetto di debito tecnico a un manager non tecnico usando una metafora efficace.
+Spiega come funziona la crittografia end-to-end a un bambino di 10 anni.
+Spiega la differenza tra intelligenza artificiale, machine learning e deep learning.
+Spiega il concetto di blockchain senza usare termini tecnici o gergali.
+Spiega come funziona l'algoritmo di PageRank di Google in modo intuitivo.
+Spiega la differenza tra Docker e una macchina virtuale (VM) usando un'analogia con il mondo reale.
+Spiega cosa sono le API (Application Programming Interface) facendo l'esempio di un ristorante.
+Spiega la differenza tra un database SQL e uno NoSQL in base ai casi d'uso.
+Spiega il concetto di compilatore rispetto a un interprete nella programmazione.
+Riassumi questo testo in massimo tre punti chiave, focalizzandoti sulle conclusioni: [inserisci testo].
+Estrai tutte le date e gli eventi principali da questo testo e digitali in ordine cronologico: [inserisci testo].
+Riscrivi questo paragrafo per renderlo più professionale e persuasivo: [inserisci testo].
+Correggi la grammatica e la sintassi di questo testo mantenendo il tono originale: [inserisci testo].
+Trasforma questo articolo di blog in uno script per un video TikTok di 60 secondi: [inserisci testo].
+Analizza il tono di voce di questo testo e suggerisci come renderlo più empatico: [inserisci testo].
+Estrai le parole chiave principali e i concetti correlati da questo documento: [inserisci testo].
+Riscrivi questa email aziendale per renderla estremamente breve e diretta: [inserisci testo].
+Riassumi questo lungo verbale di riunione evidenziando solo le azioni da compiere e i responsabili: [inserisci testo].
+Trasforma questa lista di dati tecnici in un paragrafo discorsivo facile da leggere: [inserisci testo].
+Scrivi una funzione Python che calcoli il fattoriale di un numero in modo ricorsivo.
+Scrivi una funzione Python per invertire l'ordine delle parole in una stringa, escludendo la punteggiatura.
+Scrivi uno script Python che legga un file CSV e ne stampi la media di una colonna numerica.
+Scrivi una funzione Python per verificare se due stringhe sono anagrammi l'una dell'altra.
+Scrivi una funzione Python che trovi il numero più grande in una lista senza usare la funzione integrata max().
+Scrivi uno script Python per scaricare il contenuto HTML di una pagina web data la sua URL.
+Scrivi una funzione Python che converta una temperatura da Celsius a Fahrenheit e viceversa.
+Scrivi una funzione Python che generi una password sicura casuale di lunghezza configurabile.
+Scrivi una funzione Python per unire due dizionari sommando i valori delle chiavi comuni.
+Scrivi uno script Python che calcoli i primi N numeri della successione di Fibonacci.
+Analizza questa funzione Python, individua perché va in loop infinito e correggila: [inserisci codice].
+Analizza questo codice Python e ottimizzalo per ridurre il consumo di memoria: [inserisci codice].
+Trova l'errore di sintassi o di logica che fa restituire None a questa funzione: [inserisci codice].
+Analizza questo frammento di codice e riscrivilo seguendo le linee guida ufficiali di PEP 8: [inserisci codice].
+Individua perché questa funzione solleva un errore IndexError e implementa una soluzione sicura: [inserisci codice].
+Riscrivi questa funzione Python sostituendo il ciclo for con una list comprehension più efficiente: [inserisci codice].
+Analizza questo codice e spiega perché la variabile globale non viene aggiornata correttamente: [inserisci codice].
+Trova il bug in questa gestione delle eccezioni che nasconde gli errori reali del programma: [inserisci codice].
+Analizza questo script e proponi un modo per renderlo asincrono usando asyncio: [inserisci codice].
+Riscrivi questa funzione nidificata per ridurne la complessità ciclomatica e migliorarne la leggibilità.
+Un negozio offre un secondo prodotto a metà prezzo. Calcola il prezzo totale per due articoli da 60 e 40 euro.
+Calcola la probabilità di ottenere due volte testa lanciando una moneta equa tre volte di seguito.
+Spiega passo dopo passo come calcolare l'area di un triangolo scaleno conoscendo solo i tre lati.
+Risolvi questa proporzione matematica spiegando logica e passaggi intermedi: x : 8 = 15 : 6.
+Calcola il ritorno sull'investimento (ROI) se spendi 500 euro in pubblicità e ottieni 1200 euro di ricavi.
+Spiega come calcolare la media ponderata dei voti universitari e mostra un esempio pratico.
+Un treno viaggia a 90 km/h. Calcola quanti minuti impiega a percorrere una distanza di 45 chilometri.
+Trova il valore dell'incognita X nella seguente equazione di primo grado: 3x + 5 = 20.
+Spiega la logica dietro il teorema di Pitagora e mostra come applicarlo per trovare l'ipotenusa.
+Calcola lo sconto effettivo se un prodotto già scontato del 20% riceve un ulteriore sconto del 10%.
+Confronta i vantaggi e gli svantaggi di SQL Server rispetto a PostgreSQL in ambito enterprise.
+Confronta lo sviluppo di app native (iOS/Android) rispetto allo sviluppo cross-platform (Flutter/React Native).
+Confronta l'architettura a monolito rispetto a quella a microservizi per una startup in crescita.
+Confronta i vantaggi di utilizzare GraphQL rispetto a una classica architettura REST API.
+Confronta l'uso di Git Merge rispetto a Git Rebase, indicando quando preferire l'uno o l'altro.
+Confronta i linguaggi Python e Go per lo sviluppo di backend scalabili.
+Confronta l'architettura Serverless (AWS Lambda) rispetto a server dedicati (AWS EC2) per costi e gestione.
+Confronta i dischi SSD SATA con i dischi SSD NVMe in termini di velocità e costi.
+Confronta i vantaggi di SaaS (Software as a Service) rispetto a software installato On-Premise.
+Confronta la programmazione orientata agli oggetti (OOP) con la programmazione funzionale.
+Scrivi una query SQL per contare il numero totale di ordini effettuati da ogni singolo cliente.
+Scrivi una query SQL per trovare tutti i dipendenti che hanno uno stipendio superiore alla media aziendale.
+Scrivi una query SQL per eliminare i record duplicati da una tabella mantenendo solo quello con l'ID più basso.
+Scrivi una query SQL che utilizzi una LEFT JOIN per trovare i clienti che non hanno mai effettuato un ordine.
+Scrivi una query SQL per aggiornare il prezzo di tutti i prodotti di una specifica categoria aumentandolo del 5%.
+Scrivi una query SQL per trovare il secondo dipendente più pagato usando la clausola OFFSET o sottoquery.
+Scrivi una query SQL per calcolare il fatturato totale generato nell'ultimo mese solare.
+Scrivi una query SQL per creare una nuova tabella chiamata recensioni con le giuste chiavi esterne.
+Scrivi una query SQL che utilizzi la clausola GROUP BY e HAVING per filtrare gruppi con più di 10 elementi.
+Scrivi una query SQL per combinare i risultati di due tabelle diverse utilizzando l'operatore UNION.
+Genera un file JSON valido che descriva la scheda tecnica di uno smartphone di ultima generazione.
+Converti questo frammento di codice JSON in un formato YAML pulito e ben strutturato: [inserisci JSON].
+Genera un file XML che rappresenti un catalogo di libri con autori, titoli, anni e generi.
+Valida questo file JSON, individua l'errore di sintassi e fornisci la versione corretta: [inserisci JSON].
+Genera un file JSON che contenga una lista nidificata di dipendenti divisi per il rispettivo dipartimento.
+Genera la configurazione YAML per un flusso di lavoro elementare di GitHub Actions.
+Genera un file JSON valido per configurare le impostazioni di un'applicazione (lingua, tema, notifiche).
+Crea una struttura JSON che descriva un ordine di e-commerce comprensivo di dati cliente, spedizione e prodotti.
+Converti questa lista di dati CSV nel formato standard JSON: [inserisci dati CSV].
+Genera un file YAML per definire un semplice servizio composto da un backend e un database su Docker Compose.
+Individua i problemi di sicurezza legati alla Cross-Site Scripting (XSS) in questo frammento HTML/JS: [inserisci codice].
+Spiega come prevenire gli attacchi di tipo SQL Injection usando i prepared statements in PHP.
+Analizza questa funzione di autenticazione e spiega perché memorizzare le password in MD5 non è sicuro.
+Individua i rischi di sicurezza nell'esporre chiavi API hardcoded in questo script e mostra come isolarle.
+Analizza questo codice e correggi la vulnerabilità legata all'Insecure Deserialization: [inserisci codice].
+Spiega cos'è un attacco Man-in-the-Middle (MitM) e quali misure lato codice lo prevengono.
+Analizza questo script di caricamento file e correggilo per bloccare l'upload di script dannosi (RCE).
+Individua la vulnerabilità di Broken Access Control in questa API di gestione profili: [inserisci codice].
+Spiega come implementare in modo sicuro la validazione e il controllo dei token JWT lato backend.
+Analizza questo codice e spiega come mitigare il rischio di attacchi Brute Force sui login.
+Scrivi un'email per rifiutare gentilmente una proposta commerciale da parte di un fornitore esterno.
+Analizza questi dati di traffico web settimanali, individua il giorno di picco e calcola la variazione percentuale.
+Scrivi una newsletter accattivante per lanciare il pre-ordine di un nuovo corso di formazione online.
+Analizza i feedback di questi tre clienti e stila una lista dei tre problemi principali da risolvere urgentemente.
+Scrivi un messaggio Slack aziendale per ricordare al team di compilare il foglio ore entro venerdì.
+Analizza questo report finanziario trimestrale sintetizzando i costi operativi e i margini di profitto.
+Scrivi una lettera di scuse formale a un cliente per un disservizio tecnico che ha bloccato il sistema per tre ore.
+Analizza l'andamento di queste conversioni pubblicitarie e suggerisci dove allocare meglio il budget rimasto.
+Scrivi una risposta professionale a una recensione pubblica negativa su Google focalizzandoti sulla risoluzione.
+Analizza questi dati storici dei prezzi e calcola la proiezione della domanda per il mese successivo.
