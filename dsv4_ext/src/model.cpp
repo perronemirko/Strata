@@ -19,6 +19,7 @@
 #include <cstring>
 #include <map>
 #include <numeric>
+#include <set>
 #include <thread>
 #include <unordered_map>
 #ifdef _OPENMP
@@ -179,6 +180,21 @@ struct Model::Impl {
     std::vector<const uint8_t*> maps; std::vector<size_t> map_len;
     std::vector<Layer> L;
     int nrun = 0, hd = 0, rd = 0, win = 0, dim = 0, hc = 4;
+    // Extra (MTP) layers may not have their own clamp entries in the GGUF: inherit the last main layer's.
+    float cl_exp(int l) const { return c.swiglu_clamp_exp[std::min(l, (int) c.swiglu_clamp_exp.size() - 1)]; }
+    float cl_shexp(int l) const { return c.swiglu_clamp_shexp[std::min(l, (int) c.swiglu_clamp_shexp.size() - 1)]; }
+    // ---- MTP / speculative decoding (see spec_step) ----
+    int nmtp = 0;                          // extra layers loaded: canonical indices [c.n_layer, c.n_layer+nmtp) in L
+    std::vector<int> all_layers;           // every layer index that owns weights/state: main [0,nrun) + MTP extras
+    Tn mtp_enorm, mtp_hnorm, mtp_eh_proj;  // fusion tensors (empty when the model has no MTP fusion module)
+    bool mtp_fused = false;                // true: draft input = eh_proj(concat(enorm(embd), hnorm(hidden)))
+    std::vector<float> last_hidden;        // [hc*dim] main hidden state left by the last forward()/forward_chunk()
+    bool mtp_suspended = false;            // true while a verify chunk runs: forward() must not touch MTP state
+    std::vector<float> verify_hs;          // [T][hc*dim] residual streams left by the last forward_chunk_all (verify)
+    struct CompSnap { Comp* cp; std::vector<float> kvs, scs; };   // rolling-buffer snapshot for speculative rollback
+    struct RingSnap { Layer* ly; std::vector<int> slots; std::vector<float> rows; };
+    std::vector<RingSnap> ring_snaps;      // window-ring rows touched by the draft span: restored on partial acceptance
+    std::vector<CompSnap> ck_snaps;        // filled by spec_step before drafting, consumed by rollback_kv()
     Tn embd, outw, outnorm, out_hc_fn, out_hc_base, out_hc_scale;
     std::vector<float> cos_y, sin_y, cos_p, sin_p;   // YaRN (compressed layers) / plain (window-only layers) rope tables
     uint64_t model_hash = 0;
@@ -582,6 +598,25 @@ struct Model::Impl {
         if (!gguf_read_header(shards, h, err)) return false;
         if (h.tensors.empty()) { err = "no tensors found: pass the first shard of a multi-file GGUF (…-00001-of-0000N.gguf) so all shards are loaded"; return false; }
         if (!config_from_gguf(h, c, err)) return false;
+        // --mtp FILE: the MTP module lives in a separate GGUF; only its tensors are merged into this model
+        // (its metadata is ignored - the main shards' config stays authoritative). "auto" = look for them here.
+        if (!o.mtp_path.empty() && o.mtp_path != "auto") {
+            GgufHeader mh; std::string merr;
+            if (!gguf_read_header({o.mtp_path}, mh, merr)) { err = "cannot read --mtp file: " + merr; return false; }
+            const GgufValue* ma = mh.find("general.architecture");
+            if (ma && ma->s != c.arch) { err = "--mtp file architecture is not '" + c.arch + "'"; return false; }
+            const GgufValue* me = mh.find("deepseek4.embedding_length");
+            if (me && me->i != c.n_embd) { err = "--mtp file embedding_length does not match the model"; return false; }
+            std::set<std::string> have;
+            for (const GgufTensor& t : h.tensors) have.insert(t.name);
+            const int nfiles = (int) h.files.size();
+            for (GgufTensor& t : mh.tensors) {
+                if (!have.insert(t.name).second) { err = "duplicate tensor in --mtp file: " + t.name; return false; }
+                t.shard += nfiles;   // rebase onto the main shard list (maps are built from h.files, in order)
+                h.tensors.push_back(t);
+            }
+            for (const std::string& f : mh.files) h.files.push_back(f);
+        }
         if (!inventory_from_gguf(h, c, inv, err)) return false;
         if (c.gating_func != 1 && c.gating_func != 2 && c.gating_func != 4) { err = "unsupported expert_gating_func " + std::to_string(c.gating_func); return false; }
         if (c.idx_key_len & (c.idx_key_len - 1)) { err = "indexer key length must be a power of two (Hadamard)"; return false; }
@@ -680,7 +715,9 @@ struct Model::Impl {
             cp.wkv = wkv; cp.wg = wg; cp.ape = ape; cp.norm = norm; cp.cache = cache;
             return wkv.out == (int64_t) cp.coff * d && wg.out == (int64_t) cp.coff * d;
         };
-        for (int l = 0; l < nrun; ++l) {
+        // One full layer: tensors, compressor(s), KV buffer and uploads. Shared by the main layers AND the
+        // extra MTP layers (same schema - that is what makes their state checkpointable like any other).
+        auto init_layer = [&](int l) -> bool {
             Layer& y = L[(size_t) l];
             auto N = [&](const char* s, bool req = true) { return tn("blk." + std::to_string(l) + "." + s, req, err); };
             y.ratio = c.compress_ratios[(size_t) l];
@@ -723,7 +760,38 @@ struct Model::Impl {
             // the host weights and keeps the exact (double) rounding of the sequential path. Uploading
             // 130 MiB of them would only take VRAM away from the experts that do go to the device.
             for (Tn* t : {&y.q_a, &y.q_b, &y.kv, &y.o_a, &y.o_b, &y.gate_inp, &y.sh_gate, &y.sh_up, &y.sh_down, &y.ac.wkv, &y.ac.wg, &y.i_q_b, &y.ic.wkv, &y.ic.wg}) upload(*t);
+            return true;
+        };
+        for (int l = 0; l < nrun && err.empty(); ++l) if (!init_layer(l)) return false;
+        // ---- MTP / extra layers: loaded as full Layers when speculative decoding is on (--spec N > 0).
+        // They share the token embedding and the output head with the main model, own their KV ring +
+        // compressor(s), and are executed at EVERY position (see mtp_prefill) so that their cache stays
+        // aligned with the main history - exactly like a normal layer. Their state lives in L, which is
+        // what makes save_kv/load_kv capture it automatically.
+        nmtp = 0; mtp_fused = false;
+        if (c.n_extra_layers > 0 && o.spec_n > 0) {
+            L.resize((size_t)(c.n_layer + c.n_extra_layers));
+            for (int j = 0; j < c.n_extra_layers; ++j) if (!init_layer(c.n_layer + j)) return false;
+            nmtp = c.n_extra_layers;
+            // Fusion module (DeepSeek-V3 style), auto-detected: eh_proj(concat(enorm(embedding), hnorm(hidden))).
+            mtp_enorm = tn("mtp.enorm.weight", false, err);
+            mtp_hnorm = tn("mtp.hnorm.weight", false, err);
+            mtp_eh_proj = tn("mtp.eh_proj.weight", false, err);
+            if (!err.empty()) return false;
+            if ((bool) mtp_enorm && (bool) mtp_hnorm && (bool) mtp_eh_proj) {
+                if ((int64_t) mtp_enorm.in != dim || (int64_t) mtp_hnorm.in != hc * dim ||
+                    (int64_t) mtp_eh_proj.in != (dim + hc * dim) || (int64_t) mtp_eh_proj.out != dim) {
+                    err = "MTP fusion tensor shapes do not match the model dimensions"; return false;
+                }
+                mtp_fused = true;
+            }
         }
+        all_layers.clear();
+        for (int l = 0; l < nrun; ++l) all_layers.push_back(l);
+        for (int j = 0; j < nmtp; ++j) all_layers.push_back(c.n_layer + j);
+        if (o.verbose && nmtp > 0)
+            std::fprintf(stderr, "MTP: %d extra layer(s) at blk.%d..blk.%d (%s fusion): speculative decoding active (--spec %d)\n",
+                         nmtp, c.n_layer, c.n_layer + nmtp - 1, mtp_fused ? "enorm/hnorm/eh_proj" : "none (hidden-state input)", o.spec_n);
         upload(outw);
         ph("non-expert weights uploaded to GPU");
         // ---- staging pool for MISS experts.
@@ -735,7 +803,7 @@ struct Model::Impl {
         // kMaxHit experts: layers are evaluated one at a time, so the pool is reused, not duplicated.
         if (o.gpu) {
             size_t maxb = 0;
-            for (int l = 0; l < nrun; ++l) maxb = std::max(maxb, L[(size_t) l].bpe);
+            for (int l : all_layers) maxb = std::max(maxb, L[(size_t) l].bpe);
             if (maxb > 0) {
                 const size_t need = (size_t) gpu::kMaxHit * maxb;
                 d_stage = (uint8_t*) galloc(need);
@@ -766,15 +834,15 @@ struct Model::Impl {
             // 24 GiB card that had plenty of room for experts. dsv4_plan still estimates them, because there
             // it is a what-if tool with no device in front of it.
             in.weights = 0; in.kv = 0; in.act = 0; in.prefill = 0; in.mtp = 0; in.scratch = 0;
-            in.bytes_per_expert.assign((size_t) c.n_layer, 0);
+            in.bytes_per_expert.assign((size_t)(c.n_layer + nmtp), 0);
             // A layer the device cannot evaluate gets 0 bytes here, so the planner gives it no slots: VRAM
-            // would be spent on experts that always end up computed on the host anyway.
-            for (int l = 0; l < nrun; ++l) in.bytes_per_expert[(size_t) l] = L[(size_t) l].gpu_experts ? L[(size_t) l].bpe : 0;
+            // would be spent on experts that always end up computed on the host anyway. MTP layers count too.
+            for (int l : all_layers) in.bytes_per_expert[(size_t) l] = L[(size_t) l].gpu_experts ? L[(size_t) l].bpe : 0;
             in.ram_expert_bytes = inv.total_expert_bytes;
             MemPlan pl = plan_expert_memory(in);
             if (!pl.ok) { err = pl.err; return false; }
             if (o.verbose) std::fprintf(stderr, "%s", plan_report(in, pl).c_str());
-            for (int l = 0; l < nrun; ++l) {
+            for (int l : all_layers) {
                 Layer& y = L[(size_t) l];
                 y.slots = pl.slots_layer[(size_t) l];
                 if (y.slots <= 0) { y.slots = 0; continue; }
@@ -840,7 +908,7 @@ struct Model::Impl {
                 done += (size_t) n;
             }
         };
-        for (int l = 0; l < nrun; ++l) {
+        for (int l : all_layers) {
             Layer& y = L[(size_t) l];
             int n = 0;
             for (int e = 0; e < c.n_expert; ++e) if (o.ram_all || (have_profile && y.freq[(size_t) e] > 0)) y.ram_idx[(size_t) e] = n++;
@@ -862,22 +930,22 @@ struct Model::Impl {
         uint64_t cache_bytes_plan = 0; int cache_slots_plan = 0;
         if (o.ram_cache_mib > 0) {
             uint64_t sumb = 0;
-            for (int l = 0; l < nrun; ++l) sumb += L[(size_t) l].bpe;
+            for (int l : all_layers) sumb += L[(size_t) l].bpe;
             if (sumb) {
                 const uint64_t budget = (uint64_t) o.ram_cache_mib << 20;
                 const int q = (int) std::min<uint64_t>(budget / sumb, (uint64_t) c.n_expert);
-                for (int l = 0; l < nrun; ++l) L[(size_t) l].ncache = q;
+                for (int l : all_layers) L[(size_t) l].ncache = q;
                 uint64_t left = budget - (uint64_t) q * sumb;
                 bool grew = true;
                 while (grew) {  // spend the remainder one slot at a time, last layers first
                     grew = false;
-                    for (int l = nrun - 1; l >= 0; --l) {
+                    for (size_t li = all_layers.size(); li-- > 0;) { const int l = all_layers[li];
                         Layer& y = L[(size_t) l];
                         if (y.bpe == 0 || y.ncache >= c.n_expert || left < y.bpe) continue;
                         ++y.ncache; left -= y.bpe; grew = true;
                     }
                 }
-                for (int l = 0; l < nrun; ++l) {
+                for (int l : all_layers) {
                     Layer& y = L[(size_t) l];
                     if (y.ncache <= 0) continue;
                     y.cpool.resize((size_t) y.ncache * y.bpe);
@@ -891,14 +959,14 @@ struct Model::Impl {
         // ---- VRAM preload: hottest experts per layer
         int preloaded = 0;
         if (o.gpu && have_profile)
-            for (int l = 0; l < nrun; ++l) {
+            for (int l : all_layers) {
                 Layer& y = L[(size_t) l];
                 std::vector<int> ord(c.n_expert); std::iota(ord.begin(), ord.end(), 0);
                 std::stable_sort(ord.begin(), ord.end(), [&](int a, int b) { return y.freq[(size_t) a] > y.freq[(size_t) b]; });
                 for (int k = 0; k < y.slots && k < c.n_expert && y.freq[(size_t) ord[(size_t) k]] > 0; ++k) { upload_slot(y, k, ord[(size_t) k]); ++preloaded; }
             }
         if (o.verbose) {
-            int64_t sl = 0; for (int l = 0; l < nrun; ++l) sl += L[(size_t) l].slots;
+            int64_t sl = 0; for (int l : all_layers) sl += L[(size_t) l].slots;
             std::fprintf(stderr, "expert profile: %s\nexperts in RAM: %d (%.2f GiB) | VRAM slots: %lld, preloaded: %d | rest: mmap on disk\n",
                          have_profile ? ("loaded " + o.profile_in).c_str() : "none", ram_n, ram_bytes / 1073741824.0, (long long) sl, preloaded);
             std::fprintf(stderr, "miss LRU arena: %d slots (%.2f GiB) | threads: %d\n",
@@ -918,8 +986,8 @@ struct Model::Impl {
     /// What a checkpoint must match to be loadable: model identity + every option that changes the math.
     std::string fingerprint() const {
         char b[512];
-        std::snprintf(b, sizeof b, "hash=%llu|layers=%d|dim=%d|win=%d|hd=%d|ctx=%d|qat=%d|kvf=%d|%d",
-                      (unsigned long long) model_hash, nrun, dim, win, hd, o.ctx, (int) o.qat_sim, (int) o.key_format, (int) o.value_format);
+        std::snprintf(b, sizeof b, "hash=%llu|layers=%d|dim=%d|win=%d|hd=%d|ctx=%d|qat=%d|kvf=%d|mtp=%d|%d",
+                      (unsigned long long) model_hash, nrun, dim, win, hd, o.ctx, (int) o.qat_sim, (int) o.key_format, nmtp, (int) o.value_format);
         return b;
     }
 
@@ -1069,7 +1137,7 @@ struct Model::Impl {
         const bool hash = l < c.n_hash_layers;
         const Score fn = c.gating_func == 1 ? Score::Softmax : c.gating_func == 2 ? Score::Sigmoid : Score::SqrtSoftplus;
         gate_route(lg.data(), E, K, fn, (!hash && y.exp_bias) ? y.exp_bias.f() : nullptr, hash ? (const int32_t*) y.tid2eid.h + (size_t) token * K : nullptr, c.exp_w_scale, idx, w);
-        for (int k = 0; k < K; ++k) { last_routing_p[(size_t) l * K + k] = idx[k]; y.freq[(size_t) idx[k]]++; }
+        for (int k = 0; k < K; ++k) { if (l < c.n_layer) last_routing_p[(size_t) l * K + k] = idx[k]; y.freq[(size_t) idx[k]]++; }
 
         // Every routed expert goes to the device when it can: the resident ones by VRAM pointer, the
         // others by host pointer through the staging pool. Only when the device refuses (no kernel for
@@ -1102,7 +1170,7 @@ struct Model::Impl {
         // tells the operator whether the slot budget is right.
         st->hits += (uint64_t) nres;
         st->misses += (uint64_t) (nstaged + nmiss + nstaged_dev);
-        const float lim = c.swiglu_clamp_exp[(size_t) l];
+        const float lim = cl_exp(l);
         auto t0 = Clock::now();
         bool hit_ok = false;
         if (p.n > 0) {  // launch the experts asynchronously...
@@ -1140,7 +1208,7 @@ struct Model::Impl {
         // shared expert
         std::vector<float> sg((size_t) ff), su((size_t) ff), sa((size_t) ff), sy((size_t) dim);
         mv(y.sh_gate, x, sg.data()); mv(y.sh_up, x, su.data());
-        swiglu_clamped(sg.data(), su.data(), ff, c.swiglu_clamp_shexp[(size_t) l], sa.data());
+        swiglu_clamped(sg.data(), su.data(), ff, cl_shexp(l), sa.data());
         mv(y.sh_down, sa.data(), sy.data());
         for (int i = 0; i < dim; ++i) y_out[i] = acc[(size_t) i] + sy[(size_t) i];
     }
@@ -1244,8 +1312,17 @@ struct Model::Impl {
             int32_t idx[16]; float w[16];
             gate_route(h_lg + (size_t) t * E, E, K, fn, (!hash && y.exp_bias) ? y.exp_bias.f() : nullptr,
                        hash ? (const int32_t*) y.tid2eid.h + (size_t) toks[t] * K : nullptr, c.exp_w_scale, idx, w);
+            // A hash table may map one token to the same expert twice (the tiny fixture does; a trained DSv3
+            // never): merge such slots - the expert output is linear in its weight, so w1*E(x) + w2*E(x) ==
+            // (w1+w2)*E(x), and every bucket stays <= T tokens wide, which the arena buffers are sized for.
+            int32_t orig[16];   // pre-merge routing: what the trace records, like the sequential path does
+            std::copy(idx, idx + K, orig);
+            for (int k = 0; k < K; ++k)
+                for (int q = 0; q < k; ++q)
+                    if (idx[q] == idx[k]) { w[q] += w[k]; idx[k] = -1; break; }
             for (int k = 0; k < K; ++k) {
-                h_tok[(size_t) t * K + k] = idx[k];
+                h_tok[(size_t) t * K + k] = idx[k];   // -1 marks a slot merged into an earlier one of this token
+                if (idx[k] < 0) continue;
                 h_wt[(size_t) t * K + k] = w[k];
                 ++h_cnt[idx[k]];
                 y.freq[(size_t) idx[k]]++;
@@ -1255,9 +1332,10 @@ struct Model::Impl {
             // (A trace row is n_layer*K wide like last_routing, so --max-layers leaves the unused layers at -1.)
             // Every token's routing also goes into chunk_routing, which lets a chunked prefill write
             // the same per-token trace file the token-per-token path does.
-            for (int k = 0; k < K; ++k) {
-                chunk_routing[(size_t) t * (size_t) c.n_layer * K + (size_t) l * K + k] = idx[k];
-                if (t == T - 1) last_routing_p[(size_t) l * K + k] = idx[k];
+            for (int k = 0; k < K; ++k) {   // extra (MTP) layers stay out of the trace: its row is n_layer*K wide
+                if (l >= c.n_layer) continue;
+                chunk_routing[(size_t) t * (size_t) c.n_layer * K + (size_t) l * K + k] = orig[k];
+                if (t == T - 1) last_routing_p[(size_t) l * K + k] = orig[k];
             }
         }
         // Bucket the chunk's (token, expert) pairs by expert: h_sel/h_w become one contiguous run per
@@ -1269,6 +1347,7 @@ struct Model::Impl {
         for (int t = 0; t < T; ++t)
             for (int k = 0; k < K; ++k) {
                 const int e = h_tok[(size_t) t * K + k];
+                if (e < 0) continue;   // merged duplicate slot
                 const int p = h_at[e]++;
                 h_sel[p] = t;
                 h_w[p] = h_wt[(size_t) t * K + k];
@@ -1302,7 +1381,7 @@ struct Model::Impl {
             ++nexp;
         }
         std::fill(h_acc, h_acc + (size_t) T * dim, 0.f);
-        const float lim = c.swiglu_clamp_exp[(size_t) l];
+        const float lim = cl_exp(l);
         bool ok = false;
         if (pf_device_experts() && y.gpu_experts && nexp > 0) {
             // X is the same block the gate_inp matmul above just uploaded, so this is usually free.
@@ -1334,7 +1413,7 @@ struct Model::Impl {
         mvb(y.sh_gate, X, dim, T, h_sg, ff);
         mvb(y.sh_up, X, dim, T, h_su, ff);
         for (int t = 0; t < T; ++t)
-            swiglu_clamped(h_sg + (size_t) t * ff, h_su + (size_t) t * ff, ff, c.swiglu_clamp_shexp[(size_t) l],
+            swiglu_clamped(h_sg + (size_t) t * ff, h_su + (size_t) t * ff, ff, cl_shexp(l),
                            h_sa + (size_t) t * ff);
         mvb(y.sh_down, h_sa, ff, T, h_sy, dim);
         for (size_t i = 0; i < (size_t) T * dim; ++i) out[i] = h_acc[i] + h_sy[i];
@@ -1450,6 +1529,8 @@ struct Model::Impl {
             logits->assign((size_t) c.vocab, 0.f);
             mv(outw, xn.data(), logits->data());
         }
+        last_hidden.assign(h_h + (size_t)(T - 1) * n, h_h + (size_t) T * n);   // hidden state of the chunk's last token
+        if (nmtp > 0) mtp_chunk(T, pos0);   // MTP layers run at every position: their KV stays aligned with the history
         st->total_s += secs(t0, Clock::now());
         ++st->prefill_chunks;
         st->prefill_tokens += (uint64_t) T;
@@ -1479,10 +1560,325 @@ struct Model::Impl {
         dequant_row(embd.type, embd.h + (size_t) token * embd.rb, dim, e.data());
         for (int j = 0; j < hc; ++j) std::memcpy(&hres[(size_t) j * dim], e.data(), (size_t) dim * 4);
         for (int l = 0; l < nrun; ++l) block(l, hres, token, pos);
+        last_hidden.assign(hres.begin(), hres.end());   // [hc*dim]: feeds draft step 0 of spec_step()
         hc_head(hres.data(), hc, dim, out_hc_fn.f(), out_hc_scale.f(), out_hc_base.f(), c.rms_eps, c.hc_eps, x.data());
         rmsnorm(x.data(), outnorm.f(), c.rms_eps, dim, xn.data());
         if (logits) { logits->assign((size_t) c.vocab, 0.f); mv(outw, xn.data(), logits->data()); }
+        if (nmtp > 0 && !mtp_suspended) mtp_prefill(token, pos, hres.data());   // keep the MTP layers' KV state aligned with the history
         st->total_s += secs(t0, Clock::now());
+    }
+
+
+    // ============================================================ MTP / speculative decoding (--spec N)
+    /// Fused input of one position: eh_proj(concat(enorm(embedding), hnorm(hidden))) when the model has a fusion
+    /// module, otherwise the head-combined hidden state. `hidden` is [hc*dim] (the main model's output at that
+    /// position - or the previous MTP step's output while chaining drafts).
+    void mtp_fused_input(int token, const float* hidden, float* x) {
+        if (mtp_fused) {
+            std::vector<float> e((size_t) dim), en((size_t) dim), hn((size_t)(hc * dim)), cat((size_t)(dim + hc * dim));
+            dequant_row(embd.type, embd.h + (size_t) token * embd.rb, dim, e.data());
+            rmsnorm(e.data(), mtp_enorm.f(), c.rms_eps, dim, en.data());
+            rmsnorm(hidden, mtp_hnorm.f(), c.rms_eps, hc * dim, hn.data());
+            std::memcpy(cat.data(), en.data(), (size_t) dim * 4);
+            std::memcpy(cat.data() + dim, hn.data(), (size_t)(hc * dim) * 4);
+            mv(mtp_eh_proj, cat.data(), x);
+        } else {
+            hc_head(hidden, hc, dim, out_hc_fn.f(), out_hc_scale.f(), out_hc_base.f(), c.rms_eps, c.hc_eps, x);
+        }
+    }
+
+    /// Run the MTP layers at absolute position `pos` with input (token, hidden). Used both to keep their KV state
+    /// aligned during prefill/decode (outputs discarded) and for chained draft steps (head logits + residual stream
+    /// returned). The layer's own ring/compressor advance exactly like a normal layer's.
+    void mtp_run(int token, int pos, const float* hidden, std::vector<float>* logits_out, std::vector<float>* hidden_out) {
+        std::vector<float> x((size_t) dim), hres((size_t)(hc * dim));
+        mtp_fused_input(token, hidden, x.data());
+        for (int j = 0; j < hc; ++j) std::memcpy(&hres[(size_t) j * dim], x.data(), (size_t) dim * 4);
+        for (int j2 = 0; j2 < nmtp; ++j2) block(c.n_layer + j2, hres, token, pos);
+        if (!logits_out && !hidden_out) return;
+        std::vector<float> xh((size_t) dim), xn((size_t) dim);
+        hc_head(hres.data(), hc, dim, out_hc_fn.f(), out_hc_scale.f(), out_hc_base.f(), c.rms_eps, c.hc_eps, xh.data());
+        if (hidden_out) *hidden_out = hres;
+        rmsnorm(xh.data(), outnorm.f(), c.rms_eps, dim, xn.data());
+        if (logits_out) { logits_out->assign((size_t) c.vocab, 0.f); mv(outw, xn.data(), logits_out->data()); }
+    }
+
+    /// Keep the MTP layers' KV state aligned with the main history: run them at `pos` with (token, hidden).
+    void mtp_prefill(int token, int pos, const float* hidden) { mtp_run(token, pos, hidden, nullptr, nullptr); }
+
+    /// Batched version for forward_chunk(): fused input from each token's (embedding, main residual streams), then the
+    /// MTP layers as batched blocks. h_h is consumed and left holding the last MTP layer's state.
+    void mtp_chunk(int T, int pos0) {
+        std::vector<float> x((size_t) T * dim);
+        for (int t = 0; t < T; ++t) mtp_fused_input(h_tk[t], h_h + (size_t) t * hc * dim, x.data() + (size_t) t * dim);
+        for (int t = 0; t < T; ++t)
+            for (int s = 0; s < hc; ++s) std::memcpy(h_h + ((size_t) t * hc + s) * dim, x.data() + (size_t) t * dim, (size_t) dim * 4);
+        for (int j2 = 0; j2 < nmtp; ++j2) block_batch(c.n_layer + j2, T, h_tk, pos0);
+    }
+
+    /// Snapshot the window-ring rows the draft span is about to overwrite (positions pos..pos+N-1, main AND MTP
+    /// layers). A rolled-back ring must hold exactly its pre-draft contents: attention at position p reads the whole
+    /// live window [p-win+1, p], and a single forward only rewrites ONE slot - every other clobbered slot would be
+    /// read as stale data before it is overwritten in turn.
+    void snap_rings(int pos, int N) {
+        ring_snaps.clear();
+        for (int l : all_layers) {
+            Layer& y = L[(size_t) l];
+            RingSnap rs{&y, {}, {}};
+            std::vector<char> seen((size_t) win, 0);
+            for (int p = pos; p < pos + N; ++p) {
+                const int s = ((size_t) p % win);
+                if (seen[(size_t) s]) continue;
+                seen[(size_t) s] = 1;
+                rs.slots.push_back(s);
+                rs.rows.insert(rs.rows.end(), &y.kvbuf[(size_t) s * hd], &y.kvbuf[(size_t) (s + 1) * hd]);
+            }
+            ring_snaps.push_back(std::move(rs));
+        }
+    }
+
+    /// Snapshot every compressor's rolling buffers (main AND MTP layers): on partial acceptance they are restored.
+    void snap_comps() {
+        ck_snaps.clear();
+        for (int l : all_layers) {
+            Layer& y = L[(size_t) l];
+            if (!y.ratio) continue;
+            for (Comp* cp : {&y.ac, &y.ic}) if (cp->ratio) { CompSnap s{cp, {}, {}}; s.kvs = cp->kvs; s.scs = cp->scs; ck_snaps.push_back(std::move(s)); }
+        }
+    }
+
+    /// Roll the KV state back to a live history of `n` tokens: truncate the history, restore the compressor rolling
+    /// buffers and fix up ring_pos. Stale rows from rejected positions are safe: attention only reads positions <= the
+    /// current one, each stale row is overwritten in order before it can be read, and every stale compressed entry is
+    /// recomputed exactly at the position where it first becomes readable (comp_step runs before index generation).
+    void rollback_kv(int n) {
+        cached.resize((size_t) n);
+        for (const RingSnap& rs : ring_snaps)
+            for (size_t i = 0; i < rs.slots.size(); ++i)
+                std::memcpy(&rs.ly->kvbuf[(size_t) rs.slots[i] * hd], &rs.rows[i * hd], (size_t) hd * 4);
+        ring_snaps.clear();
+        for (const CompSnap& s : ck_snaps) { s.cp->kvs = s.kvs; s.cp->scs = s.scs; }
+        ck_snaps.clear();
+        for (Layer& y : L) {
+            std::fill(y.ring_pos.begin(), y.ring_pos.end(), -1);
+            for (int p = std::max(0, n - win); p < n; ++p) y.ring_pos[(size_t)(p % win)] = p;
+        }
+    }
+
+    /// The request's own sampling distribution over the FULL vocabulary: the exact pipeline of Sampler::sample()
+    /// (penalties -> temperature -> top-k mask -> softmax -> top-p/min-p cut), returned as a probability vector
+    /// instead of a draw. Pruned tokens carry 0; survivors are renormalised, exactly like the roulette does implicitly.
+    /// `hist_len` is how many history tokens the penalties may see (the verify positions sit inside the draft span).
+    std::vector<float> target_probs(const float* lg, const SampleOpts& so, int hist_len) {
+        std::vector<float> buf((size_t) c.vocab);
+        std::copy(lg, lg + c.vocab, buf.begin());
+        const bool penal = (so.penalty_repeat != 1.0f || so.penalty_freq != 0.0f || so.penalty_present != 0.0f) &&
+                           so.penalty_last_n > 0;
+        if (penal) {
+            std::unordered_map<int, int> count;
+            const int w2 = std::min(hist_len, so.penalty_last_n);
+            for (int i = hist_len - w2; i < hist_len; ++i) {
+                const int t = cached[(size_t) i];
+                if (t >= 0 && t < c.vocab) ++count[t];
+            }
+            for (const auto& kv : count) {
+                float& x = buf[(size_t) kv.first];
+                if (so.penalty_repeat != 1.0f) x = x >= 0.0f ? x / so.penalty_repeat : x * so.penalty_repeat;
+                x -= so.penalty_freq * (float) kv.second;
+                x -= so.penalty_present;
+            }
+        }
+        if (!(so.temperature > 0.f)) {   // greedy: a one-hot at the argmax, no RNG
+            std::vector<float> p((size_t) c.vocab, 0.f);
+            int best = 0; for (int i = 1; i < c.vocab; ++i) if (buf[i] > buf[best]) best = i;
+            p[(size_t) best] = 1.f; return p;
+        }
+        std::vector<int> idx((size_t) c.vocab);
+        for (int i = 0; i < c.vocab; ++i) idx[(size_t) i] = i;
+        int keep = c.vocab;
+        if (so.top_k > 0 && so.top_k < c.vocab) {
+            keep = so.top_k;
+            std::nth_element(idx.begin(), idx.begin() + keep, idx.end(), [&](int a, int b) { return buf[a] > buf[b]; });
+            idx.resize((size_t) keep);
+        }
+        std::sort(idx.begin(), idx.end(), [&](int a, int b) { return buf[a] > buf[b]; });
+        const float inv_t = 1.0f / so.temperature;
+        const double m2 = (double) buf[idx[0]];
+        std::vector<double> e(idx.size());
+        double sum = 0.0;
+        for (size_t i = 0; i < idx.size(); ++i) { e[i] = std::exp(((double) buf[idx[i]] - m2) * inv_t); sum += e[i]; }
+        if (!(sum > 0.0) || !std::isfinite(sum)) {   // every logit was -inf/NaN: fall back to the argmax, as sample() does
+            std::vector<float> p((size_t) c.vocab, 0.f); p[(size_t) idx[0]] = 1.f; return p;
+        }
+        const double inv_sum = 1.0 / sum;
+        size_t cut = idx.size();
+        if (so.top_p > 0.f && so.top_p < 1.f) {
+            double acc2 = 0.0;
+            for (size_t i = 0; i < idx.size(); ++i) { acc2 += e[i]; cut = i + 1; if (acc2 >= (double) so.top_p) break; }
+        }
+        if (so.min_p > 0.f) {
+            const double lim = e[0] * inv_sum * (double) so.min_p;
+            while (cut > 1 && e[cut - 1] * inv_sum < lim) --cut;
+        }
+        std::vector<float> p((size_t) c.vocab, 0.f);
+        double tot = 0.0;
+        for (size_t i = 0; i < cut; ++i) { p[(size_t) idx[i]] = (float)(e[i] * inv_sum); tot += e[i]; }
+        const double renorm = 1.0 / tot;   // survivors renormalised, as the roulette does implicitly
+        for (size_t i = 0; i < cut; ++i) p[(size_t) idx[i]] = (float)(p[(size_t) idx[i]] * renorm);
+        return p;
+    }
+
+    /// One speculative step: draft up to spec_n tokens with the MTP module, verify them against the main model in a
+    /// single batched forward, and return the accepted sequence (always >= 1 token). See the header for semantics.
+    std::vector<int> spec_step(const float* cur_logits, const SampleOpts& so, Sampler* sampler, std::vector<float>* next_logits) {
+        if (nmtp == 0 || o.spec_n <= 0 || !cur_logits || !sampler) return {};
+        const int pos = (int) cached.size();
+        const int N = std::min(o.spec_n, o.ctx - pos);
+        if (N <= 0) return {};
+        st->spec_steps++;
+
+        // ---- Draft phase: up to N chained MTP steps. The MTP layers' KV state advances over positions pos..pos+N-1;
+        // the compressor snapshots taken here let us roll it back on partial acceptance.
+        snap_comps();
+        snap_rings(pos, N);
+        const bool sample_mode = so.temperature > 0.f;
+        std::vector<int> drafts((size_t) N);
+        std::vector<std::vector<float>> qlogits((size_t) N);   // MTP logits at each step (the draft distribution q)
+        std::vector<float> h_in = last_hidden, h_out((size_t)(hc * dim));
+        for (int j = 0; j < N; ++j) {
+            const int tok = (j == 0) ? cached[(size_t)(pos - 1)] : drafts[(size_t)(j - 1)];
+            mtp_run(tok, pos + j, h_in.data(), &qlogits[(size_t) j], &h_out);
+            if (!sample_mode) {
+                int best = 0; for (int v2 = 1; v2 < c.vocab; ++v2) if (qlogits[j][(size_t) v2] > qlogits[j][(size_t) best]) best = v2;
+                drafts[(size_t) j] = best;
+            } else {
+                // Draw the draft from q = softmax(mtp_logits / T) over the full vocabulary, on the request's RNG stream.
+                const float inv_t = 1.f / so.temperature;
+                double mx = -1e300; for (int v2 = 0; v2 < c.vocab; ++v2) mx = std::max(mx, (double) qlogits[j][(size_t) v2]);
+                double z = 0.0; for (int v2 = 0; v2 < c.vocab; ++v2) z += std::exp((qlogits[j][(size_t) v2] - mx) * inv_t);
+                if (!(z > 0.0)) { int best = 0; for (int v2 = 1; v2 < c.vocab; ++v2) if (qlogits[j][v2] > qlogits[j][best]) best = v2; drafts[(size_t) j] = best; }
+                else {
+                    double r = (double) sampler->next_uniform() * z, pick = 0;
+                    for (int v2 = 0; v2 < c.vocab; ++v2) { r -= std::exp((qlogits[j][(size_t) v2] - mx) * inv_t); if (r <= 0.0) { pick = v2; break; } }
+                    drafts[(size_t) j] = (int) pick;
+                }
+            }
+        }
+
+        // ---- Verify phase: one batched main-model forward over the draft tokens. The MTP layers are suspended here -
+        // their state was already advanced by drafting, and verification must only touch the main model's cache.
+        std::vector<std::vector<float>> Lg((size_t) N);
+        mtp_suspended = true;
+        forward_chunk_all(drafts.data(), N, pos, Lg);   // Lg[j] = logits after processing drafts[j] at position pos+j
+        mtp_suspended = false;
+
+        auto argm = [](const std::vector<float>& v) { int b2 = 0; for (size_t i = 1; i < v.size(); ++i) if (v[i] > v[b2]) b2 = (int) i; return b2; };
+        std::vector<int> out;   // ONLY the accepted drafts: every token in `out` is in the KV cache afterwards.
+        int acc = 0;
+        if (!sample_mode) {
+            // Greedy: accept while the main model's argmax agrees with the draft, stop at the first mismatch. The
+            // position right after the accepted span keeps its (already computed) verify logits as next_logits, so the
+            // "bonus" token materialises as the FIRST token of the next round - never emitted twice.
+            if (argm(std::vector<float>(cur_logits, cur_logits + c.vocab)) == drafts[0]) { out.push_back(drafts[0]); acc = 1; }
+            for (int j = 1; j < N && acc > 0; ++j)
+                if (argm(Lg[(size_t)(j - 1)]) == drafts[(size_t) j]) { out.push_back(drafts[(size_t) j]); ++acc; }
+        } else {
+            // Rejection sampling against q = softmax(mtp/T): exact when spec_min_p == 1.0; below that it accepts more
+            // (a controlled approximation). The target p_eff is the request's own pipeline distribution, so an accepted
+            // token is distributed exactly like a plain sample would be.
+            std::vector<std::vector<float>> peff((size_t) N);
+            peff[0] = target_probs(cur_logits, so, pos);
+            for (int j = 1; j < N; ++j) peff[(size_t) j] = target_probs(Lg[(size_t)(j - 1)].data(), so, pos + j);
+            while (acc < N) {   // stop at the first rejection
+                const std::vector<float>& q = qlogits[(size_t) acc];
+                const int x = drafts[(size_t) acc];
+                const float inv_t = 1.f / so.temperature;
+                double mx = -1e300; for (int v2 = 0; v2 < c.vocab; ++v2) mx = std::max(mx, (double) q[(size_t) v2]);
+                double z = 0.0; for (int v2 = 0; v2 < c.vocab; ++v2) z += std::exp((q[(size_t) v2] - mx) * inv_t);
+                const double qx = z > 0.0 ? std::exp((q[(size_t) x] - mx) * inv_t) / z : 0.0;   // q(x)
+                const float px = peff[(size_t) acc][(size_t) x];                                 // p_eff(x), 0 if pruned
+                const double ratio = qx > 0.0 ? (double) px / (qx * o.spec_min_p) : 0.0;        // accept probability min(1, ...)
+                if (ratio >= 1.0 || (double) sampler->next_uniform() < ratio) { out.push_back(x); ++acc; }
+                else break;   // rejected: the chain stops here
+            }
+        }
+
+        st->spec_drafts += (uint64_t) N;
+        st->spec_accepted += (uint64_t) acc;
+        if (std::getenv("DSV4_SPEC_DEBUG")) {
+            auto am2 = [](const std::vector<float>& v) { int b3 = 0; for (size_t i = 1; i < v.size(); ++i) if (v[i] > v[b3]) b3 = (int) i; return b3; };
+            std::fprintf(stderr, "[specdbg] pos=%d N=%d acc=%d drafts=[", pos, N, acc);
+            for (int j = 0; j < N; ++j) std::fprintf(stderr, "%s%d", j ? "," : "", drafts[(size_t) j]);
+            std::fprintf(stderr, "] argmax(cur)=%d Lg_argmax=", am2(std::vector<float>(cur_logits, cur_logits + c.vocab)));
+            for (int j = 0; j < N; ++j) std::fprintf(stderr, "%s%d", j ? "," : "", am2(Lg[(size_t) j]));
+            std::fprintf(stderr, "]\n");
+        }
+        if (acc < N) rollback_kv(pos + acc);   // roll main AND MTP KV state back to the accepted span
+
+        if (acc == 0) {
+            // Nothing was accepted: make progress exactly like plain decoding would - one token from `cur` plus a real
+            // forward (MTP included, on the rolled-back state). The RNG draw is the request's own pipeline distribution.
+            int tok;
+            if (!sample_mode) tok = argm(std::vector<float>(cur_logits, cur_logits + c.vocab));
+            else {
+                const std::vector<float> p = target_probs(cur_logits, so, pos);
+                double tot = 0.0; for (float v2 : p) tot += (double) v2;
+                tok = 0;
+                if (tot > 0.0) {
+                    double r = (double) sampler->next_uniform() * tot;
+                    for (int v2 = 0; v2 < c.vocab; ++v2) { r -= (double) p[(size_t) v2]; if (r <= 0.0) { tok = v2; break; } }
+                }
+            }
+            std::vector<float> lg((size_t) c.vocab);
+            forward(tok, pos, &lg);   // appends `tok` to the cache and advances MTP for it
+            out.push_back(tok);
+            if (next_logits) *next_logits = std::move(lg);
+        } else {
+            // next_logits: the verify distribution of the position right after the accepted span - its residual streams
+            // feed draft step 0 of the next round. When all N drafts were accepted this is the "free" last chunk logits.
+            if (next_logits) *next_logits = std::move(Lg[(size_t)(acc - 1)]);
+            const int hi = acc - 1;
+            if (verify_hs.size() >= (size_t)(hi + 1) * hc * dim)
+                last_hidden.assign(verify_hs.begin() + (size_t) hi * hc * dim, verify_hs.begin() + (size_t)(hi + 1) * hc * dim);
+        }
+        return out;
+    }
+
+    /// Batched forward returning the logit vector of EVERY position (the speculative verify). The MTP layers are NOT
+    /// run here - their state was already advanced by drafting, and verification must only touch the main cache.
+    int forward_chunk_all(const int* tokens, int T, int pos0, std::vector<std::vector<float>>& all_logits) {
+        if (T <= 0) return 0;
+        if (pf_cap <= 0 || T > pf_cap) {   // no batched scratch: sequential path, MTP suspended so verify stays clean
+            chunk_routing_n = 0;
+            std::fill(chunk_routing.begin(), chunk_routing.end(), -1);
+            mtp_suspended = true;
+            verify_hs.clear();
+            for (int t = 0; t < T; ++t) { forward(tokens[t], pos0 + t, &all_logits[(size_t) t]); verify_hs.insert(verify_hs.end(), last_hidden.begin(), last_hidden.end()); }
+            mtp_suspended = false;
+            return T;
+        }
+        auto t0 = Clock::now();
+        const int n = hc * dim;
+        for (int t = 0; t < T; ++t) {
+            float* e = h_e + (size_t) t * dim;
+            dequant_row(embd.type, embd.h + (size_t) tokens[t] * embd.rb, dim, e);
+            for (int j = 0; j < hc; ++j) std::memcpy(h_h + (size_t) t * n + (size_t) j * dim, e, (size_t) dim * 4);
+        }
+        for (int t = 0; t < T; ++t) h_tk[t] = tokens[t];
+        for (int t = 0; t < T; ++t) cached.push_back(tokens[t]);
+        for (int l = 0; l < nrun; ++l) block_batch(l, T, h_tk, pos0);
+        chunk_routing_n = T;
+        verify_hs.assign(h_h, h_h + (size_t) T * hc * dim);   // per-position residual streams of the verified span (feeds draft step 0)
+        all_logits.resize((size_t) T);
+        std::vector<float> x((size_t) dim), xn((size_t) dim);
+        for (int t = 0; t < T; ++t) {   // logits at EVERY position: the verify needs them all
+            hc_head(h_h + (size_t) t * n, hc, dim, out_hc_fn.f(), out_hc_scale.f(), out_hc_base.f(), c.rms_eps, c.hc_eps, x.data());
+            rmsnorm(x.data(), outnorm.f(), c.rms_eps, dim, xn.data());
+            all_logits[(size_t) t].assign((size_t) c.vocab, 0.f);
+            mv(outw, xn.data(), all_logits[(size_t) t].data());
+        }
+        st->total_s += secs(t0, Clock::now());
+        return T;
     }
 
     void end_token() { end_chunk(1); }
@@ -1584,7 +1980,7 @@ bool Model::save_kv(const std::string& path, std::string& err) const {
     const std::string fp = s.fingerprint();
     const int n = (int) s.cached.size(), HD = s.hd, WIN = s.win;
     auto write_header = [&](FILE* f, uint32_t nseg, uint64_t total) {
-        DskvHead h{{'D','S','K','V','0','0','0','2'}, (uint32_t) s.nrun, (uint32_t) HD, (uint32_t) WIN, (uint32_t) s.o.ctx, (uint32_t) fp.size(), nseg, total};
+        DskvHead h{{'D','S','K','V','0','0','0','2'}, (uint32_t) s.L.size(), (uint32_t) HD, (uint32_t) WIN, (uint32_t) s.o.ctx, (uint32_t) fp.size(), nseg, total};
         return fseeko(f, 0, SEEK_SET) == 0 && std::fwrite(&h, sizeof h, 1, f) == 1 && std::fwrite(fp.data(), 1, fp.size(), f) == fp.size();
     };
     auto write_seg = [&](FILE* f, int a, int e) {
@@ -1684,7 +2080,7 @@ bool Model::load_kv(const std::string& path, std::string& err) {
     if (std::fread(&h, sizeof h, 1, f) != 1 || std::memcmp(h.magic, "DSKV0002", 8) != 0) { std::fclose(f); err = "not a KV checkpoint"; return false; }
     std::string fp(h.fp_len, '\0');
     if (h.fp_len > 4096 || std::fread(&fp[0], 1, h.fp_len, f) != h.fp_len || fp != s.fingerprint() ||
-        h.n_layer != (uint32_t) s.nrun || h.hd != (uint32_t) s.hd || h.win != (uint32_t) s.win || h.ctx != (uint32_t) s.o.ctx) {
+        h.n_layer != (uint32_t) s.L.size() || h.hd != (uint32_t) s.hd || h.win != (uint32_t) s.win || h.ctx != (uint32_t) s.o.ctx) {
         std::fclose(f); err = "checkpoint belongs to another model/options"; return false;
     }
     if (h.n > (uint64_t) s.o.ctx) { std::fclose(f); err = "checkpoint has more tokens than --ctx"; return false; }
@@ -1743,6 +2139,15 @@ bool Model::load_kv(const std::string& path, std::string& err) {
     s.cached = std::move(toks);
     s.ck_path = path; s.ck_toks = s.cached; s.ck_segs = std::move(segs); s.ck_end = (uint64_t) end; s.ck_ok = true;
     return true;
+}
+
+int Model::mtp_layers() const { return p_ ? p_->nmtp : 0; }
+std::vector<float> Model::last_hidden_state() const { return p_ ? p_->last_hidden : std::vector<float>(); }
+std::vector<int> Model::spec_step(const float* cur_logits, const SampleOpts& so, Sampler* sampler, std::vector<float>* next_logits) {
+    return p_ ? p_->spec_step(cur_logits, so, sampler, next_logits) : std::vector<int>();
+}
+int Model::forward_chunk_all(const int* tokens, int n, int pos0, std::vector<std::vector<float>>& all_logits) {
+    return p_ ? p_->forward_chunk_all(tokens, n, pos0, all_logits) : 0;
 }
 
 std::vector<int> Model::cached_tokens() const { return p_ ? p_->cached : std::vector<int>(); }

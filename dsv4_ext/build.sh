@@ -67,6 +67,8 @@ if [ "$CUDA_ONLY" = 0 ]; then
     "$CXX" $FL $SRC tests/test_gpu_batch.cpp -o "$OUT/test_gpu_batch"
     # KV checkpoint + prefix reuse (ported from gptoss_ext): needs a tiny GGUF, so it runs below with the model.
     "$CXX" $FL $SRC tests/test_kv_checkpoint.cpp -o "$OUT/test_kv_checkpoint"
+    # MTP / speculative decoding golden test (needs the tiny GGUF, run below with the model).
+    "$CXX" $FL $SRC tests/test_mtp.cpp -o "$OUT/test_mtp"
 
     echo "==> Compiling dsv4_plan..."
     "$CXX" $FL $SRC src/dsv4_plan_main.cpp -o "$OUT/dsv4_plan"
@@ -101,6 +103,9 @@ if [ "$CUDA_ONLY" = 0 ] && [ "$HAVE_TINY" = 1 ]; then
 
     echo "==> Running KV checkpoint / prefix reuse tests..."
     "$OUT/test_kv_checkpoint" --model "$TINY/tiny.gguf"
+
+    echo "==> Running MTP / speculative decoding tests (draft parity, greedy parity, determinism, checkpoint)..."
+    "$OUT/test_mtp" --model "$TINY/tiny.gguf" --refdir "$TINY"
 fi
 
 if [ "$WITH_CUDA" = 1 ]; then

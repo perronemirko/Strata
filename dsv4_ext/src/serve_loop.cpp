@@ -273,22 +273,50 @@ int serve_loop(Model& m, const RunOpts& o, const std::vector<int>& eos_ids) {
         const auto tg = std::chrono::steady_clock::now();
         int generated = 0;
         std::string finish = "length";
-        for (int i = 0; i < max_new; ++i) {
-            const int tok = sampler.sample(logits.data(), (int) logits.size(), history);
-            std::printf("T %d\n", tok);
-            std::fflush(stdout);
-            history.push_back(tok);
-            ++generated;
-            if (std::find(stops.begin(), stops.end(), tok) != stops.end()) { finish = "stop"; break; }
-            std::string junk;
-            while (in.try_next(junk)) {
-                if (trim(junk) == "STOP") { stopped = true; break; }
+        // Speculative decoding (if the model has MTP layers and --spec N was given): one spec_step() emits >= 1 token
+        // per round - an MTP draft chain verified by a single batched main-model forward. Greedy requests stay exactly
+        // identical to plain decoding; sampled ones follow rejection sampling against the request's own distribution.
+        const bool spec_on = o.spec_n > 0 && m.mtp_layers() > 0;
+        if (spec_on) std::fprintf(stderr, "dsv4_run: speculative decoding ON (--spec %d, %d MTP layer(s))\n", o.spec_n, m.mtp_layers());
+        for (int i = 0; generated < max_new && !logits.empty(); ) {
+            if (!spec_on) {
+                const int tok = sampler.sample(logits.data(), (int) logits.size(), history);
+                std::printf("T %d\n", tok);
+                std::fflush(stdout);
+                history.push_back(tok);
+                ++generated;
+                if (std::find(stops.begin(), stops.end(), tok) != stops.end()) { finish = "stop"; break; }
+                std::string junk;
+                while (in.try_next(junk)) {
+                    if (trim(junk) == "STOP") { stopped = true; break; }
+                }
+                if (stopped) { finish = "cancel"; break; }
+                if (i + 1 >= max_new) break;
+                m.forward(tok, pos, &logits);
+                m.end_token();
+                ++pos;
+                ++i;
+            } else {
+                std::vector<float> nxt;
+                const std::vector<int> got = m.spec_step(logits.data(), so, &sampler, &nxt);
+                if (got.empty()) break;   // context exhausted
+                for (int tok : got) {
+                    std::printf("T %d\n", tok);
+                    std::fflush(stdout);
+                    history.push_back(tok);
+                    ++generated;
+                    if (std::find(stops.begin(), stops.end(), tok) != stops.end()) { finish = "stop"; break; }
+                }
+                m.end_chunk((int) got.size());
+                pos += (int) got.size() - 1;   // the last emitted token is not in the cache yet: it is verified next round
+                logits = std::move(nxt);
+                if (finish == "stop") break;
+                std::string junk;
+                while (in.try_next(junk)) {
+                    if (trim(junk) == "STOP") { stopped = true; break; }
+                }
+                if (stopped) { finish = "cancel"; break; }
             }
-            if (stopped) { finish = "cancel"; break; }
-            if (i + 1 >= max_new) break;
-            m.forward(tok, pos, &logits);
-            m.end_token();
-            ++pos;
         }
         const double decode_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tg).count();
         {   // the last generated tokens, decoded: was the end an EOS, or the max_new cap?

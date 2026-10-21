@@ -90,6 +90,15 @@ public:
      */
     const SampleOpts& opts() const { return o_; }
 
+    /**
+     * @brief Draw one uniform random float in [0, 1) from this sampler's private stream.
+     *
+     * Exposed for speculative decoding: the acceptance decisions (draft roulette + rejection coin) must
+     * consume the SAME xorshift64* stream as sample() would, so a fixed seed replays identically with or
+     * without --spec. Every draw advances the state exactly like an internal one.
+     */
+    float next_uniform();
+
 private:
     /** Initialize RNG state from seed or system clock + address entropy. */
     void init_rng();

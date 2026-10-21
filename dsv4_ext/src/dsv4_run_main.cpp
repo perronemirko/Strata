@@ -44,6 +44,10 @@ static void usage() {
         "  --expert-ram all|profile  'all' copies every expert to RAM (default: profile only)\n"
         "  --ram-cache-mib M         host-RAM LRU arena for MISS experts (default 8192, 0 = read straight from disk)\n"
         "  --prefill-chunk N         prompt tokens per batched forward (default 256, 0 = one token per pass)\n"
+        "  --spec N                  speculative decoding: draft up to N tokens with the MTP module and verify them in\n"
+        "                            ONE batched main-model forward (N=0 off; needs a model with extra/MTP layers)\n"
+        "  --spec-min-p F            acceptance threshold for sampled drafts (default 1.0 = exact rejection sampling)\n"
+        "  --mtp FILE|auto           load the MTP module from a separate GGUF file ('auto' = look inside the model shards)\n"
         "  --kv-checkpoint F       KV cache checkpoint (DSKV0002): restored at start, rewritten after every request\n"
         "  -k FMT / --key-format   format of the cached KV rows: e4m3 | f16 | f32 (default f32; e4m3 = 1/4 the memory)\n"
         "  -v FMT / --value-format must match -k (DSv4 caches ONE fused row per token)   --kv-unified accepted for parity\n"
@@ -109,6 +113,9 @@ int main(int argc, char** argv) {
         else if (a == "--expert-ram") o.ram_all = std::string(next()) == "all";
         else if (a == "--ram-cache-mib") o.ram_cache_mib = std::atoll(next());
         else if (a == "--prefill-chunk") o.prefill_chunk = std::atoi(next());
+        else if (a == "--spec") { o.spec_n = std::atoi(next()); if (o.spec_n < 0) { std::fprintf(stderr, "error: --spec must be >= 0\n"); return 2; } }
+        else if (a == "--spec-min-p") { o.spec_min_p = (float) std::atof(next()); if (!(o.spec_min_p > 0.f && o.spec_min_p <= 1.f)) { std::fprintf(stderr, "error: --spec-min-p must be in (0, 1]\n"); return 2; } }
+        else if (a == "--mtp") o.mtp_path = next();
         else if (a == "--kv-checkpoint") o.kv_checkpoint = next();
         else if (a == "-k" || a == "--key-format") { std::string v = next(); if (!parse_kv_format(v, o.key_format)) { std::fprintf(stderr, "error: invalid -k format '%s' (use e4m3, f16, f32)\n", v.c_str()); return 2; } }
         else if (a == "-v" || a == "--value-format") { std::string v = next(); if (!parse_kv_format(v, o.value_format)) { std::fprintf(stderr, "error: invalid -v format '%s' (use e4m3, f16, f32)\n", v.c_str()); return 2; } }
@@ -131,6 +138,7 @@ int main(int argc, char** argv) {
     auto t0 = std::chrono::steady_clock::now();
     if (!m.load(shards, o, err)) { std::fprintf(stderr, "error: %s\n", err.c_str()); return 1; }
     std::fprintf(stderr, "loaded in %.1f s (%s)\n", std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(), o.gpu ? (gpu::is_emulated() ? "GPU EMULATED on CPU" : "CUDA") : "CPU only");
+    if (o.spec_n > 0 && m.mtp_layers() == 0) { std::fprintf(stderr, "note: --spec %d requested but the model has no MTP/extra layers: speculative decoding OFF\n", o.spec_n); o.spec_n = 0; }
     // KV checkpoint: restore what a previous run left behind (the file must exist; a mismatched one is refused and ignored).
     if (!o.kv_checkpoint.empty()) {
         FILE* probe = std::fopen(o.kv_checkpoint.c_str(), "rb");
@@ -221,15 +229,36 @@ int main(int argc, char** argv) {
     Sampler sampler(so);
     std::vector<int> history = prompt;
     const std::vector<std::string>& vocab = m.tokens();
-    for (int i = 0; i < n_predict; ++i) {
-        next_tok = logits.empty() ? -1 : sampler.sample(logits.data(), (int) logits.size(), history);
-        if (next_tok < 0) break;
-        std::printf(" %d", next_tok); std::fflush(stdout);
-        if ((size_t) next_tok < vocab.size()) text += decode_token_text(vocab[(size_t) next_tok]);
-        history.push_back(next_tok);
-        ++produced;
-        if (std::find(stops.begin(), stops.end(), next_tok) != stops.end()) break;
-        if (i + 1 < n_predict) step(next_tok, true);
+    // Speculative decoding replaces the sample+forward cycle with spec_step(): one MTP draft chain + one batched
+    // verify per round, emitting >= 1 token. The dumps are per-token artifacts of the plain path, so they disable it.
+    bool spec_on = o.spec_n > 0 && m.mtp_layers() > 0;
+    if (spec_on && (!dump_routing.empty() || !dump_logits.empty())) { std::fprintf(stderr, "note: --dump-routing/--dump-logits are incompatible with --spec: speculative decoding OFF\n"); spec_on = false; }
+    if (spec_on) std::fprintf(stderr, "dsv4_run: speculative decoding ON (--spec %d, %d MTP layer(s), min-p %.2f)\n", o.spec_n, m.mtp_layers(), o.spec_min_p);
+    for (int i = 0; produced < n_predict && !logits.empty(); ) {
+        if (!spec_on) {
+            next_tok = sampler.sample(logits.data(), (int) logits.size(), history);
+            if (next_tok < 0) break;
+            std::printf(" %d", next_tok); std::fflush(stdout);
+            if ((size_t) next_tok < vocab.size()) text += decode_token_text(vocab[(size_t) next_tok]);
+            history.push_back(next_tok);
+            ++produced;
+            if (std::find(stops.begin(), stops.end(), next_tok) != stops.end()) break;
+            if (i + 1 < n_predict) step(next_tok, true);
+            ++i;
+        } else {
+            std::vector<float> nxt;
+            const std::vector<int> got = m.spec_step(logits.data(), so, &sampler, &nxt);
+            if (got.empty()) break;   // context exhausted: nothing more can be drafted or verified
+            for (int tok : got) {
+                std::printf(" %d", tok); std::fflush(stdout);
+                if ((size_t) tok < vocab.size()) text += decode_token_text(vocab[(size_t) tok]);
+                history.push_back(tok);
+                ++produced;
+                if (std::find(stops.begin(), stops.end(), tok) != stops.end()) break;
+            }
+            m.end_chunk((int) got.size());   // adaptive VRAM swaps + token accounting for the verified span
+            logits = std::move(nxt);         // distribution of the next position, straight from the verify chunk
+        }
     }
 
     const double gen_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - tg).count();

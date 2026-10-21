@@ -93,6 +93,44 @@ Check it before trusting it - it needs no GPU and takes seconds:
 It runs the same prompt one token at a time and in chunks of 1, 2, 3, 4, 5 and 8, and fails if the
 routing of the last token differs or a logit moves by more than 1e-4.
 
+### MTP / speculative decoding (`--spec N`)
+
+DeepSeek-V3-style multi-token prediction: when the GGUF declares extra layers beyond `block_count`
+(`compress_ratios` longer than `n_layer`, i.e. `n_extra_layers > 0`) and `--spec N` is given, those layers
+are loaded as full layers (their own KV ring + compressor) and used to draft up to N tokens per round; the
+main model then verifies every draft in a single batched forward (`forward_chunk_all`).
+
+- **Alignment.** With speculation on, the extra layers run at EVERY position - prefill included - with input
+  `eh_proj(concat(enorm(embedding), hnorm(hidden)))` (the fusion tensors `mtp.enorm/hnorm/eh_proj`,
+  auto-detected; without them the head-combined hidden state is used). Their KV state always tracks the main
+  history, so `save_kv`/`load_kv` capture it automatically and a checkpoint taken mid-speculation restores it.
+- **Drafting.** Step 0 feeds (last real token, last main hidden state); each next step feeds its own draft
+  plus the MTP residual streams of the previous one. Greedy requests take argmax; sampled ones draw from
+  `softmax(mtp_logits / T)` on the request's RNG stream.
+- **Acceptance.** Greedy: accept while the main model's argmax agrees with the draft - the emitted stream is
+  then *bit-identical* to plain decoding. Sampled: rejection sampling against the request's own pipeline
+  distribution; `--spec-min-p F` relaxes acceptance (`F < 1.0` = faster, approximate). When nothing was
+  accepted one token is sampled from the current logits and forwarded, so a round always emits >= 1 token.
+- **Rollback.** On partial acceptance the window rings are truncated in place (stale rows are overwritten in
+  order before they can be read) and every compressor's rolling buffers - main *and* MTP layers alike - are
+  restored from snapshots taken before drafting.
+
+The separate-file case: `--mtp FILE` merges a second GGUF that holds only the MTP tensors (its metadata is
+ignored; architecture + embedding length must match, duplicate tensor names are refused).
+
+    ./build-out/dsv4_run --model m.gguf --spec 4                              # greedy, exact
+    ./build-out/dsv4_run --model m.gguf --spec 4 --temp 0.8 --spec-min-p 1.0  # sampled, exact rejection
+    DSV4_SPEC_DEBUG=1 ...                                                     # per-round drafts/acceptance on stderr
+
+`tests/test_mtp.cpp` (built by `build.sh`, registered as the `mtp` CTest) checks draft parity against the
+numpy reference of `tools/tiny_model.py`, greedy stream identity with and without speculation, sampled
+determinism per seed, emission bounds [1, N+1], and a KV checkpoint taken mid-speculation.
+
+> Note: drafts are a *proposal* distribution - correctness never depends on their quality, only verification
+> does (it always uses the main model's true distributions). The drafting offset above follows "the MTP input
+> for token t is processed at position t"; if acceptance rates come out low on a trained DSv3 GGUF, shifting
+> that offset by one position is the first thing to try.
+
 ### KV checkpoint and cache formats (ported from gptoss_ext)
 
 `--kv-checkpoint FILE` makes the engine remember what it has already computed. The file (magic
@@ -235,4 +273,6 @@ Protocol (`dsv4/serve_loop.hpp`):
 | Sampler (temperature, top-k, top-p, min_p, repeat/freq/presence penalties, seed) | WRITTEN (`src/sampler.cpp`) | replaces the hardcoded argmax; greedy still the default |
 | `--serve` engine loop + `tools/serve_dsv4.py` (OpenAI /v1, Anthropic /v1/messages, web app) | WRITTEN, NOT RUN | links clean; the protocol matches `serve/server.py:533` line for line |
 | Batched prefill (`--prefill-chunk`, `row_dots`, `gpu::matmul`, `gpu::experts_batch`, window snapshot) | WRITTEN, COMPILES (g++-10 host + nvcc 12.8 sm_89), NOT RUN | `tests/test_prefill_batch.cpp` compares it token-by-token against the sequential path on the tiny GGUF; needs `python3 tools/tiny_model.py` first |
+| MoE batched routing with duplicate hash entries (`moe_batch`) | FIXED (ASan heap overflow) | a token routed twice to the same expert overflowed the per-T arena bucket: slots are now merged by weight summing (exact, the expert output is linear in its weight), buckets stay <= T tokens wide, and the routing trace records the original pre-merge indices like the sequential path does |
+| MTP / speculative decoding (`--spec N`, `--mtp FILE`) | WRITTEN, TESTED on the tiny GGUF (CPU) | `tests/test_mtp.cpp`: draft parity vs numpy, greedy stream identity with/without spec (sequential AND batched verify), sampled determinism per seed, emission bounds [1,N+1], checkpoint mid-speculation; CUDA build compiles, not run. Rollback restores ring rows + compressor rolling buffers; the tiny fixture's correction reference rolls its own KV state back like C++ does |
 | Tokenizer strings kept whole (`kMaxStoredStrs` 16 -> 2M) | WRITTEN | 16 entries truncated the 129280-entry vocab: every answer decoded to "" |

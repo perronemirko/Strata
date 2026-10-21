@@ -33,6 +33,7 @@
 #include "dsv4/config.hpp"
 #include "dsv4/mem_plan.hpp"
 #include "dsv4/kv_quant.hpp"
+#include "dsv4/sampler.hpp"
 #include <string>
 #include <vector>
 #include <cstdint>
@@ -66,6 +67,9 @@ struct RunOpts {
     bool verify_slots = false;          ///< Verify VRAM slot assignments at load time.
     bool verbose = true;                ///< Print startup report: memory plan, profile, RAM/VRAM counts.
     int prefill_chunk = 256;            ///< Prefill batch size: 0 = disabled (one token at a time).
+    int spec_n = 0;                     ///< --spec N: speculative decoding with up to N MTP draft tokens per step (0 = off).
+    float spec_min_p = 1.0f;            ///< --spec-min-p P: acceptance threshold in sampling mode (1.0 = exact rejection sampling).
+    std::string mtp_path;               ///< --mtp FILE|auto: separate GGUF holding the MTP tensors ("auto" = detect them in the main shards).
     std::string kv_checkpoint;          ///< --kv-checkpoint FILE: restored at load, rewritten after every request.
     KVFormat key_format = KVFormat::F32;   ///< -k / --key-format: format of the cached (fused) KV rows (e4m3/f16/f32).
     KVFormat value_format = KVFormat::F32; ///< -v / --value-format: must match key_format - DSv4 caches one fused row per token.
@@ -94,6 +98,9 @@ struct Stats {
     double total_s = 0;                 ///< Total forward pass time in seconds.
     double cpu_miss_s = 0;              ///< Time spent computing MISS experts on CPU/host.
     double gpu_hit_s = 0;               ///< Time spent waiting for HIT experts on GPU/device.
+    uint64_t spec_steps = 0;            ///< Speculative steps executed (draft + verify rounds).
+    uint64_t spec_drafts = 0;           ///< Draft tokens proposed by the MTP module.
+    uint64_t spec_accepted = 0;         ///< Draft tokens accepted by the main model's verification.
 };
 
 /**
@@ -197,6 +204,39 @@ public:
      * @return Number of tokens actually processed (may be less than N if chunk exceeds limits).
      */
     int forward_chunk(const int* tokens, int n, int pos0, std::vector<float>* logits_out);
+
+    /**
+     * @brief Batched forward that returns the logit vector of EVERY position (speculative verify).
+     *
+     * Same arithmetic as forward_chunk(), but all_logits[t] receives the distribution produced after
+     * processing token t at position pos0 + t. The MTP layers are NOT run here: their state was already
+     * advanced by the drafting phase, and verification must only touch the main model's cache.
+     */
+    int forward_chunk_all(const int* tokens, int n, int pos0, std::vector<std::vector<float>>& all_logits);
+
+    /**
+     * @brief One speculative decoding step (requires MTP layers: mtp_layers() > 0).
+     *
+     * Drafts up to RunOpts::spec_n tokens with the MTP module, verifies them against the main model in a
+     * single batched forward, and returns the accepted token sequence - always at least one token (the
+     * current distribution's own sample/argmax when every draft is rejected). The KV cache (main AND MTP
+     * layers) is left exactly consistent with the returned tokens: on partial acceptance the compressor
+     * rolling buffers are rolled back and the history truncated.
+     *
+     * @param cur_logits  Distribution produced by the last forward()/forward_chunk() - it predicts the token
+     *                    at position cached_tokens().size(), i.e. the first draft's claim.
+     * @param so          Sampling options of the request (temperature, penalties, ...).
+     * @param sampler     The request's sampler: its RNG stream is consumed for every random decision, so a
+     *                    fixed seed replays identically with or without speculation.
+     */
+    /// @param next_logits Receives the distribution of the NEXT position (from the verify chunk) - feed it back in.
+    std::vector<int> spec_step(const float* cur_logits, const SampleOpts& so, Sampler* sampler, std::vector<float>* next_logits);
+
+    /** @brief Number of MTP (extra) layers loaded and executed: 0 when the model has none or --spec is off. */
+    int mtp_layers() const;
+
+    /** @brief The final hidden state [hc * dim] left by the last forward()/forward_chunk() - feeds draft step 0. */
+    std::vector<float> last_hidden_state() const;
 
     /**
      * @brief Save the KV cache and token history to a checkpoint file (magic DSKV0002).
