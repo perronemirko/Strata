@@ -197,7 +197,7 @@ VISION_START = "<|vision_start|>"
 # sets it; 0 turns it off.
 REPEAT_STOP_TOKENS = 256
 ANSWER_ROOM_MIN_CAP = 1024    # 0.1.45: from this max_tokens on, thinking without a budget is closed early enough to leave room to answer
-ANSWER_RESERVE_MIN = 512      # #984: the tokens kept for the answer when a thinking budget is cut down to fit max_tokens
+ANSWER_RESERVE_MIN = 1024      # #984: the tokens kept for the answer when a thinking budget is cut down to fit max_tokens
 # #123: what closes the thinking when it reaches reasoning_budget_tokens (the model's own end-of-thinking tag after it)
 # #1053 (opt-in "reasoning_close_retry": true): a reply that ends on its stop token still inside <think>, with no answer
 # and no call, is continued once with the thinking closed (the same way the budget's wrap-up closes it)
@@ -3770,10 +3770,24 @@ class Service:
         self.restore_after_load = None                    # a session file an image job saved before it unloaded
         self.stop_ids = set(tokenizer.encode(IM_END, parse_special=True) +
                             tokenizer.encode("<|endoftext|>", parse_special=True))
-        # #567: a prompt re-encodes only what follows the last special token it shares with a recent prompt (the
-        # same ids as a full encode: tools/strata_tokenizer.py PromptEncoder).  Tokenizers without resume points
-        # encode in full.
-        self.prompts = None
+        # The ids that end a turn.  A literal that is not one control token in THIS vocabulary is not a
+        # stop: its spelling's pieces (<|im_end|> in gpt-oss's o200k_harmony: 27,91,321,13707,91,29) are
+        # ordinary text ids an answer can contain.  What closes the turn is the vocabulary's own eos
+        # (200002 there): the engine stops on it and prints it as one T line, so the frontend must read
+        # it as the end, or the answer is reported as cut by max tokens ("length") instead of "stop".
+        known = getattr(tokenizer, "special_tokens", None)
+        if known is None:                               # a test tokenizer that only names its controls
+            controls = getattr(tokenizer, "control_tokens", None)
+            known = {lit: tokenizer.encode(lit, parse_special=True)[0] for lit in controls} if controls else None
+        self.stop_ids = set()
+        for lit in (IM_END, "<|endoftext|>"):
+            if known is None:
+                self.stop_ids.update(tokenizer.encode(lit, parse_special=True))
+            elif lit in known:
+                self.stop_ids.add(known[lit])
+        eos = (getattr(tokenizer, "special_ids", None) or {}).get("tokenizer.ggml.eos_token_id")
+        if isinstance(eos, int) and not isinstance(eos, bool) and eos >= 0:
+            self.stop_ids.add(eos)
         if hasattr(tokenizer, "encode_marked") and hasattr(tokenizer, "max_special_len"):
             from strata_tokenizer import PromptEncoder
             # one kept prompt per conversation the engine's cache can hold (--conversation-cache-slots); the
@@ -3781,7 +3795,7 @@ class Service:
             slots = conversation_slots(engine)
             self.prompts = PromptEncoder(tokenizer, keep=slots) if slots is not None and slots > 0 \
                 else PromptEncoder(tokenizer)
-
+                
     def loaded(self) -> bool:
         return not hasattr(self.engine, "alive") or self.engine.alive()
 
@@ -4648,7 +4662,40 @@ class Service:
         # `cancel` (#1999): set when the client hangs up; the downloads, the wait for the turn and the encodes stop
         # between pictures and raise ClientGone
         fetched = self._note_unreadable_tool_images(messages, cancel)
-        ids = encoded_ids = self.encode_prompt(messages, tools, kwargs)
+        # --- FIX LATO SERVER: Normalizza la struttura dei tools ---
+        normalized_tools = []
+        if tools:
+            for tool in tools:
+                # Se il tool non ha la chiave 'function', la creiamo noi per il template
+                if isinstance(tool, dict) and "function" not in tool:
+                    # Se il tool ha già 'name', lo avvolgiamo dentro 'function'
+                    if "name" in tool:
+                        normalized_tools.append({"type": "function", "function": tool})
+                    else:
+                        normalized_tools.append(tool)
+                else:
+                    normalized_tools.append(tool)
+            tools = normalized_tools
+
+        # Se necessario, fai lo stesso controllo dentro i 'messages' per le 'tool_calls'
+        for msg in messages:
+            if isinstance(msg, dict) and "tool_calls" in msg and msg["tool_calls"]:
+                # Se tool_calls è una lista (standard) o un singolo dizionario
+                calls = msg["tool_calls"] if isinstance(msg["tool_calls"], list) else [msg["tool_calls"]]
+                normalized_calls = []
+                for call in calls:
+                    if isinstance(call, dict) and "function" not in call:
+                        normalized_calls.append({
+                            "id": call.get("id", "call_unknown"),
+                            "type": "function",
+                            "function": call
+                        })
+                    else:
+                        normalized_calls.append(call)
+                msg["tool_calls"] = normalized_calls
+        # --------------------------------------------------------
+        
+        ids = self.encode_prompt(messages, tools, kwargs)
         if force and kwargs.get("enable_thinking", True) is False:
             ids = ids + self.tok.encode(force, parse_special=True)
         self.embeddings.path = None
@@ -8103,7 +8150,11 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
             tokens[i] = t
         merges = (tpath / "merges.txt").read_text(encoding="utf-8").split("\n")
         types = json.loads((tpath / "token_type.json").read_text())
-        tok = ST.Tokenizer(tokens, merges, types)
+        # the tokenizer's own special ids (eos, pad): a model whose vocabulary is not the Qwen one
+        # (gpt-oss's o200k_harmony) ends its turns on ids this pack only says here
+        special_ids = (json.loads((tpath / "tokenizer.json").read_text(encoding="utf-8")).get("special_ids")
+                       if (tpath / "tokenizer.json").exists() else None)
+        tok = ST.Tokenizer(tokens, merges, types, special_ids=special_ids)
     hub = hub_from_config(cfg, a.mcp_config)            # before the minutes of loading: a bad entry stops here
     if a.offline and (hub is not None or cfg.get("before_load") or a.before_load):
         ap.error("--offline requires MCP servers and before_load commands to be disabled in this profile")
