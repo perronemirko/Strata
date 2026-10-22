@@ -2,9 +2,29 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstring>
+#include <iomanip>
 #include <sstream>
 
 namespace dsv4 {
+
+// MemAvailable from /proc/meminfo, in bytes, or -1 when the file is not there (Windows, macOS).
+// MemAvailable is the kernel's own answer to "what can I still allocate without swapping": it already
+// subtracts what the other processes hold and counts back only the page-cache entries it can evict,
+// which is exactly the figure a load that wants tens of GiB of private RAM needs. MemTotal - free
+// would be wrong: it charges the page cache of the model's own shards as if it were lost.
+int64_t host_mem_available_bytes() {
+    FILE* f = std::fopen("/proc/meminfo", "r");
+    if (!f) return -1;
+    char key[64];
+    long long kb = 0;
+    int64_t avail = -1;
+    while (std::fscanf(f, "%63s %lld kB", key, &kb) == 2) {
+        if (std::strcmp(key, "MemAvailable:") == 0) { avail = kb * 1024LL; break; }
+    }
+    std::fclose(f);
+    return avail;
+}
 
 MemPlan plan_expert_memory(const MemPlanInput& in) {
     MemPlan p;
@@ -31,6 +51,16 @@ MemPlan plan_expert_memory(const MemPlanInput& in) {
         return p;
     }
     p.budget_expert = p.libera - p.fixed;
+
+    // The host-RAM side of the plan. It never fails the plan: RAM that is over-demanded is paid
+    // for in swap, and the engine still answers - it just answers slowly, and a load that swaps
+    // for longer than serve/server.py's ENGINE_READY_S is reported as EngineDied. What this block
+    // decides is whether the caller has to say so before it starts, instead of after 900 s.
+    if (in.host_mem_available >= 0) {
+        p.host_budget = in.host_mem_available - in.host_ram_reserve;
+        p.host_demand = (int64_t) in.ram_expert_bytes + (int64_t) in.ram_cache_bytes;
+        p.host_over = p.host_demand > p.host_budget;
+    }
 
     std::vector<int> active_idx;
     for (int l = 0; l < L; ++l) if (in.bytes_per_expert[(size_t) l] != 0) active_idx.push_back(l);
@@ -122,6 +152,24 @@ std::string plan_report(const MemPlanInput& in, const MemPlan& p) {
                   (long long) p.slots_total, (long long) (p.all_expert_bytes ? (int64_t) in.n_expert * std::count_if(in.bytes_per_expert.begin(), in.bytes_per_expert.end(), [](uint64_t b) { return b != 0; }) : 0),
                   p.all_resident ? "ALL RESIDENT: fast path" : "tiered: hit/miss", lo == (1 << 30) ? 0 : lo, hi,
                   mib((int64_t) p.slot_bytes_total), mib((int64_t) in.ram_expert_bytes));
+    // The host-RAM lines only when the machine could be measured: on a system without /proc/meminfo
+    // there is nothing honest to say, and a line of zeros would read as "no RAM left".
+    if (in.host_mem_available >= 0) {
+        std::ostringstream e;
+        e << "host RAM free:   " << std::setw(8) << (p.host_budget >> 20) << " MiB (MemAvailable minus the reserve)\n"
+          << "host RAM wanted: " << std::setw(8) << (p.host_demand >> 20) << " MiB (expert copy + LRU arena)\n";
+        if (p.host_over) {
+            // The line that turns a 900 s silence into a sentence the operator can act on. The engine
+            // still loads and still answers; it pays for the over-demand in swap, and a load that
+            // swaps is exactly what serve/server.py reports as "did not report READY within 900 s".
+            e << "WARNING: the expert tiers want " << (p.host_demand >> 20) << " MiB of host RAM while the machine can hand out "
+              << (p.host_budget >> 20) << " MiB: this load swaps " << ((p.host_demand - p.host_budget) >> 20)
+              << " MiB. Shrink the arena (--ram-cache-mib "
+              << (std::max<int64_t>(0, p.host_budget - (int64_t) in.ram_expert_bytes) >> 20)
+              << "), or drop --expert-ram all and let the profile keep only the experts it has already seen.\n";
+        }
+        return std::string(buf) + e.str();
+    }
     return buf;
 }
 

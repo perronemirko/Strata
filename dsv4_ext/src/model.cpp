@@ -6,6 +6,8 @@
 #include "dsv4/mtp_adapter.hpp"
 #include "dsv4/ops.hpp"
 #include "dsv4/st_header.hpp"
+#include "dsv4/draft_policy.hpp"
+#include "dsv4/suffix_drafter.hpp"
 
 #include <fcntl.h>
 #include <sys/mman.h>
@@ -235,6 +237,13 @@ struct Model::Impl {
     bool mtp_suspended = false;            // true while a verify chunk runs: forward() must not touch MTP state
     std::vector<float> verify_hs;          // [T][hc*dim] residual streams left by the last forward_chunk_all (verify)
     struct CompSnap { Comp* cp; std::vector<float> kvs, scs; };   // rolling-buffer snapshot for speculative rollback
+    // ---- prompt-lookup drafter + adaptive window policy (the divergences the paper's spec has and
+    // this engine lacked: see SPEC_STRATA_VERIFIED.md section 6). Both only choose WHICH drafts to
+    // verify: the verify window decides every emitted token, so the output is unchanged. ----
+    std::unique_ptr<SuffixDrafter> sfx;      ///< trigram-indexed lookup drafter (null = off)
+    std::unique_ptr<DraftPolicy> policy;     ///< per-round MTP-vs-lookup window choice (null = off)
+    size_t sfx_synced = 0;                   ///< committed tokens already appended to the drafter's history
+    uint64_t spec_rounds = 0;                ///< rounds run with the policy (for the report)
     // `last_pos[i]` is the LAST draft position that writes slot `slots[i]`. A slot whose last draft
     // write came from an ACCEPTED position already holds the right row (the accepted token is the
     // verified token) and must be kept; only slots last written by a REJECTED position are stale.
@@ -940,6 +949,15 @@ struct Model::Impl {
                     std::fprintf(stderr, "note: no staging pool for MISS experts (%zu bytes): they stay on the host\n", need);
             }
         }
+        // ---- prompt-lookup drafter + adaptive window policy (the divergences the paper's spec has
+        // and this engine lacked; see SPEC_STRATA_VERIFIED.md section 6). The drafter indexes the
+        // committed history; the policy learns round costs and acceptances online. Both are per-run
+        // state: reset() drops the history, the policy keeps what it learned (it is machine-shaped).
+        if (o.suffix_draft > 0)
+            sfx = std::make_unique<SuffixDrafter>(3, 64, (size_t) o.ctx + 4096);
+        if (o.spec_adaptive)
+            policy = std::make_unique<DraftPolicy>(std::max(o.spec_n, o.suffix_draft + 1), 0.03);
+        sfx_synced = 0;
         reset();
 
         // ---- expert residency plan: VRAM slots per layer from --expert-vram-pct / --expert-cache
@@ -948,12 +966,50 @@ struct Model::Impl {
             if (profile_load(o.profile_in, perr)) have_profile = true;
             else std::fprintf(stderr, "warning: incompatible expert profile (%s): starting without profile\n", perr.c_str());
         }
+        // What the RAM copy below WILL actually hold, counted exactly as its own loop counts it:
+        // --expert-ram all takes every expert, --expert-ram profile only the ones the profile has
+        // seen. This is the figure the host-RAM budget is checked against, so the plan and the
+        // copy cannot drift apart: one counts, the other allocates, and they use the same rule.
+        uint64_t ram_wanted_bytes = 0;
+        for (int l : all_layers) {
+            const Layer& y = L[(size_t) l];
+            if (y.bpe == 0) continue;
+            int n = 0;
+            for (int e = 0; e < c.n_expert; ++e)
+                if (o.ram_all || (have_profile && y.freq[(size_t) e] > 0)) ++n;
+            ram_wanted_bytes += (uint64_t) n * y.bpe;
+        }
+        // The arena the run will actually build. o is const: the clamp below writes here, and every
+        // later use of the arena size reads this, never o.ram_cache_mib. The arena is host memory
+        // in BOTH backends, so this clamp runs before the device branch: a --cpu run that asks for
+        // a 32 GiB arena on a machine that cannot hold one is the same mistake, and it deserves
+        // the same sentence.
+        long long ram_cache_mib = o.ram_cache_mib;
+        {
+            const int64_t avail = host_mem_available_bytes();
+            if (avail >= 0 && ram_cache_mib > 0) {
+                const int64_t budget = avail - (o.host_ram_reserve_mib << 20);
+                const int64_t room = budget - (int64_t) ram_wanted_bytes;
+                const long long fit_mib = room > 0 ? (long long) (room >> 20) : 0LL;
+                if (fit_mib < ram_cache_mib) {
+                    std::fprintf(stderr, "note: --ram-cache-mib %lld does not fit this machine: the expert copy alone wants %lld MiB "
+                                          "and only %lld MiB of host RAM are free, so the arena is clamped to %lld MiB.\n"
+                                          "      The load stays correct and slower on MISS experts. To load faster, lower --expert-ram all "
+                                          "or free the memory the other engines hold (--host-ram-reserve-mib %lld says what to leave alone).\n",
+                        ram_cache_mib, (long long) (ram_wanted_bytes >> 20), (long long) (budget >> 20), fit_mib,
+                        o.host_ram_reserve_mib);
+                    ram_cache_mib = fit_mib;
+                }
+            }
+        }
         if (o.gpu) {
             size_t fb = 0, tb = 0; gpu::mem_info(&fb, &tb);
             MemPlanInput in;
             in.vram_total = o.vram_total_mib >= 0 ? o.vram_total_mib << 20 : (int64_t) tb;
             in.vram_free = o.vram_free_mib >= 0 ? o.vram_free_mib << 20 : (int64_t) fb;
             in.reserve = o.reserve_mib << 20; in.n_expert = c.n_expert; in.pct = o.vram_pct; in.abs_slots = o.abs_slots;
+            in.host_ram_reserve = o.host_ram_reserve_mib << 20;
+            in.ram_cache_bytes = ram_cache_mib > 0 ? ((uint64_t) ram_cache_mib << 20) : 0;
             // No fixed costs here, and that is not an oversight: BOTH backends report free VRAM already net
             // of what this model has put on the card (the emulated one subtracts its own pool, cudaMemGetInfo
             // subtracts every cudaMalloc including ours and other processes'). The KV cache, the activations
@@ -966,10 +1022,15 @@ struct Model::Impl {
             // A layer the device cannot evaluate gets 0 bytes here, so the planner gives it no slots: VRAM
             // would be spent on experts that always end up computed on the host anyway. MTP layers count too.
             for (int l : all_layers) in.bytes_per_expert[(size_t) l] = L[(size_t) l].gpu_experts ? L[(size_t) l].bpe : 0;
-            in.ram_expert_bytes = inv.total_expert_bytes;
+            in.ram_expert_bytes = ram_wanted_bytes;
+            in.host_mem_available = host_mem_available_bytes();
             MemPlan pl = plan_expert_memory(in);
             if (!pl.ok) { err = pl.err; return false; }
             if (o.verbose) std::fprintf(stderr, "%s", plan_report(in, pl).c_str());
+            // The arena was already clamped above, before the device branch: it is host memory
+            // whichever backend runs. What is left for the plan to say is the over-demand that
+            // cannot be clamped away - the expert copy itself - and that is the WARNING in
+            // plan_report, printed right here.
             for (int l : all_layers) {
                 Layer& y = L[(size_t) l];
                 y.slots = pl.slots_layer[(size_t) l];
@@ -1056,11 +1117,11 @@ struct Model::Impl {
         // Without it a miss is a fresh mmap read of bpe bytes per expert per token, which on a model bigger
         // than RAM is a synchronous NTFS read on the critical path.
         uint64_t cache_bytes_plan = 0; int cache_slots_plan = 0;
-        if (o.ram_cache_mib > 0) {
+        if (ram_cache_mib > 0) {
             uint64_t sumb = 0;
             for (int l : all_layers) sumb += L[(size_t) l].bpe;
             if (sumb) {
-                const uint64_t budget = (uint64_t) o.ram_cache_mib << 20;
+                const uint64_t budget = (uint64_t) ram_cache_mib << 20;
                 const int q = (int) std::min<uint64_t>(budget / sumb, (uint64_t) c.n_expert);
                 for (int l : all_layers) L[(size_t) l].ncache = q;
                 uint64_t left = budget - (uint64_t) q * sumb;
@@ -1148,6 +1209,10 @@ struct Model::Impl {
             }
         }
         cached.clear(); ck_ok = false; ck_segs.clear(); ck_end = 0; ck_toks.clear();
+        // A new conversation: the lookup drafter's history starts empty (the policy keeps what it
+        // learned about this machine - round costs and acceptances are machine-shaped, not per-run).
+        if (sfx) sfx->reset();
+        sfx_synced = 0;
     }
 
     // ------------------------------------------------------------ attention
@@ -1913,24 +1978,68 @@ struct Model::Impl {
         return p;
     }
 
-    /// One speculative step: draft up to spec_n tokens with the MTP module, verify them against the main model in a
-    /// single batched forward, and return the accepted sequence (always >= 1 token). See the header for semantics.
+    /// One speculative step: draft up to spec_n tokens with the MTP module and/or take the prompt-lookup
+    /// drafter's proposal (the divergences the paper's spec has and this engine lacked: see
+    /// SPEC_STRATA_VERIFIED.md section 6), verify them against the main model in a single batched
+    /// forward, and return the accepted sequence (always >= 1 token). See the header for semantics.
+    /// The window's SIZE and SOURCE (MTP vs lookup vs chain) are the adaptive DraftPolicy's choice:
+    /// it only decides which drafts to verify, so the emitted stream stays bit-identical to plain
+    /// decoding for a greedy request whatever the policy picks.
     std::vector<int> spec_step(const float* cur_logits, const SampleOpts& so, Sampler* sampler, std::vector<float>* next_logits) {
-        if (nmtp == 0 || o.spec_n <= 0 || !cur_logits || !sampler) return {};
+        if ((nmtp == 0 || o.spec_n <= 0) && o.suffix_draft <= 0) return {};
+        if (!cur_logits || !sampler) return {};
         const int pos = (int) cached.size();
-        const int N = std::min(o.spec_n, o.ctx - pos);
-        if (N <= 0) return {};
+        const int room = o.ctx - pos;
+        if (room <= 0) return {};
         st->spec_steps++;
-
-        // ---- Draft phase: up to N chained MTP steps. The MTP layers' KV state advances over positions pos..pos+N-1;
-        // the compressor snapshots taken here let us roll it back on partial acceptance.
-        snap_comps();
-        snap_rings(pos, N);
+        const auto t_round0 = Clock::now();
         const bool sample_mode = so.temperature > 0.f;
+
+        // ---- Sync the lookup drafter's history with the committed tokens (the KV cache's view): every
+        // token the engine has confirmed is part of what a later match may repeat.
+        if (sfx) {
+            if (sfx_synced > cached.size()) { sfx->reset(); sfx_synced = 0; }
+            for (size_t i = sfx_synced; i < cached.size(); ++i) sfx->append((int32_t) cached[i]);
+            sfx_synced = cached.size();
+        }
+        // The MTP's own window, and the lookup proposal on the current history.
+        const int n_mtp_max = nmtp > 0 && o.spec_n > 0 ? std::min(o.spec_n, room) : 0;
+        std::vector<int32_t> lk_buf;
+        int lk = 0, lk_match = 0;
+        if (sfx) {
+            lk_buf.assign((size_t) std::max(8, o.suffix_draft), 0);
+            lk = sfx->propose(o.suffix_draft, lk_buf.data());
+            lk_match = sfx->last_match();
+        }
+        // ---- Window choice: the adaptive policy (Strata's DraftPolicy), or fixed --spec without one.
+        // The policy's `t` is the window size (the last accepted token + drafts); the engine verifies
+        // the t-1 draft tokens.
+        bool use_lookup = false;
+        int t_window = n_mtp_max + 1;
+        if (policy && (n_mtp_max > 0 || lk > 0)) {
+            DraftPolicy::Pick p = policy->choose(t_window, lk, lk_match);
+            t_window = p.t;
+            use_lookup = p.lookup;
+        } else if (!policy && n_mtp_max == 0 && lk > 0) {
+            // lookup-only (--suffix-draft without --spec and without a policy): take the proposal.
+            use_lookup = true;
+            t_window = std::min(lk + 1, room + 1);
+        }
+        t_window = std::min(std::max(t_window, 1), room + 1);
+        const int chain_cap = policy && !use_lookup && o.lookup_chain > 0 && sfx && room > t_window - 1
+                                ? std::min({o.lookup_chain, room - (t_window - 1), DraftPolicy::kMaxT - t_window}) : 0;
+        const int N = std::min(t_window - 1 + chain_cap, room);   // widest draft span the snapshots must cover
+
+        // ---- Draft phase: up to t_window-1 chained MTP steps (none for a lookup window). The MTP
+        // layers' KV state advances over positions pos..pos+t_window-2; the compressor snapshots taken
+        // here let us roll it back on partial acceptance. Skipped when no draft will be verified.
+        if (N > 0) { snap_comps(); snap_rings(pos, N); }
+        const int n_mtp = use_lookup ? 0 : t_window - 1;
         std::vector<int> drafts((size_t) N);
         std::vector<std::vector<float>> qlogits((size_t) N);   // MTP logits at each step (the draft distribution q)
+        double p_chain = 1.0;                                   // probability the whole MTP chain holds (the chain rule's input)
         std::vector<float> h_in = last_hidden, h_out((size_t)(hc * dim));
-        for (int j = 0; j < N; ++j) {
+        for (int j = 0; j < n_mtp; ++j) {
             const int tok = (j == 0) ? cached[(size_t)(pos - 1)] : drafts[(size_t)(j - 1)];
             mtp_run(tok, pos + j, h_in.data(), &qlogits[(size_t) j], &h_out);
             if (!sample_mode) {
@@ -1948,61 +2057,118 @@ struct Model::Impl {
                     drafts[(size_t) j] = (int) pick;
                 }
             }
+            // The chain rule's p_mtp: the drafts' own top probabilities under q, multiplied.
+            if (chain_cap > 0 && so.temperature > 0.f) {
+                const float inv_t = 1.f / so.temperature;
+                double mx = -1e300; for (int v2 = 0; v2 < c.vocab; ++v2) mx = std::max(mx, (double) qlogits[j][(size_t) v2]);
+                double z = 0.0; for (int v2 = 0; v2 < c.vocab; ++v2) z += std::exp((qlogits[j][(size_t) v2] - mx) * inv_t);
+                if (z > 0.0) p_chain *= std::exp((double) qlogits[j][(size_t) drafts[(size_t) j]] - mx) / z;
+            }
         }
+        // ---- --lookup-chain: the policy may append lookup tokens AFTER a full MTP window, continuing
+        // where the MTP's drafts end (propose_after). Verification keeps the output exact; only the
+        // round's speed is at stake.
+        int n_lk = 0;
+        if (use_lookup) {
+            n_lk = std::min(lk, t_window - 1);
+            for (int j = 0; j < n_lk; ++j) drafts[(size_t) j] = lk_buf[(size_t) j];
+        } else if (chain_cap > 0 && n_mtp == t_window - 1) {
+            std::vector<int32_t> lk2((size_t) std::max(8, o.lookup_chain));
+            const int k2 = sfx->propose_after(drafts.data(), n_mtp, o.lookup_chain, lk2.data());
+            const int m2 = sfx->last_match();
+            const int k = policy->chain(t_window, p_chain, std::min(k2, chain_cap), m2);
+            for (int j = 0; j < k; ++j) drafts[(size_t)(n_mtp + j)] = lk2[(size_t) j];
+            n_lk = k;
+            lk_match = m2;
+        }
+        const int W = n_mtp + n_lk;   // draft tokens actually verified (window size = W + 1)
 
-        // ---- Verify phase: one batched main-model forward over the draft tokens. The MTP layers are suspended here -
-        // their state was already advanced by drafting, and verification must only touch the main model's cache.
-        std::vector<std::vector<float>> Lg((size_t) N);
-        mtp_suspended = true;
-        forward_chunk_all(drafts.data(), N, pos, Lg);   // Lg[j] = logits after processing drafts[j] at position pos+j
-        mtp_suspended = false;
+        // ---- Verify phase (skipped when the policy asked for no drafts: the correction path below
+        // makes the same progress plain decoding would). The MTP layers are suspended here - their
+        // state was advanced by drafting (MTP part) or is caught up below (accepted lookup
+        // positions), and verification must only touch the main model's cache.
+        std::vector<std::vector<float>> Lg((size_t) std::max(W, 1));
+        if (W >= 1) {
+            mtp_suspended = true;
+            forward_chunk_all(drafts.data(), W, pos, Lg);   // Lg[j] = logits after processing drafts[j] at position pos+j
+            mtp_suspended = false;
+        }
 
         auto argm = [](const std::vector<float>& v) { int b2 = 0; for (size_t i = 1; i < v.size(); ++i) if (v[i] > v[b2]) b2 = (int) i; return b2; };
         std::vector<int> out;   // ONLY the accepted drafts: every token in `out` is in the KV cache afterwards.
         int acc = 0;
-        if (!sample_mode) {
+        if (W >= 1 && !sample_mode) {
             // Greedy: accept while the main model's argmax agrees with the draft, stop at the first mismatch. The
             // position right after the accepted span keeps its (already computed) verify logits as next_logits, so the
             // "bonus" token materialises as the FIRST token of the next round - never emitted twice.
             if (argm(std::vector<float>(cur_logits, cur_logits + c.vocab)) == drafts[0]) { out.push_back(drafts[0]); acc = 1; }
-            for (int j = 1; j < N && acc > 0; ++j)
+            for (int j = 1; j < W && acc > 0; ++j)
                 if (argm(Lg[(size_t)(j - 1)]) == drafts[(size_t) j]) { out.push_back(drafts[(size_t) j]); ++acc; }
-        } else {
+        } else if (W >= 1) {
             // Rejection sampling against q = softmax(mtp/T): exact when spec_min_p == 1.0; below that it accepts more
             // (a controlled approximation). The target p_eff is the request's own pipeline distribution, so an accepted
-            // token is distributed exactly like a plain sample would be.
-            std::vector<std::vector<float>> peff((size_t) N);
+            // token is distributed exactly like a plain sample would be. A lookup row has no q: "no q means point
+            // mass, never q = 0" (Strata's spec_prob.hpp) - the accept probability is p_eff(x) itself.
+            std::vector<std::vector<float>> peff((size_t) W);
             peff[0] = target_probs(cur_logits, so, pos);
-            for (int j = 1; j < N; ++j) peff[(size_t) j] = target_probs(Lg[(size_t)(j - 1)].data(), so, pos + j);
-            while (acc < N) {   // stop at the first rejection
-                const std::vector<float>& q = qlogits[(size_t) acc];
+            for (int j = 1; j < W; ++j) peff[(size_t) j] = target_probs(Lg[(size_t)(j - 1)].data(), so, pos + j);
+            while (acc < W) {   // stop at the first rejection
                 const int x = drafts[(size_t) acc];
-                const float inv_t = 1.f / so.temperature;
-                double mx = -1e300; for (int v2 = 0; v2 < c.vocab; ++v2) mx = std::max(mx, (double) q[(size_t) v2]);
-                double z = 0.0; for (int v2 = 0; v2 < c.vocab; ++v2) z += std::exp((q[(size_t) v2] - mx) * inv_t);
-                const double qx = z > 0.0 ? std::exp((q[(size_t) x] - mx) * inv_t) / z : 0.0;   // q(x)
                 const float px = peff[(size_t) acc][(size_t) x];                                 // p_eff(x), 0 if pruned
-                const double ratio = qx > 0.0 ? (double) px / (qx * o.spec_min_p) : 0.0;        // accept probability min(1, ...)
+                double ratio;
+                if (acc >= n_mtp) {
+                    ratio = (double) px / (double) o.spec_min_p;   // point-mass row (lookup draft)
+                } else {
+                    const std::vector<float>& q = qlogits[(size_t) acc];
+                    const float inv_t = 1.f / so.temperature;
+                    double mx = -1e300; for (int v2 = 0; v2 < c.vocab; ++v2) mx = std::max(mx, (double) q[(size_t) v2]);
+                    double z = 0.0; for (int v2 = 0; v2 < c.vocab; ++v2) z += std::exp((q[(size_t) v2] - mx) * inv_t);
+                    const double qx = z > 0.0 ? std::exp((q[(size_t) x] - mx) * inv_t) / z : 0.0;   // q(x)
+                    ratio = qx > 0.0 ? (double) px / (qx * o.spec_min_p) : 0.0;                     // accept probability min(1, ...)
+                }
                 if (ratio >= 1.0 || (double) sampler->next_uniform() < ratio) { out.push_back(x); ++acc; }
                 else break;   // rejected: the chain stops here
             }
         }
 
-        st->spec_drafts += (uint64_t) N;
+        st->spec_drafts += (uint64_t) W;
         st->spec_accepted += (uint64_t) acc;
         if (std::getenv("DSV4_SPEC_DEBUG")) {
             auto am2 = [](const std::vector<float>& v) { int b3 = 0; for (size_t i = 1; i < v.size(); ++i) if (v[i] > v[b3]) b3 = (int) i; return b3; };
-            std::fprintf(stderr, "[specdbg] pos=%d N=%d acc=%d drafts=[", pos, N, acc);
-            for (int j = 0; j < N; ++j) std::fprintf(stderr, "%s%d", j ? "," : "", drafts[(size_t) j]);
+            std::fprintf(stderr, "[specdbg] pos=%d W=%d acc=%d lookup=%d drafts=[", pos, W, acc, (int) use_lookup);
+            for (int j = 0; j < W; ++j) std::fprintf(stderr, "%s%d", j ? "," : "", drafts[(size_t) j]);
             std::fprintf(stderr, "] argmax(cur)=%d Lg_argmax=", am2(std::vector<float>(cur_logits, cur_logits + c.vocab)));
-            for (int j = 0; j < N; ++j) std::fprintf(stderr, "%s%d", j ? "," : "", am2(Lg[(size_t) j]));
+            for (int j = 0; j < W; ++j) std::fprintf(stderr, "%s%d", j ? "," : "", am2(Lg[(size_t) j]));
             std::fprintf(stderr, "]\n");
         }
-        if (acc < N) rollback_kv(pos + acc);   // roll main AND MTP KV state back to the accepted span
+        if (acc < W) rollback_kv(pos + acc);   // roll main AND MTP KV state back to the accepted span
+        // Accepted positions the drafting never covered (lookup drafts, or a chain shorter than its
+        // cap): catch the MTP layers up with the verified residual streams, in the draft convention
+        // (cell pos+j pairs the token at pos+j-1 with the main hidden at pos+j-1), so the next
+        // round's chain starts from the state plain decoding would have.
+        if (nmtp > 0) {
+            for (int j = n_mtp; j < acc; ++j) {
+                const int tok_prev = cached[(size_t)(pos + j - 1)];
+                const float* hid_prev = j == 0 ? last_hidden.data() : verify_hs.data() + (size_t)(j - 1) * hc * dim;
+                mtp_run(tok_prev, pos + j, hid_prev, nullptr, nullptr);
+            }
+        }
+        // The policy learns this round: its window, its accepted drafts, its measured time.
+        if (policy) {
+            const double ms = std::chrono::duration<double, std::milli>(Clock::now() - t_round0).count();
+            if (use_lookup || n_lk == 0)
+                policy->observe(use_lookup, W + 1, acc, lk_match, ms);
+            else
+                policy->observe_chain(t_window, n_lk, acc, lk_match, ms);
+            spec_rounds++;
+        }
+        // The drafter's history gains the committed tokens at the next sync (sfx_synced tracks the
+        // KV cache's view); nothing is appended here so a rejected draft never pollutes it.
 
         if (acc == 0) {
-            // Nothing was accepted: make progress exactly like plain decoding would - one token from `cur` plus a real
-            // forward (MTP included, on the rolled-back state). The RNG draw is the request's own pipeline distribution.
+            // Nothing was accepted (or no drafts were taken): make progress exactly like plain decoding would - one
+            // token from `cur` plus a real forward (MTP included, on the rolled-back state). The RNG draw is the
+            // request's own pipeline distribution.
             int tok;
             if (!sample_mode) tok = argm(std::vector<float>(cur_logits, cur_logits + c.vocab));
             else {

@@ -43,10 +43,19 @@ static void usage() {
         "  --expert-profile-save F   write the routing-frequency profile at the end (atomic)\n"
         "  --expert-ram all|profile  'all' copies every expert to RAM (default: profile only)\n"
         "  --ram-cache-mib M         host-RAM LRU arena for MISS experts (default 8192, 0 = read straight from disk)\n"
+        "  --host-ram-reserve-mib M  host RAM to leave alone for the OTHER processes on this machine (default 0).\n"
+        "                            The engine reads MemAvailable and clamps --ram-cache-mib to what is left: a load\n"
+        "                            that over-books RAM does not fail, it swaps, and a load that swaps for longer\n"
+        "                            than the caller's READY timeout is reported as a dead engine, not as an error.\n"
         "  --prefill-chunk N         prompt tokens per batched forward (default 256, 0 = one token per pass)\n"
         "  --spec N                  speculative decoding: draft up to N tokens with the MTP module and verify them in\n"
         "                            ONE batched main-model forward (N=0 off; needs a model with extra/MTP layers)\n"
         "  --spec-min-p F            acceptance threshold for sampled drafts (default 1.0 = exact rejection sampling)\n"
+        "  --suffix-draft N          prompt-lookup drafter: propose up to N tokens continuing an earlier repeat of the\n"
+        "                            context (code edits, quotes); the adaptive window policy (DraftPolicy) picks per\n"
+        "                            round between the MTP and the lookup window. Works with or without --spec. 0 = off\n"
+        "  --lookup-chain K          append up to K lookup tokens after a full MTP window (the chain rule of the same\n"
+        "                            policy). Needs --suffix-draft. 0 = off\n"
         "  --mtp FILE|auto           load the MTP module from a separate file: a GGUF, or a .safetensors file / HF\n"
         "                            snapshot DIRECTORY (the draft head only; the main model stays the GGUF)\n"
         "  --kv-checkpoint F       KV cache checkpoint (DSKV0002): restored at start, rewritten after every request\n"
@@ -113,9 +122,13 @@ int main(int argc, char** argv) {
         else if (a == "--expert-profile-save") o.profile_out = next();
         else if (a == "--expert-ram") o.ram_all = std::string(next()) == "all";
         else if (a == "--ram-cache-mib") o.ram_cache_mib = std::atoll(next());
+        else if (a == "--host-ram-reserve-mib") o.host_ram_reserve_mib = std::atoll(next());
         else if (a == "--prefill-chunk") o.prefill_chunk = std::atoi(next());
         else if (a == "--spec") { o.spec_n = std::atoi(next()); if (o.spec_n < 0) { std::fprintf(stderr, "error: --spec must be >= 0\n"); return 2; } }
         else if (a == "--spec-min-p") { o.spec_min_p = (float) std::atof(next()); if (!(o.spec_min_p > 0.f && o.spec_min_p <= 1.f)) { std::fprintf(stderr, "error: --spec-min-p must be in (0, 1]\n"); return 2; } }
+        else if (a == "--suffix-draft") { o.suffix_draft = std::atoi(next()); if (o.suffix_draft < 0) { std::fprintf(stderr, "error: --suffix-draft must be >= 0\n"); return 2; } }
+        else if (a == "--lookup-chain") { o.lookup_chain = std::atoi(next()); if (o.lookup_chain < 0) { std::fprintf(stderr, "error: --lookup-chain must be >= 0\n"); return 2; } }
+        else if (a == "--spec-adaptive") o.spec_adaptive = true;
         else if (a == "--mtp") o.mtp_path = next();
         else if (a == "--kv-checkpoint") o.kv_checkpoint = next();
         else if (a == "-k" || a == "--key-format") { std::string v = next(); if (!parse_kv_format(v, o.key_format)) { std::fprintf(stderr, "error: invalid -k format '%s' (use e4m3, f16, f32)\n", v.c_str()); return 2; } }
@@ -139,7 +152,11 @@ int main(int argc, char** argv) {
     auto t0 = std::chrono::steady_clock::now();
     if (!m.load(shards, o, err)) { std::fprintf(stderr, "error: %s\n", err.c_str()); return 1; }
     std::fprintf(stderr, "loaded in %.1f s (%s)\n", std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(), o.gpu ? (gpu::is_emulated() ? "GPU EMULATED on CPU" : "CUDA") : "CPU only");
-    if (o.spec_n > 0 && m.mtp_layers() == 0) { std::fprintf(stderr, "note: --spec %d requested but the model has no MTP/extra layers: speculative decoding OFF\n", o.spec_n); o.spec_n = 0; }
+    if (o.spec_n > 0 && m.mtp_layers() == 0) { std::fprintf(stderr, "note: --spec %d requested but the model has no MTP/extra layers: the MTP drafter is off (a --suffix-draft lookup still works)\n", o.spec_n); o.spec_n = 0; }
+    // The adaptive window policy is auto-on when a lookup drafter joins an MTP drafter (Strata's rule:
+    // the two sources only make sense compared per round), and on demand with --spec-adaptive.
+    if (o.suffix_draft > 0 && o.spec_n >= 2) o.spec_adaptive = true;
+    if (o.lookup_chain > 0 && o.suffix_draft == 0) { std::fprintf(stderr, "error: --lookup-chain needs --suffix-draft\n"); return 2; }
     // KV checkpoint: restore what a previous run left behind (the file must exist; a mismatched one is refused and ignored).
     if (!o.kv_checkpoint.empty()) {
         FILE* probe = std::fopen(o.kv_checkpoint.c_str(), "rb");
@@ -232,9 +249,10 @@ int main(int argc, char** argv) {
     const std::vector<std::string>& vocab = m.tokens();
     // Speculative decoding replaces the sample+forward cycle with spec_step(): one MTP draft chain + one batched
     // verify per round, emitting >= 1 token. The dumps are per-token artifacts of the plain path, so they disable it.
-    bool spec_on = o.spec_n > 0 && m.mtp_layers() > 0;
-    if (spec_on && (!dump_routing.empty() || !dump_logits.empty())) { std::fprintf(stderr, "note: --dump-routing/--dump-logits are incompatible with --spec: speculative decoding OFF\n"); spec_on = false; }
-    if (spec_on) std::fprintf(stderr, "dsv4_run: speculative decoding ON (--spec %d, %d MTP layer(s), min-p %.2f)\n", o.spec_n, m.mtp_layers(), o.spec_min_p);
+    bool spec_on = (o.spec_n > 0 && m.mtp_layers() > 0) || o.suffix_draft > 0;
+    if (spec_on && (!dump_routing.empty() || !dump_logits.empty())) { std::fprintf(stderr, "note: --dump-routing/--dump-logits are incompatible with speculation: speculative decoding OFF\n"); spec_on = false; }
+    if (spec_on) std::fprintf(stderr, "dsv4_run: speculative decoding ON (--spec %d, %d MTP layer(s), suffix %d, chain %d, adaptive %d, min-p %.2f)\n",
+                                 o.spec_n, m.mtp_layers(), o.suffix_draft, o.lookup_chain, (int) o.spec_adaptive, o.spec_min_p);
     for (int i = 0; produced < n_predict && !logits.empty(); ) {
         if (!spec_on) {
             next_tok = sampler.sample(logits.data(), (int) logits.size(), history);

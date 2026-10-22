@@ -28,6 +28,16 @@
  *   for CUDA, pool counter for emulated). So `plan_expert_memory()` is called with `weights = kv = act =
  *   prefill = mtp = scratch = 0`: charging them again double-counts and used to abort with
  *   `fixed costs (8742 MiB) exceed the usable VRAM (-883 MiB after the reserve)` on a 24 GiB card.
+ *
+ * @par The host-RAM side of the same budget
+ *   The expert tiers are host memory, not device memory, and the machine that hosts them is shared: a
+ *   sibling engine already resident, the page cache of the model itself and the desktop all compete for
+ *   it. `host_mem_available` is what the kernel reports as still allocatable (`/proc/meminfo`
+ *   MemAvailable) and `host_ram_reserve` is what the caller refuses to touch; `host_budget` is the
+ *   difference. Nothing here fails when the tiers exceed it: over-subscribing RAM is not an error, it
+ *   is a promise the machine breaks by swapping, and a load that swaps for 900 s is what made
+ *   `serve/server.py` report `EngineDied: the engine did not report READY within 900 s`. The caller
+ *   uses `host_budget` to shrink the arena it can shrink (the LRU cache) and to report the rest.
  */
 #pragma once
 
@@ -54,6 +64,9 @@ struct MemPlanInput {
     double pct = -1.0;                    ///< VRAM percentage for experts: 0..100, < 0 = auto mode.
     int64_t abs_slots = -1;               ///< --expert-cache N: >= 0 overrides pct with absolute count.
     uint64_t ram_expert_bytes = 0;        ///< Host RAM copy of all experts (report only, not counted in VRAM).
+    int64_t host_mem_available = -1;      ///< Host RAM the machine can still hand out (bytes); < 0 = unknown.
+    int64_t host_ram_reserve = 0;         ///< Host RAM the caller refuses to touch (bytes): the sibling engines.
+    int64_t ram_cache_bytes = 0;          ///< The LRU RAM arena the caller asked for (bytes); 0 = none.
 };
 
 /**
@@ -72,6 +85,9 @@ struct MemPlan {
     uint64_t slot_bytes_total = 0;        ///< Total bytes for all slots: sum(slots_layer[l] * bpe[l]).
     bool all_resident = false;            ///< true if every layer holds ALL its experts (fast path).
     uint64_t all_expert_bytes = 0;        ///< Total bytes for ALL experts across all layers.
+    int64_t host_budget = 0;              ///< Host RAM the tiers may use: host_mem_available - host_ram_reserve.
+    int64_t host_demand = 0;              ///< Host RAM the tiers want: ram_expert_bytes + ram_cache_bytes.
+    bool host_over = false;               ///< true if host_demand exceeds host_budget: the load will swap.
 };
 
 /**
@@ -91,6 +107,15 @@ struct MemPlan {
  * @return MemPlan with `ok == true` on success, or `ok == false` with error details.
  */
 MemPlan plan_expert_memory(const MemPlanInput& in);
+
+/**
+ * @brief Host RAM the machine can still hand out, in bytes, or -1 when it cannot be read.
+ *
+ * MemAvailable from /proc/meminfo, which is the only figure that already accounts for the sibling
+ * engines, the page cache and the desktop: MemTotal - used - the reclaimable cache. Linux only;
+ * anything else returns -1 and the caller keeps its own default.
+ */
+int64_t host_mem_available_bytes();
 
 /**
  * @brief Generate a human-readable report of the memory plan.

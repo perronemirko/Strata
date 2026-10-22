@@ -126,6 +126,35 @@ ignored; architecture + embedding length must match, duplicate tensor names are 
 numpy reference of `tools/tiny_model.py`, greedy stream identity with and without speculation, sampled
 determinism per seed, emission bounds [1, N+1], and a KV checkpoint taken mid-speculation.
 
+### Prompt-lookup drafter + adaptive window policy (`--suffix-draft`, `--spec-adaptive`)
+
+The two mechanisms the paper's spec has and this engine lacked (see `SPEC_STRATA_VERIFIED.md`
+section 6) are now implemented, ported from Strata's verified code
+(`strata/spec/suffix_drafter.*`, `strata/spec/draft_policy.*`):
+
+- **`--suffix-draft N`** adds a prompt-lookup drafter: a trigram index of the committed history
+  (prompt + accepted output) proposes up to N tokens continuing an earlier repeat — when the answer
+  quotes its input (edits, refactors, repeated code) the continuation is usually exact. It needs no
+  weights and costs microseconds. It works **with or without** `--spec` (a model with no MTP layers
+  can still speculate from lookup drafts).
+- **`--spec-adaptive`** (auto-on when `--suffix-draft` joins `--spec >= 2`) lets the `DraftPolicy`
+  choose per round between the MTP window and a lookup window by expected committed tokens per
+  millisecond: round costs are an EMA of measured times (prior shape for unmeasured sizes), lookup
+  acceptances are tracked by match-length buckets with priors — exactly the constants verified in
+  Strata's `src/spec/draft_policy.cpp` (kCostAlpha 0.1, kShape, buckets <6/<12/<24/≥24 with priors
+  0.75/0.88/0.93/0.96, decay 0.97, stale re-probing).
+- **`--lookup-chain K`** appends up to K lookup tokens *after* a full MTP window (the chain rule of
+  the same policy, `propose_after` continuing where the MTP's drafts end).
+
+The policy only decides **which drafts to verify**: the verify window decides every emitted token,
+so a greedy request stays bit-identical to plain decoding whatever the policy picks — checked by
+`tests/test_spec_policy.cpp` (unit tests of both ported units + greedy exactness with lookup-only,
+MTP+lookup adaptive, and MTP-only adaptive).
+
+    ./build-out/dsv4_run --model m.gguf --spec 4 --suffix-draft 3            # both sources, adaptive
+    ./build-out/dsv4_run --model m.gguf --suffix-draft 4                     # lookup-only (no MTP needed)
+    ./build-out/dsv4_run --model m.gguf --spec 4 --suffix-draft 3 --lookup-chain 2
+
 > Note: drafts are a *proposal* distribution - correctness never depends on their quality, only verification
 > does (it always uses the main model's true distributions). The drafting offset above follows "the MTP input
 > for token t is processed at position t"; if acceptance rates come out low on a trained DSv3 GGUF, shifting

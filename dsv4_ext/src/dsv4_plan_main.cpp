@@ -25,7 +25,10 @@ static void usage() {
         "  --kv-mib N  --act-mib N  --prefill-mib N  --scratch-mib N   override estimates\n"
         "  --no-mtp                     do not count the extra (MTP) layer's experts as fixed VRAM\n"
         "  --sweep                      table for P = 0/25/50/75/100\n"
-        "  --dump-tensors               list every tensor (name, dims, type, bytes)");
+        "  --dump-tensors               list every tensor (name, dims, type, bytes)\n"
+        "  --expert-ram all|profile     what the host-RAM expert copy would hold, for the host-RAM check\n"
+        "  --ram-cache-mib M            the LRU arena the run asks for (default 8192, 0 = none)\n"
+        "  --host-ram-reserve-mib M     host RAM to leave for the other processes (default 0)");
 }
 
 static std::vector<std::string> expand_shards(const std::string& p) {
@@ -58,6 +61,8 @@ int main(int argc, char** argv) {
     std::string pct_s = "auto";
     long long abs_slots = -1, reserve_mib = 1024, vt = -1, vf = -1, max_ctx = 4096;
     long long kv_mib = -1, act_mib = -1, prefill_mib = -1, scratch_mib = -1;
+    long long ram_cache_mib = 8192, host_reserve_mib = 0;
+    bool ram_all = false;
     bool sweep = false, dump = false, no_mtp = false;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
@@ -73,6 +78,9 @@ int main(int argc, char** argv) {
         else if (a == "--act-mib") act_mib = std::atoll(next());
         else if (a == "--prefill-mib") prefill_mib = std::atoll(next());
         else if (a == "--scratch-mib") scratch_mib = std::atoll(next());
+        else if (a == "--expert-ram") ram_all = std::string(next()) == "all";
+        else if (a == "--ram-cache-mib") ram_cache_mib = std::atoll(next());
+        else if (a == "--host-ram-reserve-mib") host_reserve_mib = std::atoll(next());
         else if (a == "--no-mtp") no_mtp = true;
         else if (a == "--sweep") sweep = true;
         else if (a == "--dump-tensors") dump = true;
@@ -140,6 +148,17 @@ int main(int argc, char** argv) {
     in.ram_expert_bytes = inv.total_expert_bytes;
     in.abs_slots = abs_slots;
     in.pct = pct_s == "auto" ? -1.0 : std::atof(pct_s.c_str());
+    // The host-RAM side. This tool is a what-if with no engine in front of it, so it reads the
+    // machine it runs on: MemAvailable here is the same figure dsv4_run will read at load time.
+    // --expert-ram all is the upper bound for the copy; with --expert-ram profile the copy holds
+    // only the experts the profile has seen, so the real demand is lower and this check is
+    // conservative - it says "would swap" only when even the all-copy case would.
+    in.host_mem_available = host_mem_available_bytes();
+    in.host_ram_reserve = host_reserve_mib << 20;
+    in.ram_cache_bytes = ram_cache_mib > 0 ? ((uint64_t) ram_cache_mib << 20) : 0;
+    if (in.host_mem_available < 0) std::puts("(host RAM not readable here: no /proc/meminfo, so the host-RAM lines are skipped)");
+    else if (!ram_all) std::printf("(--expert-ram profile: the copy is counted at its upper bound of %.2f GiB, the real one is smaller)\n",
+                                   inv.total_expert_bytes / 1073741824.0);
 
     std::printf("\n(KV/act/prefill/scratch are ROUGH estimates, max-context %lld: override with --kv-mib etc.)\n", max_ctx);
     MemPlan p = plan_expert_memory(in);
