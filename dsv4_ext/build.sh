@@ -23,7 +23,10 @@ done
 
 # Gestione sicura della directory di output per ambienti noexec
 OUT=build-out; mkdir -p "$OUT"
-cp /bin/true "$OUT/.x" 2>/dev/null && "$OUT/.x" 2>/dev/null || OUT=/tmp/dsv4_build
+# cp -f and rm -f first: a marker left by another user's run (a container build runs as root)
+# cannot be rewritten by a plain cp, and that "Permission denied" is not this tree being noexec.
+rm -f "$OUT/.x" 2>/dev/null
+cp -f /bin/true "$OUT/.x" 2>/dev/null && "$OUT/.x" 2>/dev/null || OUT=/tmp/dsv4_build
 mkdir -p "$OUT"
 
 # OpenMP e' OBBLIGATORIO per la velocita': senza, ogni "#pragma omp parallel for" (cpu_mv, gpu::matvec,
@@ -49,7 +52,7 @@ fi
 # Sorgenti condivisi della libreria core (incluso model.cpp)
 # src/iq_tables.cpp e' generato: python3 tools/extract_iq_tables.py
 # SRC_NO_GPU = the same without any device backend: the CUDA build adds src/gpu_cuda.cu to it.
-CORE="src/gguf_header.cpp src/config.cpp src/mem_plan.cpp src/mtp_adapter.cpp src/ops.cpp src/dequant.cpp src/iq_tables.cpp src/serve_loop.cpp src/st_header.cpp src/model.cpp src/sampler.cpp"
+CORE="src/gguf_header.cpp src/config.cpp src/mem_plan.cpp src/mtp_adapter.cpp src/ops.cpp src/dequant.cpp src/iq_tables.cpp src/serve_loop.cpp src/st_header.cpp src/model.cpp src/sampler.cpp src/suffix_drafter.cpp src/draft_policy.cpp"
 SRC="$CORE src/gpu.cpp"
 SRC_NO_GPU="$CORE"
 
@@ -69,6 +72,9 @@ if [ "$CUDA_ONLY" = 0 ]; then
     "$CXX" $FL $SRC tests/test_kv_checkpoint.cpp -o "$OUT/test_kv_checkpoint"
     # MTP / speculative decoding golden test (needs the tiny GGUF, run below with the model).
     "$CXX" $FL $SRC tests/test_mtp.cpp -o "$OUT/test_mtp"
+    # The prompt-lookup drafter + adaptive window policy (the divergences the paper's spec has and
+    # this engine lacked): unit tests + greedy exactness with lookup/policy ON (run below).
+    "$CXX" $FL $SRC tests/test_spec_policy.cpp -o "$OUT/test_spec_policy"
     # The MTP bridge: a Hugging Face safetensors draft module on top of the GGUF model.
     "$CXX" $FL $SRC tests/test_mtp_safetensors.cpp -o "$OUT/test_mtp_safetensors"
     # dsv4_mtp_ckpt: the bridge's diagnostic. Reads ONLY the headers of a real GGUF + a real
@@ -119,6 +125,9 @@ if [ "$CUDA_ONLY" = 0 ] && [ "$HAVE_TINY" = 1 ]; then
     echo "==> Running MTP / speculative decoding tests (draft parity, greedy parity, determinism, checkpoint)..."
     "$OUT/test_mtp" --model "$TINY/tiny.gguf" --refdir "$TINY"
 
+    echo "==> Running prompt-lookup + adaptive window policy tests (units + greedy exactness)..."
+    "$OUT/test_spec_policy" --model "$TINY/tiny.gguf"
+
     ST="$OUT/tiny_mtp"
     if python3 tools/tiny_mtp_checkpoint.py "$ST" >/dev/null 2>&1; then
         echo "==> Running the MTP bridge tests (safetensors draft module on the GGUF model)..."
@@ -137,10 +146,19 @@ if [ "$CUDA_ONLY" = 0 ] && [ "$HAVE_TINY" = 1 ]; then
 fi
 
 if [ "$WITH_CUDA" = 1 ]; then
-    NVCC="${NVCC:-$(command -v nvcc || true)}"
-    [ -z "$NVCC" ] && for d in /usr/local/cuda/bin /usr/local/cuda-12.8/bin /usr/local/cuda-12/bin; do
-        [ -x "$d/nvcc" ] && NVCC="$d/nvcc" && break
-    done
+    # Some distributions ship /usr/bin/nvcc as a wrapper that needs CUDAVER in the environment
+    # (Debian's nvidia-cuda-toolkit): with CUDAVER unset it resolves to "/usr/local/cuda-/bin/nvcc"
+    # and fails, while command -v finds it and the fallback below never runs. So the probe asks
+    # the candidate whether it can report its own version; only one that answers is used.
+    nvcc_probe() {
+        for c in "${NVCC:-}" "$(command -v nvcc || true)" /usr/local/cuda/bin/nvcc \
+                 /usr/local/cuda-13.1/bin/nvcc /usr/local/cuda-13/bin/nvcc /usr/local/cuda-12.8/bin/nvcc /usr/local/cuda-12/bin/nvcc; do
+            [ -n "$c" ] && [ -x "$c" ] && "$c" --version 2>/dev/null | grep -q "Cuda compilation tools" && { echo "$c"; return 0; }
+        done
+        return 1
+    }
+    NVCC="${NVCC:-$(nvcc_probe)}"
+    [ -z "$NVCC" ] && { echo "ERROR: --cuda needs a working nvcc (set NVCC=/path/to/nvcc). Not built."; exit 3; }
     if [ -z "$NVCC" ]; then
         echo "ERROR: --cuda needs nvcc (set NVCC=/path/to/nvcc). Not built."
         exit 3

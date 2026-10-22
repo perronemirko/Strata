@@ -3565,6 +3565,12 @@ class Detokenizer:
         return delta
 
 
+# A control token's spelling: `<|im_end|>`, `<|endoftext|>`, `<｜end▁of▁sentence｜>` (a fullwidth bar), ...
+# One token, no spaces, no nested angle brackets.  Only consulted for an id the engine already treats as a
+# stop, so an ordinary vocabulary entry ("<b>" in an HTML-heavy vocab) is never reached here.
+CONTROL_SHAPE = re.compile(r"<[^<>\s]{1,64}>")
+
+
 OPENAI_MAX_STOP = 4                                  # OpenAI's limit on `stop`
 
 
@@ -3788,19 +3794,34 @@ class Service:
         eos = (getattr(tokenizer, "special_ids", None) or {}).get("tokenizer.ggml.eos_token_id")
         if isinstance(eos, int) and not isinstance(eos, bool) and eos >= 0:
             self.stop_ids.add(eos)
-        # A stop id's literal spelling, when the vocabulary names one: the model writing `<|endoftext|>` or
-        # `<|im_end|>` INSIDE its thinking is that spelling as text, not the end of the turn.  Service._run
-        # escapes it into the reasoning instead of swallowing it; whether the reply is then continued with
-        # the thinking closed stays with reasoning_close_retry (#1053).  An id with no spelling in this
-        # vocabulary (a bare eos with no control literal) has nothing to escape and keeps the old behaviour.
+        # A stop id's literal spelling, when the vocabulary names one: the model writing `<|endoftext|>`,
+        # `<|im_end|>` or its own end of sentence (`<｜end▁of▁sentence｜>` on DeepSeek's vocabularies) INSIDE
+        # its thinking is that spelling as text, not the end of the turn.  Service._run escapes it into the
+        # reasoning instead of swallowing it; whether the reply is then continued with the thinking closed
+        # stays with reasoning_close_retry (#1053).  The map is every special the tokenizer names, NOT
+        # intersected with stop_ids: a wrapper (tools/serve_dsv4.py) replaces stop_ids after this point,
+        # and control_literal() also resolves an id the vocabulary only lists in its tokens array.
         self.control_literals: dict[int, str] = {}
         named = known if known is not None else {
             lit: tokenizer.encode(lit, parse_special=True)[0]
             for lit in getattr(tokenizer, "control_tokens", ())
             if tokenizer.encode(lit, parse_special=True)}
         for lit, tid in named.items():
-            if isinstance(tid, int) and not isinstance(tid, bool) and tid in self.stop_ids:
+            if isinstance(tid, int) and not isinstance(tid, bool) and tid >= 0:
                 self.control_literals[tid] = lit
+        # The ids of the two thinking markers, when this vocabulary has each as ONE token: whether a prompt
+        # leaves the model inside its thinking is read from the rendered prompt (see thinking_open).  A
+        # template may answer the request's reasoning_effort with its own switch - DeepSeek's opens the
+        # block only on `thinking`/`enable_thinking` and otherwise ends the generation prompt with
+        # `<｜Assistant｜></think>` - so a parser that believed the request alone read the whole answer as
+        # reasoning: the answer showed under "Thought for N s", and the model's end-of-sentence token at
+        # its end was kept as text instead of ending the turn.
+        think_ids = [None, None]
+        for i, lit in enumerate(("<think>", THINK_END)):
+            got = tokenizer.encode(lit, parse_special=True)
+            if len(got) == 1 and isinstance(got[0], int) and not isinstance(got[0], bool):
+                think_ids[i] = got[0]
+        self.think_ids: tuple[int | None, int | None] = (think_ids[0], think_ids[1])
         if hasattr(tokenizer, "encode_marked") and hasattr(tokenizer, "max_special_len"):
             from strata_tokenizer import PromptEncoder
             # one kept prompt per conversation the engine's cache can hold (--conversation-cache-slots); the
@@ -4668,6 +4689,45 @@ class Service:
             self.prompts.forget(ids)
 
 
+    def control_literal(self, t: int) -> str | None:
+        """The literal spelling of a token the engine treats as a stop, when this vocabulary names one.
+
+        `control_literals` covers the specials the tokenizer marks as such (types 3 and 4).  A vocabulary
+        that only lists the token in its tokens array - an eos whose type is not recorded as CONTROL, or a
+        wrapper that replaced `stop_ids` after `Service.__init__` ran - is answered here, from the array
+        itself, but only for a string that really is one control token's spelling (`CONTROL_SHAPE`): an
+        ordinary vocabulary entry (`<b>` in an HTML-heavy vocab) must not become a literal."""
+        lit = self.control_literals.get(t)
+        if lit is not None:
+            return lit
+        tokens = getattr(self.tok, "tokens", None)
+        if not tokens or not isinstance(t, int) or isinstance(t, bool) or not (0 <= t < len(tokens)):
+            return None
+        word = tokens[t]
+        return word if isinstance(word, str) and CONTROL_SHAPE.fullmatch(word) else None
+
+    def thinking_open(self, ids: list[int], kwargs: dict) -> bool:
+        """Whether the prompt leaves the model inside its thinking, as the rendered prompt says.
+
+        The request's kwargs say what was asked; the prompt says what the template did.  They differ for a
+        template that names its thinking switch differently (DeepSeek's chat template opens `<think>` only on
+        `thinking`/`enable_thinking` and otherwise ends the generation prompt with `<｜Assistant｜></think>`),
+        and reading only the kwargs made the parser start in the thinking for a model that was never asked to
+        think: the whole answer came back as reasoning - shown under "Thought for N s" - and the model's own
+        end-of-sentence token, written at the end of that answer, was kept as its literal spelling instead of
+        ending the turn.  The last of the two markers in the prompt decides: an opener leaves the model
+        thinking, a closer has already closed the block.  A vocabulary without one of the two markers (a model
+        that cannot think) keeps the request's own answer."""
+        start, end = self.think_ids
+        if start is None or end is None:
+            return kwargs.get("enable_thinking", True) is not False
+        for t in reversed(ids):
+            if t == end:
+                return False
+            if t == start:
+                return True
+        return kwargs.get("enable_thinking", True) is not False
+
     def prepare(self, messages, tools, kwargs, max_new=None, force=None, req=None, cancel=None):
         """-> (ids, thinking, max_new). An unset or non-positive max_new (some clients send -1) means "unlimited":
         the rest of the context.  `force` (forced_call): without thinking the reply starts with it, so it ends the
@@ -4709,7 +4769,9 @@ class Service:
         # --------------------------------------------------------
         
         ids = self.encode_prompt(messages, tools, kwargs)
-        if force and kwargs.get("enable_thinking", True) is False:
+        # what the prompt actually leaves the model doing: thinking, or answering directly
+        thinking = self.thinking_open(ids, kwargs)
+        if force and not thinking:
             ids = ids + self.tok.encode(force, parse_special=True)
         self.embeddings.path = None
         self.embeddings.keys = None
@@ -4803,7 +4865,7 @@ class Service:
             write_temporary(combined, [p for p, _ in encoded])
         if req is not None and req.get("strata_prefix") is not None:
             req["strata_prefix"] = self.resolve_prefix(req["strata_prefix"], messages, tools, kwargs, ids, bool(images))
-        return ids, kwargs.get("enable_thinking", True) is not False, max_new
+        return ids, thinking, max_new
 
     PREFIX_END = "\u0001strata-prefix-end\u0001"          # marks where a message's shared part ends in the rendered prompt
 
@@ -5148,7 +5210,7 @@ class Service:
                                     if force and parser.state == "reasoning" and parser.buf == THINK_END:
                                         opens = True    # #537: the held </think> was the end: the call opens there
                                         break
-                                    lit = self.control_literals.get(t)
+                                    lit = self.control_literal(t)
                                     # A clean point only: nothing is held back as a tag still arriving (a `</think>`
                                     # the end of the turn resolves, #537) and no character is split across tokens.
                                     if (lit and parser.state in ("reasoning", "rcall") and not parser.buf

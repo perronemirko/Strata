@@ -273,11 +273,14 @@ int serve_loop(Model& m, const RunOpts& o, const std::vector<int>& eos_ids) {
         const auto tg = std::chrono::steady_clock::now();
         int generated = 0;
         std::string finish = "length";
-        // Speculative decoding (if the model has MTP layers and --spec N was given): one spec_step() emits >= 1 token
-        // per round - an MTP draft chain verified by a single batched main-model forward. Greedy requests stay exactly
-        // identical to plain decoding; sampled ones follow rejection sampling against the request's own distribution.
-        const bool spec_on = o.spec_n > 0 && m.mtp_layers() > 0;
-        if (spec_on) std::fprintf(stderr, "dsv4_run: speculative decoding ON (--spec %d, %d MTP layer(s))\n", o.spec_n, m.mtp_layers());
+        // Speculative decoding (an MTP chain when the model has one and --spec N was given, and/or the
+        // prompt-lookup drafter with --suffix-draft N): one spec_step() emits >= 1 token per round - the
+        // drafts verified by a single batched main-model forward. Greedy requests stay exactly identical
+        // to plain decoding whatever the window policy picks; sampled ones follow rejection sampling
+        // against the request's own distribution.
+        const bool spec_on = (o.spec_n > 0 && m.mtp_layers() > 0) || o.suffix_draft > 0;
+        if (spec_on) std::fprintf(stderr, "dsv4_run: speculative decoding ON (--spec %d, %d MTP layer(s), suffix %d, chain %d, adaptive %d)\n",
+                                 o.spec_n, m.mtp_layers(), o.suffix_draft, o.lookup_chain, (int) o.spec_adaptive);
         for (int i = 0; generated < max_new && !logits.empty(); ) {
             if (!spec_on) {
                 const int tok = sampler.sample(logits.data(), (int) logits.size(), history);

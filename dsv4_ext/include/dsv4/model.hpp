@@ -63,12 +63,16 @@ struct RunOpts {
     std::string profile_out;            ///< Output expert routing profile file path (saved on exit).
     bool ram_all = false;               ///< --expert-ram all: copy ALL experts into RAM at load time.
     long long ram_cache_mib = 8192;     ///< LRU RAM arena size in MiB for MISS experts (0 = disabled).
+    long long host_ram_reserve_mib = 0; ///< Host RAM this run must not touch: what the sibling engines already hold.
     int adapt_swaps = 0;                ///< Adaptive expert swap count tracking.
     bool verify_slots = false;          ///< Verify VRAM slot assignments at load time.
     bool verbose = true;                ///< Print startup report: memory plan, profile, RAM/VRAM counts.
     int prefill_chunk = 256;            ///< Prefill batch size: 0 = disabled (one token at a time).
-    int spec_n = 0;                     ///< --spec N: speculative decoding with up to N MTP draft tokens per step (0 = off).
+    int spec_n = 0;                     ///< --spec N: speculative decoding with up to N draft tokens per verify window (0 = off).
     float spec_min_p = 1.0f;            ///< --spec-min-p P: acceptance threshold in sampling mode (1.0 = exact rejection sampling).
+    int suffix_draft = 0;               ///< --suffix-draft N: prompt-lookup drafter (the divergence the paper's spec has and this engine lacked): proposes up to N tokens continuing an earlier repeat of the context; the adaptive DraftPolicy decides per round whether an MTP or a lookup window pays. 0 = off.
+    int lookup_chain = 0;               ///< --lookup-chain K: append up to K lookup tokens after a full MTP window (the chain rule of the same policy). Needs --suffix-draft. 0 = off.
+    bool spec_adaptive = false;         ///< --spec-adaptive: the DraftPolicy chooses the window size/source per round (Strata's verified policy). Auto-on when --suffix-draft is used with --spec; this flag also enables it for MTP-only runs.
     std::string mtp_path;               ///< --mtp FILE|auto: separate GGUF holding the MTP tensors ("auto" = detect them in the main shards).
     std::string kv_checkpoint;          ///< --kv-checkpoint FILE: restored at load, rewritten after every request.
     KVFormat key_format = KVFormat::F32;   ///< -k / --key-format: format of the cached (fused) KV rows (e4m3/f16/f32).

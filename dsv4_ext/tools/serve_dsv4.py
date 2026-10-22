@@ -22,6 +22,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -38,6 +39,8 @@ def build_engine_args(a) -> list[str]:
     args = ["--model", str(Path(a.model).resolve()), "--ctx", str(a.ctx)]
     if a.threads:
         args += ["--threads", str(a.threads)]
+    if a.host_ram_reserve_mib is not None:
+        args += ["--host-ram-reserve-mib", str(a.host_ram_reserve_mib)]
     if a.expert_vram_pct is not None:
         args += ["--expert-vram-pct", str(a.expert_vram_pct)]
     if a.expert_cache is not None:
@@ -104,6 +107,150 @@ def patch_tokenizer_byte_fallback() -> None:
     ST.Tokenizer._dsv4_byte_fallback = True
 
 
+# ----------------------------------------------------------------------------------------------
+# The preflight: read the two budgets the engine is about to ask for, before it starts.
+#
+# Why this exists. serve/server.py waits ENGINE_READY_S (900 s) for the READY line and, when it
+# does not come, raises EngineDied with the last lines of the engine log. That is an honest report
+# of a symptom, not of the cause: what actually happened on this machine, twice, was that the
+# engine asked for more host RAM than the machine could hand out. The kernel journal for the 2026-10-22
+# 18:04 start says it plainly - dsv4_run_cuda at rss 61.5 GiB with swapents 49 GiB, and an
+# "Out of memory" that killed other processes on the same machine. The engine log stops right after
+# "[load 108.0s] experts copied to RAM", which is exactly the next allocation in src/model.cpp: the
+# LRU arena. Nothing was wrong with the model, the GPU or the protocol; the flags over-booked RAM.
+#
+# The engine clamps the arena itself now (see --host-ram-reserve-mib in src/model.cpp), so a start
+# that used to hang loads instead. This preflight is the other half of the fix: it says the numbers
+# BEFORE the first byte is read, so the operator sees "this wants 106 GiB and the machine has 73"
+# instead of a 900 s silence, and can decide instead of waiting. It reads only the GGUF headers,
+# /proc/meminfo and nvidia-smi: it never touches another process, and it never touches the GPU.
+def expand_shards(path: str) -> list[str]:
+    """…-00001-of-00003.gguf -> all three shards, the same rule dsv4_run uses (src/dsv4_plan_main.cpp
+    replaces only the index and keeps the "-of-NNNNN" tail, so the names cannot drift apart)."""
+    m = re.search(r"-(\d{5})-of-(\d{5})\.gguf$", path)
+    if not m:
+        return [path]
+    total = int(m.group(2))
+    head, tail = path[:m.start()], path[m.start() + 6:]      # "-of-00003.gguf" stays intact
+    return [f"{head}-{i:05d}{tail}" for i in range(1, total + 1)]
+
+
+def read_host_memory() -> tuple[int | None, int | None]:
+    """(MemAvailable, SwapFree) in bytes, from /proc/meminfo; None when the file is not there."""
+    try:
+        with open("/proc/meminfo", encoding="ascii") as f:
+            got = {}
+            for line in f:
+                k, _, v = line.partition(":")
+                n = v.strip().split()
+                if n and k in ("MemAvailable", "SwapFree"):
+                    got[k] = int(n[0]) * 1024
+        return got.get("MemAvailable"), got.get("SwapFree")
+    except OSError:
+        return None, None
+
+
+def free_vram_mib() -> int | None:
+    """Free VRAM as nvidia-smi reports it, MiB, or None. Read-only: it starts no process of our
+    own that could fight the engines already holding the card."""
+    import subprocess
+    try:
+        out = subprocess.run(["nvidia-smi", "--query-gpu=memory.free",
+                             "--format=csv,noheader,nounits"], capture_output=True, text=True, timeout=20)
+        vals = [int(x) for x in out.stdout.split() if x.strip().isdigit()]
+        return max(vals) if vals else None
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+
+
+def expert_bytes_from_gguf(shards: list[str]) -> tuple[int, dict[int, int], int] | None:
+    """(all expert bytes, per-layer bytes, unknown-type count) reading ONLY the GGUF headers.
+    Reuses tools/dump_gguf_shapes.py, the header reader this project already ships, so the
+    preflight and the tool that produced shapes.txt cannot disagree about what an expert costs."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("dump_gguf_shapes", HERE / "dump_gguf_shapes.py")
+    if spec is None:
+        return None
+    mod = importlib.util.module_from_spec(spec)
+    try:
+        spec.loader.exec_module(mod)
+    except Exception:
+        return None
+    total, per_layer, unknown = 0, {}, 0
+    for p in shards:
+        try:
+            _ver, _kv, tensors = mod.read_file(p)
+        except (OSError, ValueError, EOFError):
+            return None
+        for name, dims, ty, _off in tensors:
+            b = mod.nbytes(dims, ty)
+            if b is None:
+                unknown += 1
+                continue
+            if "_exps" in name and len(dims) == 3:
+                total += b
+                m = re.search(r"\.(\d+)\.", name)
+                if m:
+                    per_layer[int(m.group(1))] = per_layer.get(int(m.group(1)), 0) + b // dims[-1]
+    return total, per_layer, unknown
+
+
+def preflight(a) -> bool:
+    """Print what the engine will ask for, and refuse only what the machine cannot do at all.
+    Returns False when starting is pointless (the demand does not fit RAM plus swap): the caller
+    then exits with a number and a remedy instead of waiting 900 s for an EngineDied."""
+    gib = 1073741824
+    avail, swap = read_host_memory()
+    if avail is None:
+        print("preflight: /proc/meminfo not readable (not Linux): skipping the host-RAM check.", file=sys.stderr)
+        return True
+
+    reserve = (a.host_ram_reserve_mib or 0) << 20
+    budget = avail - reserve
+    print(f"host RAM available: {avail / gib:.1f} GiB (MemAvailable) | swap free: {(swap or 0) / gib:.1f} GiB "
+          f"| reserve asked for: {reserve / gib:.1f} GiB", file=sys.stderr, flush=True)
+
+    shards = expand_shards(str(Path(a.model).resolve()))
+    got = expert_bytes_from_gguf(shards)
+    if got is None:
+        print(f"preflight: cannot read the headers of {shards}: skipping the expert-size check.", file=sys.stderr)
+        return True
+    all_experts, _per_layer, unknown = got
+    if unknown:
+        print(f"preflight: {unknown} tensors have a ggml type this reader does not know: sizes below are a floor.",
+              file=sys.stderr)
+
+    # The RAM copy: --expert-ram all takes every expert; --expert-ram profile takes only the ones
+    # the profile has seen, which is smaller and unknown here, so all-experts is the upper bound.
+    copy = all_experts if a.expert_ram == "all" else 0
+    arena = (a.ram_cache_mib if a.ram_cache_mib is not None else 8192) << 20
+    demand = copy + arena
+    print(f"expert weights on disk: {all_experts / gib:.1f} GiB | RAM copy asked for (--expert-ram {a.expert_ram or 'profile'}): "
+          f"{copy / gib:.1f} GiB | LRU arena (--ram-cache-mib): {arena / gib:.1f} GiB", file=sys.stderr, flush=True)
+    print(f"host RAM the load wants: {demand / gib:.1f} GiB against {budget / gib:.1f} GiB the machine can hand out",
+          file=sys.stderr, flush=True)
+
+    if a.cuda:
+        free = free_vram_mib()
+        if free is not None:
+            print(f"VRAM free now: {free / 1024:.1f} GiB (another engine on the same card is why this number moves; "
+                  f"--expert-vram-pct auto plans against it at load time)", file=sys.stderr, flush=True)
+
+    if demand > budget:
+        fits = max(0, budget - copy) >> 20
+        print(f"note: this over-books host RAM by {(demand - budget) / gib:.1f} GiB. The engine clamps the arena to "
+              f"{fits} MiB and loads correctly but slower on MISS experts; the load that used to hang here is the "
+              f"same one that now swaps. To load at full speed: --ram-cache-mib {fits}, or keep --expert-ram profile "
+              f"instead of all, or end the other engine that holds this machine's RAM.", file=sys.stderr, flush=True)
+    if swap is not None and demand > avail + swap:
+        print(f"refused: the load wants {demand / gib:.1f} GiB of host RAM and RAM plus swap together are "
+              f"{(avail + swap) / gib:.1f} GiB. This is not a slow start, it is an out-of-memory: the kernel "
+              f"will kill this engine or another process on the machine. Lower --ram-cache-mib, or drop "
+              f"--expert-ram all.", file=sys.stderr, flush=True)
+        return False
+    return True
+
+
 def ensure_tokenizer(a, workdir: Path) -> Path:
     """<workdir>/tokenizer/ from the GGUF, or reuse what is already there."""
     out = Path(a.tokenizer_dir) if a.tokenizer_dir else workdir
@@ -153,6 +300,13 @@ def main() -> int:
     ap.add_argument("--prefill-chunk", type=int, default=None,
                     help="prompt tokens per batched forward (engine default 256, 0 = one token per pass)")
     ap.add_argument("--expert-adapt-swaps", type=int, default=None)
+    ap.add_argument("--host-ram-reserve-mib", type=int, default=None,
+                    help="host RAM to leave for the other processes on this machine (passed to the engine as "
+                         "--host-ram-reserve-mib, and used by this preflight). Set it to what the sibling "
+                         "engines already hold: a second engine resident on the same machine is the usual "
+                         "cause of an engine that never reported READY.")
+    ap.add_argument("--no-preflight", action="store_true",
+                    help="skip the host-RAM/VRAM preflight (it only reads the GGUF headers, /proc/meminfo and nvidia-smi)")
     ap.add_argument("--no-qat-sim", action="store_true")
     ap.add_argument("--max-layers", type=int, default=None, help="debug: run the first N layers only")
     ap.add_argument("--eos-ids", default=None, help="comma-separated ids that end a turn (default: the GGUF's eos)")
@@ -175,6 +329,11 @@ def main() -> int:
 
     workdir = Path(a.workdir).resolve()
     workdir.mkdir(parents=True, exist_ok=True)
+    # The budgets first: reading them costs a few MB of header parsing, and if they do not fit
+    # there is no point extracting the tokenizer or waiting 900 s for an EngineDied.
+    if not a.no_preflight:
+        if not preflight(a):
+            return 3
     tdir = ensure_tokenizer(a, workdir)
     log = str(workdir / "dsv4_engine.log")
 
@@ -231,6 +390,14 @@ def main() -> int:
         eos_text = "<\uff5cend\u2581of\u2581sentence\uff5c>"      # <｜end▁of▁sentence｜>, id 1 in this GGUF
         return {vocab[eos_text]} if eos_text in vocab else set()
 
+    # The thinking switch, and why it matters here.  serve/server.py asks a model to think by sending the
+    # template a `reasoning_effort`; this GGUF's template (Unsloth's, in tokenizer/chat_template.jinja) opens
+    # `<think>` only on its own `thinking`/`enable_thinking` and otherwise ends the generation prompt with
+    # `<｜Assistant｜></think>` - already closed.  A request that only names an effort therefore gets a prompt
+    # that does not think, and serve/server.py now reads that prompt (Service.thinking_open) rather than the
+    # request: the answer comes back as the answer, and the model's `<｜end▁of▁sentence｜>` ends the turn
+    # instead of showing at its end.  To make this model think, send chat_template_kwargs
+    # {"enable_thinking": true} beside the effort - the server then parses the thinking as the model writes it.
     _stop_ids = _dsv4_stop_ids()
     if _stop_ids:
         _service_init = S.Service.__init__

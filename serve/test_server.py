@@ -4287,6 +4287,90 @@ class EndOfSentenceLiteral(unittest.TestCase):
         self.assertEqual(again["message"]["content"], ControlTokenInThinkingEngine.ANSWER)
 
 
+class ClosedThinkPrompt(unittest.TestCase):
+    """A template that names its thinking switch differently from the request's kwargs: DeepSeek's chat
+    template opens `<think>` only on `thinking`/`enable_thinking`, and otherwise ends the generation
+    prompt with `<｜Assistant｜></think>` - the block is already closed, so the model answers without
+    thinking.  A server that took the request alone as the truth started its parser inside the thinking:
+    the whole answer came back as reasoning (the web app showed it under "Thought for N s"), and the
+    model's end-of-sentence token at its end was kept as its literal spelling.  Service.thinking_open
+    reads the rendered prompt instead."""
+
+    EOS = "<｜end▁of▁sentence｜>"
+    EOS_ID = 257                                      # the second SPECIALS entry, as ByteTokenizer numbers them
+    TEMPLATE = ("{{- '<｜User｜>' + messages[-1].content + '<｜end▁of▁sentence｜>' }}"
+                "{%- if thinking is defined and thinking is true -%}"
+                "{{- '<｜Assistant｜><think>' }}"
+                "{%- else -%}"
+                "{{- '<｜Assistant｜></think>' }}"
+                "{%- endif -%}")
+
+    class Vocab(ByteTokenizer):
+        """A DeepSeek-style vocabulary: its own control tokens, its end of sentence named as its eos, and
+        the two thinking markers as single tokens."""
+        SPECIALS = ["<｜begin▁of▁sentence｜>", "<｜end▁of▁sentence｜>", "<｜Assistant｜>", "<｜User｜>",
+                    "<think>", "</think>"]
+        EOS_ID = 257                                      # the second SPECIALS entry, as ByteTokenizer numbers
+
+        @property
+        def special_ids(self):
+            return {"tokenizer.ggml.eos_token_id": self.EOS_ID}
+
+    class AnswerOnly(MockEngine):
+        """Answers with no thinking at all - what a model whose prompt already closed the block does - and
+        ends on the vocabulary's own end-of-sentence token."""
+
+        def __init__(self, tok, eos_id):
+            super().__init__(tok, "x", max_context=CTX)
+            self.eos = eos_id
+
+        def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+            for t in (self.tok.encode("Ciao! Come posso help?", parse_special=True) + [self.eos])[:max_new]:
+                if cancel.is_set():
+                    return
+                yield t
+
+    def answer(self, kwargs, tok=None):
+        """-> (thinking, reasoning, content, finish) of one request whose kwargs the template may answer
+        differently: the request asks for the highest effort, the template decides on its own switch."""
+        tok = tok if tok is not None else self.Vocab()
+        with tempfile.TemporaryDirectory() as d:
+            tpl = Path(d) / "chat_template.jinja"
+            tpl.write_text(self.TEMPLATE, encoding="utf-8")
+            svc = Service(self.AnswerOnly(tok, self.EOS_ID), tok, ChatTemplate(tpl))
+        ids, thinking, max_new = svc.prepare([{"role": "user", "content": "ciao"}], [], kwargs, 100)
+        out, done = [], None
+        for kind, x in svc.run(ids, thinking, [], max_new, {}, threading.Event()):
+            if kind == "event":
+                out.append((x.kind, x.text))
+            elif kind == "done":
+                done = x
+        return (thinking, "".join(t for k, t in out if k == "reasoning"),
+                "".join(t for k, t in out if k == "content"), done["finish"])
+
+    def test_a_closed_prompt_answers_without_thinking(self):
+        # the request asks for the highest effort; this template only opens the block on its own switch
+        thinking, reasoning, content, finish = self.answer({"reasoning_effort": "xhigh"})
+        self.assertFalse(thinking)                    # the prompt closed it: the model was not asked to think
+        self.assertEqual(content, "Ciao! Come posso help?")
+        self.assertEqual(reasoning, "")               # no "Thought for N s" over the answer
+        self.assertNotIn(self.EOS, content + reasoning)   # the end of the turn is not shown as text
+        self.assertEqual(finish, "stop")
+
+    def test_the_templates_own_switch_still_thinks(self):
+        thinking, reasoning, content, _ = self.answer({"reasoning_effort": "xhigh", "thinking": True})
+        self.assertTrue(thinking)
+        self.assertTrue(reasoning.startswith("Ciao!"))    # the model was asked: its text is the thinking
+        self.assertEqual(content, "")
+
+    def test_a_vocabulary_without_think_markers_keeps_the_requests_answer(self):
+        # ByteTokenizer names no <think>: nothing in the prompt can be read, so the request's kwargs decide,
+        # as they did before
+        for kwargs, want in (({}, True), ({"enable_thinking": False}, False)):
+            thinking, _, _, _ = self.answer(kwargs, tok=ByteTokenizer())
+            self.assertIs(thinking, want)
+
+
 class ThinkingBudget(unittest.TestCase):
     """#123: reasoning_budget_tokens (opt-in): at the budget the thinking is wrapped up and the model answers,
     continuing from the prompt plus what it generated plus the wrap-up (a prefix the engine already holds)."""
