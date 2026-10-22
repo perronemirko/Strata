@@ -4157,6 +4157,136 @@ class ReasoningCloseRetry(unittest.TestCase):
         self.assertEqual(c["message"]["reasoning_content"], 'two plus two is "4"')
 
 
+class DeepSeekEosTokenizer(ByteTokenizer):
+    """A vocabulary whose end of turn is DeepSeek's own `<｜end▁of▁sentence｜>` (a fullwidth bar and U+2581
+    underscores): a spelling that is neither `<|im_end|>` nor `<|endoftext|>`, so a fix that only knew those two
+    literals would miss it.  The pack names it as its eos, as a GGUF's tokenizer metadata does."""
+    SPECIALS = ByteTokenizer.SPECIALS + ["<\uff5cend\u2581of\u2581sentence\uff5c"]
+
+    @property
+    def special_ids(self):
+        return {"tokenizer.ggml.eos_token_id": 256 + self.SPECIALS.index(self.SPECIALS[-1])}
+
+
+class ControlTokenInThinkingEngine(ThinkingEngine):
+    """The escaped reply: reasoning that ends on a control token's spelling (`<|endoftext|>`, `<|im_end|>`) written
+    as text, without closing its thinking.  The engine stops there, as a real one does on its end-of-turn token:
+    nothing after it exists.  A prompt that ends the thinking (the continuation) gets the answer, the way the model
+    continues after `</think>`.  Unlike ThinkingEngine this engine encodes its script with parse_special, so the
+    spelling really is the vocabulary's one control token."""
+    THOUGHT = "two plus two is <|endoftext|>"
+
+    def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+        self.prompts.append(list(ids))
+        done = self.tok.decode(ids).endswith("</think>" + chr(10) + chr(10))
+        text = self.ANSWER if done else self.THOUGHT
+        for t in (self.tok.encode(text, parse_special=True)
+                  + self.tok.encode("<|im_end|>", parse_special=True))[:max_new]:
+            if cancel.is_set():
+                return
+            yield t
+
+
+class ControlTokenInsideThinking(unittest.TestCase):
+    """A control token's text the model writes INSIDE its thinking is that text, escaped: it is never swallowed as
+    the end of the turn.  Whether the reply is then continued with the thinking closed stays with #1053's opt-in."""
+
+    def setUp(self):
+        self.tok = ByteTokenizer()
+        self.engine = ControlTokenInThinkingEngine(self.tok)
+        self.svc = Service(self.engine, self.tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        self.httpd = serve(self.svc, port=0)
+        self.base = f"http://127.0.0.1:{self.httpd.server_address[1]}"
+
+    def tearDown(self):
+        self.httpd.shutdown()
+        self.httpd.server_close()
+
+    def chat(self):
+        body = {"model": "m", "messages": [{"role": "user", "content": "2+2?"}], "max_tokens": 300}
+        req = urllib.request.Request(self.base + "/v1/chat/completions", data=json.dumps(body).encode(),
+                                     headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return json.loads(r.read().decode())["choices"][0]
+
+    def test_the_literal_is_never_lost(self):
+        for lit in ("<|endoftext|>", "<|im_end|>"):
+            with self.subTest(literal=lit):
+                self.engine.THOUGHT = f"two plus two is {lit}"
+                c = self.chat()
+                # the spelling reaches the client as the model's own words, inside the reasoning
+                self.assertIn(lit, c["message"]["reasoning_content"])
+                self.assertIn("two plus two is", c["message"]["reasoning_content"])
+                self.assertEqual(c["finish_reason"], "stop")
+                # off by default: the turn ends where the engine stopped, as it always did
+                self.assertFalse(c["message"].get("content"))
+
+    def test_with_the_opt_in_the_answer_is_not_lost(self):
+        for lit in ("<|endoftext|>", "<|im_end|>"):
+            with self.subTest(literal=lit):
+                before = len(self.engine.prompts)
+                self.svc.reasoning_close_retry = True
+                self.engine.THOUGHT = f"two plus two is {lit}"
+                c = self.chat()
+                self.assertIn(lit, c["message"]["reasoning_content"])
+                self.assertEqual(c["message"]["content"], ControlTokenInThinkingEngine.ANSWER)
+                self.assertEqual(c["finish_reason"], "stop")
+                self.assertEqual(len(self.engine.prompts), before + 2)   # continued once, not twice
+                # the engine's own context keeps the token it really produced, not its spelling
+                second = self.tok.decode(self.engine.prompts[before + 1])
+                self.assertTrue(second.endswith("</think>" + chr(10) + chr(10)))
+                self.assertIn(lit, second)
+
+    def test_an_escaped_token_does_not_double_the_thinking(self):
+        self.svc.reasoning_close_retry = True
+        c = self.chat()
+        self.assertEqual(c["message"]["content"], ControlTokenInThinkingEngine.ANSWER)
+        self.assertEqual(len(self.engine.prompts), 2)           # closed once, as without the escape
+
+
+class EndOfSentenceLiteral(unittest.TestCase):
+    """The DeepSeek spelling: a model whose end of turn is `<｜end▁of▁sentence｜>` writes that literal, which is
+    neither `<|im_end|>` nor `<|endoftext|>`.  Written inside the thinking it is escaped as text, and the engine
+    that stops on it is still read as the end of the turn ("stop", not "length")."""
+    EOS = "<\uff5cend\u2581of\u2581sentence\uff5c"
+
+    def setUp(self):
+        self.tok = DeepSeekEosTokenizer()
+        self.engine = ControlTokenInThinkingEngine(self.tok)
+        self.svc = Service(self.engine, self.tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        self.httpd = serve(self.svc, port=0)
+        self.base = f"http://127.0.0.1:{self.httpd.server_address[1]}"
+
+    def tearDown(self):
+        self.httpd.shutdown()
+        self.httpd.server_close()
+
+    def chat(self):
+        body = {"model": "m", "messages": [{"role": "user", "content": "ciao"}], "max_tokens": 300}
+        req = urllib.request.Request(self.base + "/v1/chat/completions", data=json.dumps(body).encode(),
+                                     headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return json.loads(r.read().decode())["choices"][0]
+
+    def test_the_deepseek_spelling_ends_the_turn_as_stop(self):
+        # the model answers and closes on its own end-of-turn token: the turn ends as "stop"
+        self.engine.THOUGHT = "ok</think>\n\nCiao! " + self.EOS
+        c = self.chat()
+        self.assertEqual(c["message"]["content"], "Ciao! ")
+        self.assertEqual(c["finish_reason"], "stop")
+
+    def test_the_deepseek_spelling_inside_the_thinking_is_escaped(self):
+        self.engine.THOUGHT = "Ciao! " + self.EOS
+        c = self.chat()
+        self.assertIn(self.EOS, c["message"]["reasoning_content"])
+        self.assertEqual(c["finish_reason"], "stop")
+        self.assertFalse(c["message"].get("content"))           # off by default, as #1053 stays opt-in
+        self.svc.reasoning_close_retry = True
+        again = self.chat()
+        self.assertIn(self.EOS, again["message"]["reasoning_content"])
+        self.assertEqual(again["message"]["content"], ControlTokenInThinkingEngine.ANSWER)
+
+
 class ThinkingBudget(unittest.TestCase):
     """#123: reasoning_budget_tokens (opt-in): at the budget the thinking is wrapped up and the model answers,
     continuing from the prompt plus what it generated plus the wrap-up (a prefix the engine already holds)."""

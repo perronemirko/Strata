@@ -3788,6 +3788,19 @@ class Service:
         eos = (getattr(tokenizer, "special_ids", None) or {}).get("tokenizer.ggml.eos_token_id")
         if isinstance(eos, int) and not isinstance(eos, bool) and eos >= 0:
             self.stop_ids.add(eos)
+        # A stop id's literal spelling, when the vocabulary names one: the model writing `<|endoftext|>` or
+        # `<|im_end|>` INSIDE its thinking is that spelling as text, not the end of the turn.  Service._run
+        # escapes it into the reasoning instead of swallowing it; whether the reply is then continued with
+        # the thinking closed stays with reasoning_close_retry (#1053).  An id with no spelling in this
+        # vocabulary (a bare eos with no control literal) has nothing to escape and keeps the old behaviour.
+        self.control_literals: dict[int, str] = {}
+        named = known if known is not None else {
+            lit: tokenizer.encode(lit, parse_special=True)[0]
+            for lit in getattr(tokenizer, "control_tokens", ())
+            if tokenizer.encode(lit, parse_special=True)}
+        for lit, tid in named.items():
+            if isinstance(tid, int) and not isinstance(tid, bool) and tid in self.stop_ids:
+                self.control_literals[tid] = lit
         if hasattr(tokenizer, "encode_marked") and hasattr(tokenizer, "max_special_len"):
             from strata_tokenizer import PromptEncoder
             # one kept prompt per conversation the engine's cache can hold (--conversation-cache-slots); the
@@ -4985,6 +4998,7 @@ class Service:
             opening, force = parser.feed(force), None
         tail = ""                                       # the last characters written (the newlines before a call)
         answered, close_retried = False, False          # #1053: content or a call came out; the thinking was closed
+        mid_think_stop = None                          # a control token's spelling written inside the thinking
         nf_retried = False                              # #879: the request was sent again after non-finite logits
         timings, before = None, None                    # this request's timings; the engine's `last` before it
         recovery_count, reasoning_text, repeat_coverage = 0, "", 0.0
@@ -5134,6 +5148,25 @@ class Service:
                                     if force and parser.state == "reasoning" and parser.buf == THINK_END:
                                         opens = True    # #537: the held </think> was the end: the call opens there
                                         break
+                                    lit = self.control_literals.get(t)
+                                    # A clean point only: nothing is held back as a tag still arriving (a `</think>`
+                                    # the end of the turn resolves, #537) and no character is split across tokens.
+                                    if (lit and parser.state in ("reasoning", "rcall") and not parser.buf
+                                            and not parser.pending and not detok.pending()):
+                                        # the model wrote a control token's spelling inside its thinking: that is
+                                        # text, not the end of the turn.  It goes to the client as the literal
+                                        # words instead of being swallowed as the end; what closes the turn and
+                                        # whether the reply is continued stays with reasoning_close_retry (#1053).
+                                        mid_think_stop = lit
+                                        finish = "stop"
+                                        raw_ids.append(t)
+                                        seg.append(t)
+                                        thinking_n += 1
+                                        run_len, run_tok = 1, t
+                                        tail = (tail + lit)[-2:]
+                                        for ev in cut(parser.feed(lit)):
+                                            yield "event", ev
+                                        break
                                     finish = "stop"
                                     raw_ids.append(t)
                                     break
@@ -5265,13 +5298,19 @@ class Service:
                                 and not answered and not wrap and not opens and parser.state == "reasoning"
                                 and parser.buf != THINK_END         # #537: not after a held </think>, the end
                                 and (stops is None or stops.hit is None) and not cancel.is_set()):
-                            # #1053: the model wrote its reasoning and stopped before </think>: the client would get
-                            # an empty answer.  Close the thinking once and let it answer.
+                            # #1053 (opt-in): the model wrote its reasoning and stopped before </think>: the client
+                            # would get an empty answer.  Close the thinking once and let it answer.  When the stop
+                            # was a control token's spelling written inside the thinking, that spelling was already
+                            # kept as reasoning text above, so the answer is not lost with it.
                             close_retried = True
                             extra = self.tok.encode(REASONING_CLOSE, parse_special=True)
                             if max_new - n - len(extra) >= 1:
-                                print("[strata] the reply ended inside its thinking with no answer: closing the "
-                                      "thinking once and continuing (reasoning_close_retry)", flush=True)
+                                print(("[strata] the model wrote a control token's spelling "
+                                      f"({mid_think_stop!r}) inside its thinking: kept as text; closing the "
+                                      "thinking once and continuing (reasoning_close_retry)"
+                                      if mid_think_stop is not None else
+                                      "[strata] the reply ended inside its thinking with no answer: closing the "
+                                      "thinking once and continuing (reasoning_close_retry)"), flush=True)
                                 for t in extra:
                                     n += 1
                                     raw_ids.append(t)
