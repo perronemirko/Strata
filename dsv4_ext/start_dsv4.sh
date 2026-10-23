@@ -13,6 +13,7 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 EXT_ROOT="$SCRIPT_DIR"
 
+# Absolute: a relative default would resolve against whatever directory this is started from.
 MODEL_DIR_DEFAULT="/media/albus/windows/Users/mio/models/llm_models/models/DeepSeekV4"
 MODEL="${DSV4_MODEL:-$MODEL_DIR_DEFAULT/DeepSeek-V4-Flash-UD-IQ1_M-00001-of-00003.gguf}"
 PROFILE="${DSV4_PROFILE:-$MODEL_DIR_DEFAULT/dsv4_experts.bin}"
@@ -50,7 +51,7 @@ fi
 echo "  model: $MODEL"
 echo ""
 
-ARGS="--model $MODEL --port $PORT --host 127.0.0.1 --ctx $CTX --threads $THREADS"
+ARGS="--model $MODEL --port $PORT --host 0.0.0.0 --ctx $CTX --threads $THREADS"
 ARGS="$ARGS --prefill-chunk 256 --workdir $EXT_ROOT/serve-work --model-name deepseek-v4-flash"
 if [ "$GPU" = 1 ]; then
     ARGS="$ARGS --cuda --expert-vram-pct auto --expert-cache 256 --expert-vram-reserve-mib 768"
