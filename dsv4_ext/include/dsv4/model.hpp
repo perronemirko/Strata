@@ -65,6 +65,7 @@ struct RunOpts {
     long long ram_cache_mib = 8192;     ///< LRU RAM arena size in MiB for MISS experts (0 = disabled).
     long long host_ram_reserve_mib = 0; ///< Host RAM this run must not touch: what the sibling engines already hold.
     int adapt_swaps = 0;                ///< Adaptive expert swap count tracking.
+    float pcie_frac = -1.0f;            ///< --pcie-frac F: share of a layer's MISS experts sent to the device by DMA from the page-locked arena. -1 = auto (0.55, Strata's native-pack default per SPEC_STRATA_VERIFIED.md section 4); 0 = compute every miss in place on the CPU tier, 1 = stage every miss.
     bool verify_slots = false;          ///< Verify VRAM slot assignments at load time.
     bool verbose = true;                ///< Print startup report: memory plan, profile, RAM/VRAM counts.
     int prefill_chunk = 256;            ///< Prefill batch size: 0 = disabled (one token at a time).
@@ -102,6 +103,12 @@ struct Stats {
     double total_s = 0;                 ///< Total forward pass time in seconds.
     double cpu_miss_s = 0;              ///< Time spent computing MISS experts on CPU/host.
     double gpu_hit_s = 0;               ///< Time spent waiting for HIT experts on GPU/device.
+    uint64_t pinned_stage_bytes = 0;    ///< MISS-expert bytes DMA'ed straight from a page-locked arena (docs/TODO.md item 1).
+    uint64_t staged_host_bytes = 0;     ///< MISS-expert bytes that still paid the pinned staging bounce (fallback path).
+    uint64_t graph_captures = 0;        ///< CUDA graphs captured for a decode shape (docs/TODO.md item 5).
+    uint64_t graph_replays = 0;         ///< Decode layers served by a replayed graph.
+    uint64_t doorbell_reads = 0;        ///< Layer results read back through the doorbell instead of a synchronous DtoH.
+    uint64_t d2h_syncs = 0;             ///< Layer results that still paid the blocking readback.
     uint64_t spec_steps = 0;            ///< Speculative steps executed (draft + verify rounds).
     uint64_t spec_drafts = 0;           ///< Draft tokens proposed by the MTP module.
     uint64_t spec_accepted = 0;         ///< Draft tokens accepted by the main model's verification.

@@ -25,6 +25,8 @@
 
 #include <cstdio>
 #include <cstring>
+#include <cstdint>
+#include <vector>
 
 #include <cuda_runtime.h>
 
@@ -56,6 +58,15 @@ float* g_down_acc = nullptr;   // kMaxHit * kMaxDim floats: the down projection 
 uint8_t* g_stage = nullptr;
 size_t g_stage_bytes = 0;
 uint8_t* g_stage_pin = nullptr;
+
+// The stream every launch and copy in this file uses. It is the legacy default stream (0) for the
+// whole life of a run EXCEPT while a CUDA graph is being captured, when it points at the capture
+// stream: the launches are then recorded, not executed. The <<<g, b, 0, s>>> spelling below is
+// what makes that possible - the third argument is dynamic shared memory (these kernels use static
+// shared arrays, so it is 0) and the fourth is the stream. Without it the kernels would go to the
+// default stream whatever stream the capture was opened on, and the graph would record nothing.
+cudaStream_t g_launch_stream = 0;
+cudaStream_t g_cap_stream = nullptr;
 
 // Batched-prefill scratch: the token gather list and the routing weights of one expert are HOST
 // arrays, so every batched launch copies them up first. One pair of buffers, reused expert by
@@ -221,6 +232,13 @@ __global__ void sum_rows_kernel(const float* __restrict__ tmp, int n, int64_t di
     y[i] = s;
 }
 
+// The doorbell's announcement: one ordered increment of a counter that lives in mapped pinned
+// memory, so the host can read it without a driver call. It is INCREMENTED, not written with a
+// constant, because the publish may be inside a captured CUDA graph: a replay runs this kernel
+// again, and a value baked at capture time would leave the host waiting on a number that never
+// comes.
+__global__ void bump_kernel(uint32_t* __restrict__ counter) { *counter += 1u; }
+
 // ---------------------------------------------------------------- dispatch
 template <class Tr>
 bool launch_mv(uint32_t type, const uint8_t* W, int64_t rows, int64_t in, const float* d_x, float* d_y) {
@@ -230,7 +248,7 @@ bool launch_mv(uint32_t type, const uint8_t* W, int64_t rows, int64_t in, const 
     // shared with dequant.cpp, and if a trait's block size disagrees with the type it claims to decode,
     // the honest answer is false ("wrote nothing, use the host") - not a row of zeros on the device.
     if (in % Tr::BE != 0 || (int64_t)(in / Tr::BE) * (int64_t) Tr::BB != (int64_t) rb) return false;
-    matvec_kernel<Tr><<<(unsigned) rows, kThreads>>>(W, rows, (int) in, (int) rb, d_x, d_y);
+    matvec_kernel<Tr><<<(unsigned) rows, kThreads, 0, g_launch_stream>>>(W, rows, (int) in, (int) rb, d_x, d_y);
     return check(cudaGetLastError(), "matvec launch");
 }
 
@@ -247,7 +265,7 @@ bool launch_mm(uint32_t type, const uint8_t* W, int64_t rows, int64_t in, const 
     for (int t0 = 0; t0 < T; t0 += 65535) {
         const int tn = T - t0 < 65535 ? T - t0 : 65535;
         dim3 grid((unsigned) rows, (unsigned) tn);
-        matmul_kernel<Tr><<<grid, kThreads>>>(W, rows, (int) in, (int) rb,
+        matmul_kernel<Tr><<<grid, kThreads, 0, g_launch_stream>>>(W, rows, (int) in, (int) rb,
                                               d_X + (int64_t) t0 * x_stride, tn,
                                               d_sel ? d_sel + t0 : nullptr,
                                               d_Y + (int64_t) t0 * y_stride, x_stride, y_stride);
@@ -345,6 +363,63 @@ bool staging(uint8_t* device_pool, size_t bytes) {
 
 bool has_staging() { return g_stage != nullptr && !g_cuda_err; }
 
+// ---------------------------------------------------------------- pinned host arenas
+// docs/TODO.md item 1: the mistake was never the destination, it was the SOURCE. staging() already
+// cudaHostAllocs a buffer, and the model copied the expert's bytes INTO it from pageable memory -
+// so a MISS expert paid shard -> LRU arena (pageable) -> pinned staging -> VRAM. With a pinned
+// arena the model owns, the first hop lands in page-locked memory and the second hop is skipped:
+// one host copy per expert instead of two, and the DMA starts straight from the arena.
+//
+// Only bounded arenas go through here. The profile's RAM arena (y.ram) stays pageable on
+// deliberate grounds: 74.4 GiB of pinned memory is not swappable and would have blown exactly the
+// OOM already documented in AVVIO_HOST.md.
+void* pin_host(size_t bytes) {
+    if (!g_ready || g_cuda_err || bytes == 0) return nullptr;
+    void* p = nullptr;
+    if (!check(cudaHostAlloc(&p, bytes, cudaHostAllocDefault), "pinned arena")) return nullptr;
+    return p;
+}
+void unpin_host(void* p) { if (p) cudaFreeHost(p); }
+
+/// Ask the driver rather than assume: an arena the model fell back to malloc() for must not be
+/// treated as DMA-able. Called once per arena at load time, never per token.
+bool host_is_pinned(const void* p) {
+    if (!p || g_cuda_err) return false;
+    cudaPointerAttributes a;
+    if (cudaPointerGetAttributes(&a, p) != cudaSuccess) return false;
+    return a.type == cudaMemoryTypeHost;
+}
+
+// ---------------------------------------------------------------- strided readback
+// docs/TODO.md item 7: mvb() used to read a batched matmul back one token row at a time, and every
+// d2h() is a synchronous cudaMemcpy - one stream drain per row, ~256 per batched matmul and ~470k
+// per prefill chunk. This is the same bytes in one call: n queued async copies and a single sync.
+void d2h_rows(void* dst, const void* src, size_t n_rows, size_t row_bytes,
+              size_t elem_size, size_t dst_stride, size_t src_stride) {
+    if (!n_rows || !row_bytes || !elem_size || g_cuda_err) return;
+    const size_t dstep = dst_stride * elem_size, sstep = src_stride * elem_size;
+    if (dstep == row_bytes && sstep == row_bytes) {   // contiguous on both sides: one flat copy
+        if (!check(cudaMemcpyAsync(dst, src, n_rows * row_bytes, cudaMemcpyDeviceToHost, g_launch_stream),
+                   "flat D2H"))
+            return;
+    } else {
+        for (size_t t = 0; t < n_rows; ++t)
+            if (!check(cudaMemcpyAsync((char*) dst + t * dstep, (char*) src + t * sstep, row_bytes,
+                                       cudaMemcpyDeviceToHost, g_launch_stream), "strided D2H"))
+                return;
+    }
+    check(cudaStreamSynchronize(g_launch_stream), "strided D2H sync");
+}
+
+// ---------------------------------------------------------------- fused activation on the device
+bool swiglu(const float* d_g, const float* d_u, float* d_a, int64_t n, float limit) {
+    if (!g_ready || g_cuda_err || n <= 0) return false;
+    // w_k = 1: the shared expert's routing weight is folded in by the caller, exactly as the
+    // host path's swiglu_clamped() leaves it.
+    swiglu_kernel<<<(unsigned) ((n + 255) / 256), 256, 0, g_launch_stream>>>(d_g, d_u, d_a, (int) n, limit, 1.f);
+    return check(cudaGetLastError(), "swiglu launch");
+}
+
 void h2d(void* dst, const void* src, size_t bytes) {
     if (!bytes || g_cuda_err) return;
     check(cudaMemcpy(dst, src, bytes, cudaMemcpyHostToDevice), "H2D copy");
@@ -352,6 +427,14 @@ void h2d(void* dst, const void* src, size_t bytes) {
 void d2h(void* dst, const void* src, size_t bytes) {
     if (!bytes || g_cuda_err) return;
     check(cudaMemcpy(dst, src, bytes, cudaMemcpyDeviceToHost), "D2H copy");  // also the sync point of a launch
+}
+
+void h2d_async(void* dst, const void* src, size_t bytes) {
+    if (!bytes || g_cuda_err) return;
+    // Queued on the launch stream, so it is ordered before the kernels that read dst. From
+    // pageable memory the driver still stages the copy internally; that is exactly why the model
+    // asks whether an arena is pinned before it starts a DMA from it.
+    check(cudaMemcpyAsync(dst, src, bytes, cudaMemcpyHostToDevice, g_launch_stream), "async H2D");
 }
 
 bool matvec(uint32_t type, const uint8_t* W, int64_t rows, int64_t in, const float* d_x, float* d_y) {
@@ -399,7 +482,11 @@ bool matmul(uint32_t type, const uint8_t* W, int64_t rows, int64_t in,
     const int32_t* d_sel = nullptr;
     if (sel) {
         if (!g_d_sel) return false;
-        if (!check(cudaMemcpy(g_d_sel, sel, (size_t) T * sizeof(int32_t), cudaMemcpyHostToDevice), "matmul sel H2D"))
+        // Async on the launch stream, like experts_batch() does for its gather list: the copy is
+        // queued ahead of the kernels that read g_d_sel, so the two staging implementations now
+        // behave identically (docs/TODO.md item 6 called out this inconsistency).
+        if (!check(cudaMemcpyAsync(g_d_sel, sel, (size_t) T * sizeof(int32_t), cudaMemcpyHostToDevice,
+                                  g_launch_stream), "matmul sel H2D"))
             return false;
         d_sel = g_d_sel;
     }
@@ -462,30 +549,43 @@ bool experts_batch(const ExpBatch* e, int n_exp, uint32_t type_g, uint32_t type_
         if (!gp) {   // host expert: stage it into the device pool, like experts_hit() does
             if (!b.hg || !b.hu || !b.hd || !g_stage) return false;
             if (g_stage_bytes < bg + bu + bd) return false;
-            if (!ensure_batch_pin(bg + bu + bd)) return false;
-            if (g_batch_pin_next == 0 && !check(cudaStreamSynchronize(0), "batch stage ring sync")) return false;
-            uint8_t* pin = g_batch_pin + (size_t) g_batch_pin_next * g_batch_pin_slot;
-            g_batch_pin_next = (g_batch_pin_next + 1) % kStageRing;
-            std::memcpy(pin, b.hg, bg);
-            std::memcpy(pin + bg, b.hu, bu);
-            std::memcpy(pin + bg + bu, b.hd, bd);
-            if (!check(cudaMemcpyAsync(g_stage, pin, bg + bu + bd, cudaMemcpyHostToDevice), "batch stage H2D"))
-                return false;
             gp = g_stage; gu = g_stage + bg; gd = g_stage + bg + bu;
+            if (b.host_pinned) {
+                // docs/TODO.md item 6: ONE staging implementation for both paths. The arena is
+                // already page-locked and already contiguous [gate|up|down], so the DMA starts
+                // there: no pinned ring, no host memcpy, and no ring-wrap sync to wait for.
+                if (!check(cudaMemcpyAsync(g_stage, b.hg, bg + bu + bd, cudaMemcpyHostToDevice, g_launch_stream),
+                           "batch pinned H2D"))
+                    return false;
+            } else {
+                if (!ensure_batch_pin(bg + bu + bd)) return false;
+                if (g_batch_pin_next == 0 && !check(cudaStreamSynchronize(g_launch_stream), "batch stage ring sync"))
+                    return false;
+                uint8_t* pin = g_batch_pin + (size_t) g_batch_pin_next * g_batch_pin_slot;
+                g_batch_pin_next = (g_batch_pin_next + 1) % kStageRing;
+                std::memcpy(pin, b.hg, bg);
+                std::memcpy(pin + bg, b.hu, bu);
+                std::memcpy(pin + bg + bu, b.hd, bd);
+                if (!check(cudaMemcpyAsync(g_stage, pin, bg + bu + bd, cudaMemcpyHostToDevice, g_launch_stream),
+                           "batch stage H2D"))
+                    return false;
+            }
         }
-        if (!check(cudaMemcpyAsync(g_d_sel, b.tok, (size_t) n * sizeof(int32_t), cudaMemcpyHostToDevice), "batch tok H2D"))
+        if (!check(cudaMemcpyAsync(g_d_sel, b.tok, (size_t) n * sizeof(int32_t), cudaMemcpyHostToDevice, g_launch_stream),
+                   "batch tok H2D"))
             return false;
-        if (!check(cudaMemcpyAsync(g_d_w, b.w, (size_t) n * sizeof(float), cudaMemcpyHostToDevice), "batch w H2D"))
+        if (!check(cudaMemcpyAsync(g_d_w, b.w, (size_t) n * sizeof(float), cudaMemcpyHostToDevice, g_launch_stream),
+                   "batch w H2D"))
             return false;
 
         // gate/up read the chunk through the gather; the down projection reads d_a, which this same
         // launch order has already filled for exactly those n rows.
         if (!mm_dispatch(type_g, gp, ff, dim, d_X, n, g_d_sel, d_g, dim, ff)) return false;
         if (!mm_dispatch(type_u, gu, ff, dim, d_X, n, g_d_sel, d_u, dim, ff)) return false;
-        swiglu_batch_kernel<<<(unsigned) (((int64_t) n * ff + 255) / 256), 256>>>(d_g, d_u, d_a, n, ff, swiglu_limit, g_d_w);
+        swiglu_batch_kernel<<<(unsigned) (((int64_t) n * ff + 255) / 256), 256, 0, g_launch_stream>>>(d_g, d_u, d_a, n, ff, swiglu_limit, g_d_w);
         if (!check(cudaGetLastError(), "swiglu batch launch")) return false;
         if (!mm_dispatch(type_d, gd, dim, ff, d_a, n, nullptr, d_dn, ff, dim)) return false;
-        scatter_add_kernel<<<(unsigned) (((int64_t) n * dim + 255) / 256), 256>>>(d_dn, g_d_sel, n, dim, d_Y);
+        scatter_add_kernel<<<(unsigned) (((int64_t) n * dim + 255) / 256), 256, 0, g_launch_stream>>>(d_dn, g_d_sel, n, dim, d_Y);
         if (!check(cudaGetLastError(), "scatter_add launch")) return false;
     }
     return true;
@@ -518,11 +618,22 @@ bool experts_hit(const ExpPtrs& p, uint32_t type_g, uint32_t type_u, uint32_t ty
         if (!p.hg[k] || !p.hu[k] || !p.hd[k]) return false;
         if (p.bpe < bg + bu + bd || (size_t) (k + 1) * p.bpe > g_stage_bytes) return false;
         uint8_t* dst = g_stage + (size_t) k * p.bpe;
-        uint8_t* pin = g_stage_pin + (size_t) k * p.bpe;
-        std::memcpy(pin, p.hg[k], bg);
-        std::memcpy(pin + bg, p.hu[k], bu);
-        std::memcpy(pin + bg + bu, p.hd[k], bd);
-        if (!check(cudaMemcpyAsync(dst, pin, bg + bu + bd, cudaMemcpyHostToDevice), "stage H2D")) return false;
+        if (p.host_pinned) {
+            // docs/TODO.md items 1+2: the arena the model filled IS page-locked, so the DMA starts
+            // from it. This removes the whole second host copy: the expert's bytes were written
+            // once, into the arena, by whoever owns it.
+            if (!check(cudaMemcpyAsync(dst, p.hg[k], bg + bu + bd, cudaMemcpyHostToDevice, g_launch_stream),
+                       "pinned stage H2D"))
+                return false;
+        } else {
+            uint8_t* pin = g_stage_pin + (size_t) k * p.bpe;
+            std::memcpy(pin, p.hg[k], bg);
+            std::memcpy(pin + bg, p.hu[k], bu);
+            std::memcpy(pin + bg + bu, p.hd[k], bd);
+            if (!check(cudaMemcpyAsync(dst, pin, bg + bu + bd, cudaMemcpyHostToDevice, g_launch_stream),
+                       "stage H2D"))
+                return false;
+        }
         gp[k] = dst;
         gu[k] = dst + bg;
         gd[k] = dst + bg + bu;
@@ -531,15 +642,177 @@ bool experts_hit(const ExpPtrs& p, uint32_t type_g, uint32_t type_u, uint32_t ty
     for (int k = 0; k < nk; ++k) {
         if (!matvec(type_g, gp[k], ff, dim, d_x, d_g + (size_t) k * ff)) return false;
         if (!matvec(type_u, gu[k], ff, dim, d_x, d_u + (size_t) k * ff)) return false;
-        swiglu_kernel<<<(unsigned) ((ff + 255) / 256), 256>>>(d_g + (size_t) k * ff, d_u + (size_t) k * ff,
-                                                              d_a + (size_t) k * ff, ff, swiglu_limit, p.w[k]);
+        // The routing weight is the one argument a captured graph cannot freeze: swiglu_kernel takes
+        // it BY VALUE, so a replay would reuse the weight of the token that was captured. When the
+        // caller supplied a device-side copy - uploaded BEFORE the window opened, because a copy of
+        // fresh bytes cannot be captured - the fused kernel reads it from there instead.
+        if (p.d_w)
+            swiglu_batch_kernel<<<(unsigned) ((ff + 255) / 256), 256, 0, g_launch_stream>>>(
+                d_g + (size_t) k * ff, d_u + (size_t) k * ff, d_a + (size_t) k * ff, 1, ff, swiglu_limit,
+                p.d_w + k);
+        else
+            swiglu_kernel<<<(unsigned) ((ff + 255) / 256), 256, 0, g_launch_stream>>>(
+                d_g + (size_t) k * ff, d_u + (size_t) k * ff, d_a + (size_t) k * ff, ff, swiglu_limit, p.w[k]);
         if (!check(cudaGetLastError(), "swiglu launch")) return false;
     }
     for (int k = 0; k < nk; ++k)
         if (!matvec(type_d, gd[k], dim, ff, d_a + (size_t) k * ff, g_down_acc + (size_t) k * dim)) return false;
 
-    sum_rows_kernel<<<(unsigned) ((dim + 255) / 256), 256>>>(g_down_acc, nk, dim, d_y);
+    sum_rows_kernel<<<(unsigned) ((dim + 255) / 256), 256, 0, g_launch_stream>>>(g_down_acc, nk, dim, d_y);
     return check(cudaGetLastError(), "sum_rows launch");
+}
+
+// ================================================================================ doorbell
+// docs/TODO.md item 3. experts_hit() ends by writing d_y into a device block; the model used to
+// read it back with gpu::d2h(), a synchronous cudaMemcpy whose comment literally says "also the
+// sync point of a launch" - one stream drain per layer, ~516 per token. Here the result is
+// written into mapped pinned memory instead and announced by bumping a counter the host can read
+// without touching the driver, so the host's CPU expert tier runs while the GPU queue is still
+// open and the readback costs nothing.
+//
+// The counter and the payload are ONE allocation: the payload first, the counter right after it.
+// cudaHostGetDevicePointer maps the whole range, and the model never writes past the payload.
+bool doorbell_open(Doorbell& db, size_t n_floats) {
+    if (!g_ready || g_cuda_err || n_floats == 0) return false;
+    const size_t pb = n_floats * 4;
+    void* raw = nullptr;
+    if (!check(cudaHostAlloc(&raw, pb + sizeof(uint32_t), cudaHostAllocMapped), "doorbell payload"))
+        return false;
+    db.payload = (float*) raw;
+    db.flag_host = (uint32_t*) ((char*) raw + pb);
+    void* dp = nullptr;
+    if (!check(cudaHostGetDevicePointer(&dp, raw, 0), "doorbell map")) {
+        cudaFreeHost(raw);
+        db.payload = nullptr;
+        return false;
+    }
+    db.d_payload = (float*) dp;
+    db.flag_dev = (uint32_t*) ((char*) dp + pb);
+    db.n_floats = n_floats;
+    db.impl = raw;
+    *db.flag_host = 0;
+    cudaMemsetAsync(db.flag_dev, 0, sizeof(uint32_t), g_launch_stream);
+    return true;
+}
+
+void doorbell_close(Doorbell& db) {
+    if (db.impl) cudaFreeHost(db.impl);
+    db.impl = nullptr;
+    db.payload = nullptr;
+    db.flag_host = nullptr;
+    db.d_payload = nullptr;
+    db.flag_dev = nullptr;
+}
+
+bool doorbell_publish(const Doorbell& db, const float* d_src, size_t n_floats) {
+    if (!db.payload || n_floats != db.n_floats || g_cuda_err) return false;
+    // The common case: experts_hit() already wrote its result into the payload's own device alias,
+    // so there is nothing to move and only the announcement is needed.
+    if (d_src != db.d_payload && !check(cudaMemcpyAsync(db.d_payload, d_src, n_floats * 4,
+                                                        cudaMemcpyDeviceToDevice, g_launch_stream),
+                                       "doorbell copy"))
+        return false;
+    bump_kernel<<<1, 1, 0, g_launch_stream>>>(db.flag_dev);
+    return check(cudaGetLastError(), "doorbell bump");
+}
+
+bool doorbell_wait(const Doorbell& db, uint32_t expected) {
+    if (!db.flag_host || expected == 0) return false;
+    // A volatile read of page-locked memory the device has already written: the compiler may not
+    // hoist it out of the loop, and there is no driver call anywhere in this spin.
+    volatile uint32_t* f = (volatile uint32_t*) db.flag_host;
+    // The spin is bounded, and the escape is honest: every so often the stream is asked whether
+    // it still has work. cudaErrorNotReady means "keep waiting"; cudaSuccess means the stream is
+    // EMPTY and the flag still has not reached expected, which can only happen if the publish was
+    // never queued - a lost handshake, not a slow kernel. Then the answer is false and the caller
+    // falls back to the synchronous readback instead of hanging for the rest of the run.
+    for (uint64_t spins = 0;; ++spins) {
+        if (*f >= expected) return true;
+        if (g_cuda_err) return false;
+        if ((spins & 0xfffffull) == 0 && cudaStreamQuery(g_launch_stream) == cudaSuccess) return false;
+    }
+}
+
+const float* doorbell_read(const Doorbell& db) { return db.payload; }
+
+// ================================================================================ one graph per shape
+// docs/TODO.md item 5, and the shape Strata already has (SPEC_STRATA_VERIFIED.md: "one CUDA graph
+// per window size, so the host never blocks on synchronous calls"). The key here is whatever the
+// CALLER says makes a replay valid; the engine uses (layer, expert-slot set, expert count), which
+// is exactly the set of pointers the captured launches read.
+//
+// What must stay OUTSIDE a window is anything whose bytes change between tokens: a host-to-device
+// copy of fresh data, or a host memcpy into a staging buffer. Those are issued before graph_open();
+// only the kernels that read them are captured.
+namespace {
+struct GraphEntry {
+    uint64_t key;
+    cudaGraph_t graph;
+    cudaGraphExec_t exec;
+    bool failed;   // instantiation failed: do not retry it on every token
+};
+std::vector<GraphEntry> g_graphs;
+
+constexpr int kMaxGraphs = 64;   // one per (layer, slot-set) shape is far more than a model needs
+}  // namespace
+
+int graph_open(GraphWindow& gw, uint64_t key) {
+    if (!g_ready || g_cuda_err) { gw.key = 0; gw.impl = nullptr; return GRAPH_NONE; }
+    gw.key = key;
+    for (GraphEntry& ge : g_graphs) {
+        if (ge.key != key || ge.failed) continue;
+        if (!check(cudaGraphLaunch(ge.exec, g_launch_stream), "graph launch")) return GRAPH_NONE;
+        gw.impl = nullptr;   // nothing to close: the graph already ran
+        return GRAPH_REPLAYED;
+    }
+    if (!g_cap_stream) check(cudaStreamCreateWithFlags(&g_cap_stream, cudaStreamNonBlocking), "capture stream");
+    if (!g_cap_stream || g_cuda_err) { gw.key = 0; return GRAPH_NONE; }
+    if (!check(cudaStreamBeginCapture(g_cap_stream, cudaStreamCaptureModeRelaxed), "graph capture")) {
+        gw.key = 0;
+        return GRAPH_NONE;
+    }
+    g_launch_stream = g_cap_stream;   // every launch this file makes now goes into the capture
+    gw.impl = (void*) (uintptr_t) 1;
+    return GRAPH_CAPTURE;
+}
+
+bool graph_close(GraphWindow& gw) {
+    if (!gw.impl) return true;   // GRAPH_REPLAYED: already launched
+    gw.impl = nullptr;
+    if (!g_cap_stream) return false;
+    cudaGraph_t graph = nullptr;
+    if (!check(cudaStreamEndCapture(g_cap_stream, &graph), "end capture")) {
+        g_launch_stream = 0;
+        return false;
+    }
+    g_launch_stream = 0;   // back to the legacy default stream for everything else
+    GraphEntry ge{gw.key, graph, nullptr, false};
+    if (!check(cudaGraphInstantiate(&ge.exec, graph, 0), "graph instantiate")) {
+        check(cudaGraphDestroy(graph), "drop failed graph");
+        g_graphs.push_back({gw.key, nullptr, nullptr, true});   // remember the refusal
+        return false;
+    }
+    if (!check(cudaGraphLaunch(ge.exec, 0), "graph launch")) {
+        check(cudaGraphDestroy(graph), "drop graph");
+        check(cudaGraphExecDestroy(ge.exec), "drop exec");
+        return false;
+    }
+    if (g_graphs.size() >= kMaxGraphs) {   // the card is not a hotel: drop the oldest shape
+        GraphEntry& old = g_graphs[0];
+        if (old.graph) check(cudaGraphDestroy(old.graph), "evict graph");
+        if (old.exec) check(cudaGraphExecDestroy(old.exec), "evict exec");
+        g_graphs.erase(g_graphs.begin());
+    }
+    g_graphs.push_back(ge);
+    return true;
+}
+
+void graph_flush() {
+    for (GraphEntry& ge : g_graphs) {
+        if (ge.exec) check(cudaGraphExecDestroy(ge.exec), "flush exec");
+        if (ge.graph) check(cudaGraphDestroy(ge.graph), "flush graph");
+    }
+    g_graphs.clear();
 }
 
 }  // namespace gpu

@@ -164,13 +164,27 @@ struct Layer {
     std::vector<uint8_t> ram;                   // RAM arena: only experts the profile marks as used
     // LRU arena for MISS experts (neither in `ram` nor in a VRAM slot). Without it every miss re-reads
     // bpe bytes from the mmap'ed shard: for a model larger than RAM that is a disk read per expert.
-    std::vector<uint8_t> cpool;                 // ncache slots of bpe bytes each
+    //
+    // docs/TODO.md item 1: when a GPU is in play this arena is PAGE-LOCKED, so the bytes a MISS
+    // needs are copied exactly once (shard -> arena) and the device DMAs them from there. The
+    // pageable std::vector stays as the fallback for a build without a device, or for the
+    // (documented, and rare) case where cudaHostAlloc refuses the arena.
+    std::vector<uint8_t> cpool;                 // ncache slots of bpe bytes each (pageable fallback)
+    uint8_t* cpool_pin = nullptr;               // same layout, page-locked (see gpu::pin_host)
+    bool arena_pinned = false;                  // cpool_pin is really DMA-able
     std::vector<int> cslot_of, cocc;            // expert -> slot, slot -> expert
     std::vector<uint64_t> cstamp;               // slot -> last use (LRU clock)
     int ncache = 0;
 };
 
-struct ExpSrc { const uint8_t *g, *u, *d; const uint8_t* packed; };  // packed != null: contiguous [g|u|d]
+// A MISS expert's bytes, wherever they live. packed != null means the three matrices are one
+// contiguous [gate | up | down] block, which is what the device's single DMA needs.
+//
+// pinned is true only when that block sits in a page-locked arena: it is the flag that lets
+// experts_hit() skip the pinned staging buffer (docs/TODO.md items 1+2). The profile's RAM copy
+// (y.ram) deliberately never sets it - 74.4 GiB of pinned memory is not swappable and would have
+// blown exactly the OOM documented in AVVIO_HOST.md.
+struct ExpSrc { const uint8_t *g, *u, *d; const uint8_t* packed; bool pinned = false; };
 
 uint64_t fnv(uint64_t h, uint64_t v) { for (int i = 0; i < 8; ++i) { h ^= (v >> (8 * i)) & 0xff; h *= 1099511628211ULL; } return h; }
 
@@ -264,8 +278,57 @@ struct Model::Impl {
     uint64_t ck_end = 0;                     // file size after the last commit
     // device scratch
     float *d_x = nullptr, *d_y = nullptr, *d_g = nullptr, *d_u = nullptr, *d_a = nullptr, *d_yh = nullptr;
+    float* d_w_dev = nullptr;   // device copy of the routing weights, for a captured window only
+    // What d_x currently holds, and how many elements: the same memoization pf_up() uses for the
+    // prefill block. mv() uploads the activation of every matvec; within one layer the SAME vector
+    // is read by the router, the routed experts and the shared expert, so remembering it turns the
+    // layer's several h2d() of identical bytes into one (docs/TODO.md item 4).
+    const float* d_x_note = nullptr;
+    size_t d_x_note_len = 0;
+    void note_d_x(const float* host, size_t len) { d_x_note = host; d_x_note_len = len; }
+    bool d_x_holds(const float* host, size_t len) const { return d_x_note == host && d_x_note_len == len; }
+    // A freed std::vector can be re-allocated at the SAME address with the SAME length and different
+    // bytes, which would make the memo above lie. Every entry point that starts a new sequence of
+    // matvecs calls this; the callers that already reset it (attention(), moe()) are the ones that
+    // own a whole layer.
+    void invalidate_d_x() { d_x_note = nullptr; d_x_note_len = 0; }
+    // docs/TODO.md item 4: the shared expert of one layer is three matvecs and a SwiGLU on a
+    // [ff]-float intermediate. mv() paid an h2d + a d2h for each of them, so a layer drained the
+    // stream four times around the experts. With the activation already in d_x and the
+    // intermediate kept in d_sg/d_su/d_sa, the whole chain stays on the card and the layer ends
+    // in ONE readback instead of four.
+    float *d_sg = nullptr, *d_su = nullptr, *d_sa = nullptr, *d_sh = nullptr;
+    gpu::Doorbell db_shared{};   // the shared expert's result, announced like the experts'
+    bool db_shared_ready = false;
+    uint32_t db_shared_seq = 0;
     std::vector<void*> allocs;
     uint8_t* d_stage = nullptr;      // device pool MISS experts are staged through (see gpu::staging)
+    // ---- decode readback without a stream sync (docs/TODO.md item 3) ----
+    // The old decode path ended every layer with gpu::d2h(), a synchronous cudaMemcpy whose own
+    // comment says it is "also the sync point of a launch": ~516 of them per token, each one
+    // draining the queue the kernels above had just filled. The doorbell writes the result into
+    // mapped pinned memory and announces it with a counter the host can read without touching the
+    // driver, so the CPU expert tier runs while the GPU queue is still open and the readback
+    // itself costs nothing.
+    gpu::Doorbell db_moe{};
+    bool db_ready = false;             // db_moe is open and usable
+    uint32_t db_seq = 0;               // publishes issued since the last reset
+    // ---- one captured launch sequence per decode shape (docs/TODO.md item 5) ----
+    gpu::GraphWindow gw_moe{};
+    bool graph_captures = false;       // the device can capture at all
+    // ---- routing of the token being decoded (see moe()) ----
+    // Members rather than stack arrays: the old code assumed top-k <= 16, which held for this
+    // model but not for the geometry SPEC_STRATA_VERIFIED.md documents (expert_used_count = 10
+    // fits, a larger family would not). These are sized from the model's own config at load.
+    std::vector<int32_t> route_idx;    // [n_expert_used] expert ids
+    std::vector<float> route_w;        // [n_expert_used] routing weights
+    std::vector<int> slot_of_k_;       // [n_expert_used] VRAM slot, -1 = not resident
+    std::vector<int> miss_k_;          // [n_expert_used] routed entries left to the CPU tier
+    std::vector<uint64_t> graph_keys;  // shapes already captured, for the report
+    bool warned_topk_capacity = false;
+    // The runtime expert limit: this model's top-k clamped to the capacity of ExpPtrs. Sized and
+    // checked once at load so the decode path never re-derives it (docs/TODO.md item 6).
+    int exp_cap = 0;
     // ---- prefill scratch (see forward_chunk) ----
     // A chunk of T tokens shares every weight row: the projections become [rows]x[in] times [T], and
     // the MoE evaluates each routed expert ONCE for all the tokens of the chunk that picked it.
@@ -459,6 +522,12 @@ struct Model::Impl {
         for (void* p : allocs) gpu::release(p);
         // The adapted MTP module is a host arena, not a mapping: only the real shards are unmapped.
         for (size_t i = 0; i < maps.size(); ++i) if (maps[i] && (int) i != mtp_synthetic) munmap((void*) maps[i], map_len[i]);
+        // Page-locked arenas and captured graphs are the device's to give back, not the process's.
+        for (Layer& y : L) if (y.cpool_pin) { gpu::unpin_host(y.cpool_pin); y.cpool_pin = nullptr; }
+        if (db_moe.payload) gpu::doorbell_close(db_moe);
+        if (db_shared.payload) gpu::doorbell_close(db_shared);
+        db_ready = db_shared_ready = false;
+        gpu::graph_flush();
     }
     // vram_used counts every byte handed out by the device layer, so the residency plan can subtract the
     // Sizes of the allocations in allocs[], index for index: the prefill arena has to give its VRAM
@@ -512,7 +581,12 @@ struct Model::Impl {
     void mv(const Tn& w, const float* x, float* y, int64_t row0 = 0, int64_t nrows = -1) {
         if (nrows < 0) nrows = w.out;
         if (o.gpu && w.d) {
-            gpu::h2d(d_x, x, (size_t) w.in * 4);
+            // One upload per activation per layer instead of one per matvec: the router, the routed
+            // experts and the shared expert all read the same vector (docs/TODO.md item 4).
+            if (!d_x_holds(x, (size_t) w.in)) {
+                gpu::h2d(d_x, x, (size_t) w.in * 4);
+                note_d_x(x, (size_t) w.in);
+            }
             // matvec returns false when this backend has no kernel for the type: fall back to the host
             // rather than reading back a d_y that was never written.
             if (gpu::matvec(w.type, w.d + (size_t) row0 * w.rb, nrows, w.in, d_x, d_y)) {
@@ -550,8 +624,16 @@ struct Model::Impl {
                 // [0,nrows) of each row. Copying one flat span instead would also move the gaps
                 // between rows, which hold whatever an earlier matmul left there - and when
                 // y_stride > nrows those gaps are the neighbouring group's output.
-                for (int t = 0; t < T; ++t)
-                    gpu::d2h(Y + (size_t) t * y_stride, d_pY + (size_t) t * y_stride, (size_t) nrows * 4);
+                // The kernel wrote row t at d_pY + t*y_stride, so the meaningful floats are exactly
+                // [0,nrows) of each row. Copying one flat span instead would also move the gaps
+                // between rows, which hold whatever an earlier matmul left there - and when
+                // y_stride > nrows those gaps are the neighbouring group's output.
+                //
+                // docs/TODO.md item 7: that is exactly a strided readback, and doing it one row per
+                // gpu::d2h() meant one stream drain per token - ~256 synchronous DtoH per batched
+                // matmul, ~470k per prefill chunk. One call, one sync.
+                gpu::d2h_rows(Y, d_pY, (size_t) T, (size_t) nrows * 4, 4, (size_t) y_stride,
+                              (size_t) y_stride);
                 return true;
             }
             if (!warned_host_fallback) {
@@ -580,8 +662,9 @@ struct Model::Impl {
     }
 
     // ------------------------------------------------------------ expert sources / residency
-    static ExpSrc packed(const Layer& l, const uint8_t* p) {
-        ExpSrc s; s.packed = p; s.g = p; s.u = p + l.bg; s.d = p + l.bg + l.bu; return s;
+    static ExpSrc packed(const Layer& l, const uint8_t* p, bool pinned = false) {
+        ExpSrc s; s.packed = p; s.g = p; s.u = p + l.bg; s.d = p + l.bg + l.bu; s.pinned = pinned;
+        return s;
     }
     ExpSrc src(const Layer& l, int e) const {
         if (l.ram_idx[(size_t) e] >= 0) return packed(l, l.ram.data() + (size_t) l.ram_idx[(size_t) e] * l.bpe);
@@ -591,10 +674,21 @@ struct Model::Impl {
     }
     /// Weights of a MISS expert: the profile's RAM copy, else the LRU arena (copied out of the mmap once),
     /// else the mmap itself when the arena is disabled.
+    // Weights of a MISS expert: the profile's RAM copy, else the LRU arena (copied out of the mmap
+    // once), else the mmap itself when the arena is disabled.
+    //
+    // The arena has two spellings and this is the only place that chooses between them: cpool_pin
+    // when the GPU build got a page-locked arena, cpool otherwise. Same layout, same LRU bookkeeping
+    // - the difference is only whether the bytes the caller returns may start a DMA (ExpSrc::pinned),
+    // which is exactly what docs/TODO.md items 1 and 2 ask for.
     ExpSrc src_miss(Layer& y, int e) {
         if (y.ncache <= 0 || y.ram_idx[(size_t) e] >= 0) return src(y, e);
+        const bool use_pin = y.arena_pinned && y.cpool_pin;
         const int have = y.cslot_of[(size_t) e];
-        if (have >= 0) { y.cstamp[(size_t) have] = ++cache_clock; ++st->cache_hits; return packed(y, y.cpool.data() + (size_t) have * y.bpe); }
+        if (have >= 0) {
+            y.cstamp[(size_t) have] = ++cache_clock; ++st->cache_hits;
+            return packed(y, (use_pin ? y.cpool_pin : y.cpool.data()) + (size_t) have * y.bpe, use_pin);
+        }
         int slot = -1;
         for (int s = 0; s < y.ncache; ++s) if (y.cocc[(size_t) s] < 0) { slot = s; break; }
         if (slot < 0) {  // full: evict the least recently used
@@ -603,13 +697,15 @@ struct Model::Impl {
             if (y.cocc[(size_t) slot] >= 0) y.cslot_of[(size_t) y.cocc[(size_t) slot]] = -1;
             ++st->cache_evictions;
         }
-        uint8_t* dst = y.cpool.data() + (size_t) slot * y.bpe;
+        uint8_t* dst = (use_pin ? y.cpool_pin : y.cpool.data()) + (size_t) slot * y.bpe;
+        // One host copy, period: the shard -> arena hop. The device reads the arena through a DMA,
+        // so the arena -> pinned staging hop the CPU build still pays is gone from this path.
         std::memcpy(dst, y.eg.h + (size_t) e * y.bg, y.bg);
         std::memcpy(dst + y.bg, y.eu.h + (size_t) e * y.bu, y.bu);
         std::memcpy(dst + y.bg + y.bu, y.ed.h + (size_t) e * y.bd, y.bd);
         y.cocc[(size_t) slot] = e; y.cslot_of[(size_t) e] = slot; y.cstamp[(size_t) slot] = ++cache_clock;
         ++st->cache_loads; st->cache_bytes += y.bpe;
-        return packed(y, dst);
+        return packed(y, dst, use_pin);
     }
     void upload_slot(Layer& l, int slot, int e) {
         ExpSrc s = src(l, e);
@@ -785,13 +881,32 @@ struct Model::Impl {
         nrun = (o.max_layers > 0 && o.max_layers < c.n_layer) ? o.max_layers : c.n_layer;
         if (o.ctx < 8) o.ctx = 8;
 
+        // ---- per-token routing scratch, sized from the model's own geometry ----
+        route_idx.assign((size_t) std::max(1, c.n_expert_used), 0);
+        route_w.assign((size_t) std::max(1, c.n_expert_used), 0.f);
+        slot_of_k_.assign((size_t) std::max(1, c.n_expert_used), -1);
+        miss_k_.assign((size_t) std::max(1, c.n_expert_used), 0);
         if (o.gpu) {
+            // docs/TODO.md item 6: gpu::kMaxHit is the CAPACITY of ExpPtrs, not this model's routing
+            // width. Every buffer below is sized from the model's own expert_used_count, clamped to
+            // that capacity - so a top-6 model does not pay for 16 slots, and a top-10 model (the
+            // geometry SPEC_STRATA_VERIFIED.md documents) is not silently truncated to 8.
+            exp_cap = std::min(c.n_expert_used, gpu::kMaxHit);
+            if (c.n_expert_used > gpu::kMaxHit)
+                std::fprintf(stderr, "note: this model routes top-%d but ExpPtrs holds %d: the remaining "
+                                     "%d experts per layer go to the CPU tier\n",
+                             c.n_expert_used, gpu::kMaxHit, c.n_expert_used - gpu::kMaxHit);
             if (!gpu::init(err)) return false;
             const uint64_t before_scratch = vram_used;
             d_x = (float*) galloc(16384 * 4); d_y = (float*) galloc((size_t) std::max<int64_t>(c.vocab, 16384) * 4 + 4096);
-            d_g = (float*) galloc((size_t) gpu::kMaxHit * c.ff_exp * 4); d_u = (float*) galloc((size_t) gpu::kMaxHit * c.ff_exp * 4);
-            d_a = (float*) galloc((size_t) gpu::kMaxHit * c.ff_exp * 4); d_yh = (float*) galloc((size_t) dim * 4);
-            if (!d_x || !d_y || !d_g || !d_u || !d_a || !d_yh) { err = "cannot allocate GPU scratch"; return false; }
+            d_g = (float*) galloc((size_t) exp_cap * c.ff_exp * 4); d_u = (float*) galloc((size_t) exp_cap * c.ff_exp * 4);
+            d_a = (float*) galloc((size_t) exp_cap * c.ff_exp * 4); d_yh = (float*) galloc((size_t) dim * 4);
+            d_sg = (float*) galloc((size_t) c.ff_exp * 4); d_su = (float*) galloc((size_t) c.ff_exp * 4);
+            d_sa = (float*) galloc((size_t) c.ff_exp * 4); d_sh = (float*) galloc((size_t) dim * 4);
+            d_w_dev = (float*) galloc((size_t) gpu::kMaxHit * 4);
+            if (!d_x || !d_y || !d_g || !d_u || !d_a || !d_yh || !d_sg || !d_su || !d_sa || !d_sh || !d_w_dev) {
+                err = "cannot allocate GPU scratch"; return false;
+            }
             vram_scratch = vram_used - before_scratch;
         }
         // ---- prefill scratch: sized from --prefill-chunk, shrunk to what fits below ----
@@ -937,17 +1052,39 @@ struct Model::Impl {
         // decodes per token - more than the rest of the forward pass combined. With a device pool the
         // same expert is copied up and decoded by the kernels that already exist, so the expert cost
         // drops to a PCIe transfer that overlaps the other launches. Sized for one layer's worth of
-        // kMaxHit experts: layers are evaluated one at a time, so the pool is reused, not duplicated.
+        // experts: layers are evaluated one at a time, so the pool is reused, not duplicated.
+        //
+        // This pool is now the FALLBACK path only. When the model's LRU arena is page-locked (docs/
+        // TODO.md item 1) a staged expert DMAs from there and this pool is not touched; it stays
+        // sized for the whole top-k because a layer whose arena cudaHostAlloc refused still needs it.
         if (o.gpu) {
             size_t maxb = 0;
             for (int l : all_layers) maxb = std::max(maxb, L[(size_t) l].bpe);
             if (maxb > 0) {
-                const size_t need = (size_t) gpu::kMaxHit * maxb;
+                const size_t need = (size_t) std::max(1, exp_cap) * maxb;
                 d_stage = (uint8_t*) galloc(need);
                 if (d_stage && !gpu::staging(d_stage, need)) d_stage = nullptr;
                 if (!d_stage && o.verbose)
                     std::fprintf(stderr, "note: no staging pool for MISS experts (%zu bytes): they stay on the host\n", need);
             }
+        }
+        // ---- the doorbell and the graph capture (docs/TODO.md items 3 and 5) ----
+        // Both are asked for once, at load, so a run that cannot have them simply does not use them
+        // and every per-token path stays a straight-line branch on a bool.
+        if (o.gpu) {
+            if (!db_moe.payload && !gpu::doorbell_open(db_moe, (size_t) dim))
+                db_ready = false;
+            else
+                db_ready = true;
+            if (!db_shared.payload && !gpu::doorbell_open(db_shared, (size_t) dim))
+                db_shared_ready = false;
+            else
+                db_shared_ready = true;
+            graph_captures = !gpu::is_emulated();
+            if (o.verbose)
+                std::fprintf(stderr, "decode readback: doorbell %s | graph capture %s\n",
+                            db_ready ? "mapped pinned + counter (no stream sync)" : "synchronous DtoH (fallback)",
+                            graph_captures ? "one graph per (layer, slot-set) shape" : "off (CPU-emulated device)");
         }
         // ---- prompt-lookup drafter + adaptive window policy (the divergences the paper's spec has
         // and this engine lacked; see SPEC_STRATA_VERIFIED.md section 6). The drafter indexes the
@@ -1137,11 +1274,25 @@ struct Model::Impl {
                 for (int l : all_layers) {
                     Layer& y = L[(size_t) l];
                     if (y.ncache <= 0) continue;
-                    y.cpool.resize((size_t) y.ncache * y.bpe);
+                    const size_t arena = (size_t) y.ncache * y.bpe;
+                    // docs/TODO.md item 1: the LRU arena is the ONE bounded place a MISS expert's
+                    // bytes are written, so it is where page-locking pays. cudaHostAlloc can refuse
+                    // a big arena; then this layer keeps the pageable vector and the device stages
+                    // through its pinned ring as before - slower, exact, and reported.
+                    //
+                    // What is deliberately NOT pinned is y.ram just above: with --expert-ram all
+                    // that is 74.4 GiB, and pinned memory is not swappable, so pinning it would
+                    // have blown exactly the OOM already documented in AVVIO_HOST.md.
+                    if (o.gpu && y.bpe) y.cpool_pin = (uint8_t*) gpu::pin_host(arena);
+                    if (y.cpool_pin) y.arena_pinned = gpu::host_is_pinned(y.cpool_pin);
+                    if (!y.arena_pinned) {
+                        if (y.cpool_pin) { gpu::unpin_host(y.cpool_pin); y.cpool_pin = nullptr; }
+                        y.cpool.resize(arena);
+                    }
                     y.cslot_of.assign((size_t) c.n_expert, -1);
                     y.cocc.assign((size_t) y.ncache, -1);
                     y.cstamp.assign((size_t) y.ncache, 0);
-                    cache_bytes_plan += y.cpool.size(); cache_slots_plan += y.ncache;
+                    cache_bytes_plan += arena; cache_slots_plan += y.ncache;
                 }
             }
         }
@@ -1290,6 +1441,9 @@ struct Model::Impl {
     }
 
     void attention(int l, const float* x, int pos, float* out) {
+        // A new activation for this layer: whatever d_x held before belongs to the previous call,
+        // and a freed host vector can be re-allocated at the SAME address with different bytes.
+        d_x_note = nullptr; d_x_note_len = 0;
         Layer& y = L[(size_t) l];
         const int nh = c.n_head;
         const bool yarn = y.ratio > 0;
@@ -1328,64 +1482,166 @@ struct Model::Impl {
 
     // ------------------------------------------------------------ MoE (router -> HIT on GPU / MISS on CPU -> shared expert)
     void moe(int l, const float* x, int token, float* y_out) {
+        // The activation of this half of the layer is new: whatever d_x held belongs to the
+        // attention that just ran.
+        invalidate_d_x();
         Layer& y = L[(size_t) l];
         const int K = c.n_expert_used, ff = c.ff_exp, E = c.n_expert;
         std::vector<float> lg((size_t) E);
         mv(y.gate_inp, x, lg.data());
-        int32_t idx[16]; float w[16];
+        int32_t* idx = route_idx.data();
+        float* w = route_w.data();
         const bool hash = l < c.n_hash_layers;
         const Score fn = c.gating_func == 1 ? Score::Softmax : c.gating_func == 2 ? Score::Sigmoid : Score::SqrtSoftplus;
-        gate_route(lg.data(), E, K, fn, (!hash && y.exp_bias) ? y.exp_bias.f() : nullptr, hash ? (const int32_t*) y.tid2eid.h + (size_t) token * K : nullptr, c.exp_w_scale, idx, w);
+        gate_route(lg.data(), E, K, fn, (!hash && y.exp_bias) ? y.exp_bias.f() : nullptr,
+                   hash ? (const int32_t*) y.tid2eid.h + (size_t) token * K : nullptr, c.exp_w_scale, idx, w);
         for (int k = 0; k < K; ++k) { if (l < c.n_layer) last_routing_p[(size_t) l * K + k] = idx[k]; y.freq[(size_t) idx[k]]++; }
 
-        // Every routed expert goes to the device when it can: the resident ones by VRAM pointer, the
-        // others by host pointer through the staging pool. Only when the device refuses (no kernel for
-        // these types, or no staging pool) does an expert fall back to the host loop below.
-        gpu::ExpPtrs p{};   // value-initialised: n = 0, pointers unused beyond n
-        int miss[16], nmiss = 0, nres = 0, nstaged = 0, nstaged_dev = 0;
+        // ---- three homes for a routed expert, and the model's own top-k as the limit ----
+        // docs/TODO.md item 6: gpu::kMaxHit is the CAPACITY of ExpPtrs, not the routing width. The
+        // limit here is the model's expert_used_count, clamped to that capacity and reported once
+        // when a model asks for more of it than the header can hold.
+        // The limit is the model's own top-k (already clamped to the header's capacity at load,
+        // where the refusal was reported): docs/TODO.md item 6.
+        const int cap = exp_cap;
         const bool device_experts = o.gpu && y.gpu_experts && (d_stage || gpu::is_emulated());
-        p.bpe = y.bpe;
+
+        // Pass 1 resolves VRAM residency only, so the DMA quota of pass 2 can be a fraction of the
+        // misses rather than "everything that still fits" - which is what left the 10 OpenMP
+        // threads idle (docs/TODO.md item 2).
+        int* slot_of_k = slot_of_k_.data();
+        int nres_total = 0;
         for (int k = 0; k < K; ++k) {
             const int e = idx[k];
             int s = (o.gpu && y.slots > 0) ? y.slot_of[(size_t) e] : -1;
             if (s < 0 && o.gpu && y.slots > 0) {   // admit into a free slot (static profile mode fills the rest on first use)
-                for (int q = 0; q < y.slots; ++q) if (y.occ[(size_t) q] < 0) { upload_slot(y, q, e); ++st->admits; s = q; break; }
+                for (int q = 0; q < y.slots; ++q)
+                    if (y.occ[(size_t) q] < 0) { upload_slot(y, q, e); ++st->admits; s = q; break; }
             }
-            if (s >= 0) {
-                if (p.n >= gpu::kMaxHit) { miss[nmiss++] = k; continue; }
+            slot_of_k[k] = s;
+            if (s >= 0) ++nres_total;
+        }
+        const int nhost = K - nres_total;
+        // A MISS has two homes: a bounded share travels by DMA from the page-locked arena, the rest
+        // is computed IN PLACE on the bytes already in RAM by the OpenMP threads, which overlaps the
+        // GPU work just queued. Strata's pcie_frac (SPEC_STRATA_VERIFIED.md section 4): 0.55 for a
+        // native pack, 0.2 for the Q2_0 pack - and every pack this engine has a kernel for is a
+        // native one, so 0.55 is the auto value here.
+        float frac = o.pcie_frac;
+        if (frac < 0.f) frac = 0.55f;
+        if (frac > 1.f) frac = 1.f;
+        if (frac < 0.f) frac = 0.f;
+        int quota = device_experts ? (int) ((float) nhost * frac + 0.5f) : 0;
+        quota = std::min(quota, std::max(0, cap - std::min(nres_total, cap)));
+
+        gpu::ExpPtrs p{};
+        p.bpe = y.bpe;
+        int* miss = miss_k_.data();
+        int nmiss = 0, nres = 0, nstaged = 0, nstaged_dev = 0;
+        bool all_resident = true;   // only then is the launch sequence a function of stable pointers
+        for (int k = 0; k < K; ++k) {
+            const int e = idx[k];
+            const int s = slot_of_k[k];
+            if (s >= 0 && p.n < cap) {
                 uint8_t* base = y.dpool + (size_t) s * y.bpe;
-                p.gate[p.n] = base; p.up[p.n] = base + y.bg; p.down[p.n] = base + y.bg + y.bu; p.w[p.n] = w[k]; ++p.n;
-                ++nres;
-            } else {
-                missed_now.push_back({l, e});
-                if (!device_experts || p.n >= gpu::kMaxHit) { miss[nmiss++] = k; ++nstaged; continue; }
-                ExpSrc s2 = src_miss(y, e);
-                p.hg[p.n] = s2.g; p.hu[p.n] = s2.u; p.hd[p.n] = s2.d; p.w[p.n] = w[k]; ++p.n;
-                ++nstaged_dev;
+                p.gate[p.n] = base; p.up[p.n] = base + y.bg; p.down[p.n] = base + y.bg + y.bu;
+                p.w[p.n] = w[k]; ++p.n; ++nres;
+                continue;
             }
+            missed_now.push_back({l, e});
+            if (device_experts && p.n < cap && nstaged_dev < quota) {
+                ExpSrc s2 = src_miss(y, e);
+                p.hg[p.n] = s2.g; p.hu[p.n] = s2.u; p.hd[p.n] = s2.d; p.w[p.n] = w[k];
+                p.host_pinned = s2.pinned;   // the arena is page-locked: the DMA starts there (item 1)
+                // The report counts which of the two staging implementations this token used, so an
+                // operator can see the pinned arena is actually being reached rather than assumed.
+                if (s2.pinned) st->pinned_stage_bytes += y.bpe; else st->staged_host_bytes += y.bpe;
+                ++p.n; ++nstaged_dev; all_resident = false;
+                continue;
+            }
+            miss[nmiss++] = k; ++nstaged;
+            all_resident = false;
         }
         // hits/misses count VRAM residency, not which unit did the arithmetic: an expert staged from
-        // host memory is still a miss for the residency plan, and the hit rate the report shows is what
-        // tells the operator whether the slot budget is right.
+        // host memory is still a miss for the residency plan, and the hit rate the report shows is
+        // what tells the operator whether the slot budget is right.
         st->hits += (uint64_t) nres;
-        st->misses += (uint64_t) (nstaged + nmiss + nstaged_dev);
+        st->misses += (uint64_t) (nstaged + nstaged_dev);
         const float lim = cl_exp(l);
         auto t0 = Clock::now();
         bool hit_ok = false;
-        if (p.n > 0) {  // launch the experts asynchronously...
-            gpu::h2d(d_x, x, (size_t) dim * 4);
-            hit_ok = gpu::experts_hit(p, y.eg.type, y.eu.type, y.ed.type, ff, dim, lim, d_x, d_g, d_u, d_a, d_yh);
-            if (!hit_ok) {   // no kernel, or a device error: those experts are computed on the host instead
-                nmiss = 0;
-                for (int k = 0; k < K; ++k) miss[nmiss++] = k;
-                st->hits -= (uint64_t) nres;   // they were already counted as misses: residency, not device
-                p.n = 0;
-                if (!warned_host_fallback) {
-                    warned_host_fallback = true;
-                    std::fprintf(stderr, "warning: no device kernel for the experts of layer %d (%s/%s/%s): they run on the host\n",
-                                 l, ggml_type_str(y.eg.type).c_str(), ggml_type_str(y.eu.type).c_str(), ggml_type_str(y.ed.type).c_str());
+        // Where this layer's result was written: the doorbell's device alias when one is live, the
+        // plain scratch otherwise. Declared here because the readback is a separate block.
+        float* out_dev = d_yh;
+        if (p.n > 0) {
+            // The activation copy stays OUTSIDE any captured window: its bytes change every token,
+            // and a graph replays the pointers it saw at capture time.
+            // The router's matvec above already uploaded this very vector, so this is usually free
+            // (docs/TODO.md item 4: one upload per activation per layer, not one per matvec).
+            if (!d_x_holds(x, (size_t) dim)) { gpu::h2d(d_x, x, (size_t) dim * 4); note_d_x(x, (size_t) dim); }
+            // docs/TODO.md item 5: the decode MoE of one layer is the same launches, on the same
+            // scratch and the same expert slots, for every token. Capturing it once per (layer,
+            // slot set, n) shape removes the per-launch host cost. Only a fully resident layer
+            // qualifies: a staged expert's bytes change per token, and its copy must stay outside.
+            gpu::GraphWindow& gw = gw_moe;
+            int gmode = gpu::GRAPH_NONE;
+            if (graph_captures && db_ready && all_resident && nres == p.n) {
+                uint64_t key = (uint64_t) (l + 1) * 1000003u + (uint64_t) p.n * 7919u;
+                for (int k = 0; k < K; ++k) key = key * 1099511628211ULL + (uint64_t) (slot_of_k[k] + 1);
+                // A captured kernel freezes its scalar arguments, so the routing weights cannot be
+                // passed by value through a window: they are uploaded HERE, outside it, and the
+                // fused SwiGLU reads them from d_w_dev. Same bytes, same values, one replay-safe
+                // spelling. Queued, not blocking: this is 64 bytes and the stream must stay open.
+                gpu::h2d_async(d_w_dev, p.w, (size_t) p.n * 4);
+                p.d_w = d_w_dev;
+                gmode = gpu::graph_open(gw, key);
+            }
+            if (db_ready) out_dev = db_moe.d_payload;
+            bool ran = false;
+            if (gmode == gpu::GRAPH_REPLAYED) {
+                ran = true;   // the graph already ran, including its doorbell bump
+                ++db_seq;     // the device counter moved with it
+                ++st->graph_replays;
+            } else {
+                hit_ok = gpu::experts_hit(p, y.eg.type, y.eu.type, y.ed.type, ff, dim, lim, d_x, d_g, d_u, d_a, out_dev);
+                if (!hit_ok) {   // no kernel, or a device error: those experts are computed on the host instead
+                    nmiss = 0;
+                    for (int k = 0; k < K; ++k) miss[nmiss++] = k;
+                    st->hits -= (uint64_t) nres;   // they were already counted as misses: residency, not device
+                    p.n = 0;
+                    nres = 0;
+                    if (!warned_host_fallback) {
+                        warned_host_fallback = true;
+                        std::fprintf(stderr, "warning: no device kernel for the experts of layer %d (%s/%s/%s): they run on the host\n",
+                                     l, ggml_type_str(y.eg.type).c_str(), ggml_type_str(y.eu.type).c_str(), ggml_type_str(y.ed.type).c_str());
+                    }
+                }
+                if (gmode == gpu::GRAPH_CAPTURE) {   // the launches were recorded, not executed
+                    // The announcement is recorded too, so a replay bumps the device counter on its
+                    // own and the caller's count stays in step with it. Nothing ran here, so db_seq
+                    // is not touched: only the instantiated graph, whose launch carries the bump,
+                    // counts.
+                    if (hit_ok && !gpu::doorbell_publish(db_moe, out_dev, (size_t) dim)) db_ready = false;
+                    // graph_close MUST run: it is what ends the capture. Skipping it would leave the
+                    // backend's launch stream pointing at a stream that never executes.
+                    const bool captured = gpu::graph_close(gw);
+                    if (hit_ok && db_ready && captured) {
+                        ran = true;
+                        ++db_seq;
+                        ++st->graph_captures;
+                        graph_keys.push_back(gw.key);
+                    } else
+                        graph_captures = false;   // the capture failed: never try again per token
+                }
+                if (!ran && hit_ok) {
+                    if (db_ready) {   // docs/TODO.md item 3: announce, do not drain the stream
+                        if (gpu::doorbell_publish(db_moe, out_dev, (size_t) dim)) ++db_seq;
+                        else db_ready = false;
+                    }
+                    ran = true;
                 }
             }
+            hit_ok = ran;
         }
         std::vector<float> acc((size_t) dim, 0.f), g((size_t) ff), u((size_t) ff), a((size_t) ff), yy((size_t) dim);
         for (int mi = 0; mi < nmiss; ++mi) {  // ...while the CPU computes whatever the device could not take
@@ -1398,17 +1654,62 @@ struct Model::Impl {
         }
         auto t1 = Clock::now();
         if (hit_ok && p.n > 0) {
-            std::vector<float> yh((size_t) dim);
-            gpu::d2h(yh.data(), d_yh, (size_t) dim * 4);   // blocks until the GPU is done
-            for (int i = 0; i < dim; ++i) acc[(size_t) i] += yh[(size_t) i];
+            // out_dev is wherever this layer's result was written, so it is the only pointer a
+            // readback may use. The doorbell is tried first because it costs nothing; if the
+            // handshake did not complete, the same bytes are read back synchronously and the
+            // doorbell is dropped for the rest of the run.
+            if (db_ready && gpu::doorbell_wait(db_moe, db_seq)) {
+                ++st->doorbell_reads;
+                const float* yh = gpu::doorbell_read(db_moe);
+                for (int i = 0; i < dim; ++i) acc[(size_t) i] += yh[(size_t) i];
+            } else {
+                if (db_ready) db_ready = false;
+                std::vector<float> yh((size_t) dim);
+                gpu::d2h(yh.data(), out_dev, (size_t) dim * 4);   // blocks until the GPU is done
+                ++st->d2h_syncs;
+                for (int i = 0; i < dim; ++i) acc[(size_t) i] += yh[(size_t) i];
+            }
         }
         auto t2 = Clock::now();
         st->cpu_miss_s += secs(t0, t1); st->gpu_hit_s += secs(t1, t2);
         // shared expert
-        std::vector<float> sg((size_t) ff), su((size_t) ff), sa((size_t) ff), sy((size_t) dim);
-        mv(y.sh_gate, x, sg.data()); mv(y.sh_up, x, su.data());
-        swiglu_clamped(sg.data(), su.data(), ff, cl_shexp(l), sa.data());
-        mv(y.sh_down, sa.data(), sy.data());
+        //
+        // docs/TODO.md item 4: the shared expert is three matvecs and a SwiGLU on a [ff]-float
+        // intermediate. Written through mv() that is four h2d/d2h pairs around the same activation,
+        // and every d2h drains the stream the experts just filled. With the intermediate kept in
+        // d_sg/d_su/d_sa the whole chain stays on the card and the layer ends in one readback.
+        std::vector<float> sy((size_t) dim);
+        const bool sh_dev = o.gpu && y.sh_gate.d && y.sh_up.d && y.sh_down.d &&
+                            d_sg && d_su && d_sa && d_sh && y.sh_gate.in == dim;
+        bool sh_ok = false;
+        if (sh_dev) {
+            if (!d_x_holds(x, (size_t) dim)) { gpu::h2d(d_x, x, (size_t) dim * 4); note_d_x(x, (size_t) dim); }
+            sh_ok = gpu::matvec(y.sh_gate.type, y.sh_gate.d, ff, dim, d_x, d_sg) &&
+                    gpu::matvec(y.sh_up.type, y.sh_up.d, ff, dim, d_x, d_su) &&
+                    gpu::swiglu(d_sg, d_su, d_sa, ff, cl_shexp(l)) &&
+                    gpu::matvec(y.sh_down.type, y.sh_down.d, dim, ff, d_sa, d_sh);
+            if (sh_ok) {
+                // Same handshake discipline as the routed experts: the doorbell is tried first, and
+                // only a failed announcement falls back to the blocking readback of the SAME bytes.
+                bool got = false;
+                if (db_shared_ready && gpu::doorbell_publish(db_shared, d_sh, (size_t) dim)) {
+                    ++db_shared_seq;
+                    if (gpu::doorbell_wait(db_shared, db_shared_seq)) {
+                        got = true;
+                        ++st->doorbell_reads;
+                        std::copy(gpu::doorbell_read(db_shared), gpu::doorbell_read(db_shared) + dim, sy.begin());
+                    } else
+                        db_shared_ready = false;
+                }
+                if (!got) { gpu::d2h(sy.data(), d_sh, (size_t) dim * 4); ++st->d2h_syncs; }
+            }
+        }
+        if (!sh_ok) {   // no device chain for these tensors: the host spelling, unchanged
+            std::vector<float> sg((size_t) ff), su((size_t) ff), sa((size_t) ff);
+            mv(y.sh_gate, x, sg.data()); mv(y.sh_up, x, su.data());
+            swiglu_clamped(sg.data(), su.data(), ff, cl_shexp(l), sa.data());
+            mv(y.sh_down, sa.data(), sy.data());
+        }
         for (int i = 0; i < dim; ++i) y_out[i] = acc[(size_t) i] + sy[(size_t) i];
     }
     int32_t* last_routing_p = nullptr;
@@ -1571,6 +1872,11 @@ struct Model::Impl {
                 ExpSrc src = src_miss(y, e);
                 b.gate = b.up = b.down = nullptr;
                 b.hg = src.g; b.hu = src.u; b.hd = src.d;
+                // docs/TODO.md item 6: the prefill and the decode path now share ONE staging
+                // implementation. When the bytes came from a page-locked arena, experts_batch()
+                // DMAs them from there and never touches its pinned ring.
+                b.host_pinned = src.pinned;
+                if (src.pinned) st->pinned_stage_bytes += (uint64_t) y.bpe * (uint64_t) h_cnt[e];
                 st->misses += (uint64_t) h_cnt[e];
             }
             b.tok = h_sel + h_off[e];
@@ -1738,6 +2044,7 @@ struct Model::Impl {
 
     // ------------------------------------------------------------ block / forward
     void block(int l, std::vector<float>& hres, int token, int pos) {
+        invalidate_d_x();
         Layer& y = L[(size_t) l];
         std::vector<float> yv((size_t) dim), post((size_t) hc), comb((size_t) hc * hc), nrm((size_t) dim), a((size_t) dim), hn((size_t) hc * dim);
         hc_pre(hres.data(), hc, dim, y.hc_attn_fn.f(), y.hc_attn_scale.f(), y.hc_attn_base.f(), c.rms_eps, c.hc_sinkhorn_iters, c.hc_eps, yv.data(), post.data(), comb.data());
@@ -1750,6 +2057,9 @@ struct Model::Impl {
         moe(l, nrm.data(), token, a.data());
         hc_post(a.data(), hres.data(), post.data(), comb.data(), hc, dim, hn.data());
         hres = hn;
+        // The vectors this block owned are gone: a later matvec may re-use one of their addresses
+        // with the same length, and the memo must not believe the old bytes are still in d_x.
+        invalidate_d_x();
     }
 
     void forward(int token, int pos, std::vector<float>* logits) {

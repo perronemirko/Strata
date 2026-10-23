@@ -11,6 +11,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <vector>
+#include <cstdint>
 
 #ifdef _OPENMP
 #include <omp.h>
@@ -55,6 +56,67 @@ void mem_info(size_t* free_bytes, size_t* total_bytes) {
 
 void h2d(void* dst, const void* src, size_t bytes) { std::memcpy(dst, src, bytes); }
 void d2h(void* dst, const void* src, size_t bytes) { std::memcpy(dst, src, bytes); }
+void h2d_async(void* dst, const void* src, size_t bytes) { std::memcpy(dst, src, bytes); }
+
+// One strided readback instead of one call per row. On this backend "device" memory IS host memory,
+// so the shape of the copy is all that matters: the CUDA backend turns the same request into one
+// queued async copy per row and a single sync, which is the point of the API existing at all.
+void d2h_rows(void* dst, const void* src, size_t n_rows, size_t row_bytes,
+              size_t elem_size, size_t dst_stride, size_t src_stride) {
+    if (!n_rows || !row_bytes || !elem_size) return;
+    for (size_t t = 0; t < n_rows; ++t)
+        std::memcpy((char*) dst + t * dst_stride * elem_size,
+                    (char*) src + t * src_stride * elem_size, row_bytes);
+}
+
+// Page-locked host memory. There is nothing to page-lock here: this backend's device memory is
+// host memory, so a pinned arena and a plain one are the same thing and behave the same. Answering
+// true is what lets the model run the pinned code path - and be tested against it - on the CPU.
+void* pin_host(size_t bytes) { return bytes ? std::malloc(bytes) : nullptr; }
+void unpin_host(void* p) { if (p) std::free(p); }
+bool host_is_pinned(const void*) { return true; }
+
+bool swiglu(const float* d_g, const float* d_u, float* d_a, int64_t n, float limit) {
+    swiglu_clamped(d_g, d_u, (int) n, limit, d_a);
+    return true;
+}
+
+// The doorbell, emulated: the write is already where the host wants it and there is no queue to
+// hide behind, so publishing is a copy and waiting is a check. The model code is identical for both
+// backends, which is the whole reason this API is in the header and not in a #ifdef.
+bool doorbell_open(Doorbell& db, size_t n_floats) {
+    if (!n_floats) return false;
+    db.payload = (float*) std::malloc(n_floats * 4);
+    db.flag_host = (uint32_t*) std::malloc(sizeof(uint32_t));
+    if (!db.payload || !db.flag_host) { std::free(db.payload); std::free(db.flag_host); return false; }
+    db.d_payload = db.payload;
+    db.flag_dev = db.flag_host;
+    db.n_floats = n_floats;
+    db.impl = nullptr;
+    *db.flag_host = 0;
+    return true;
+}
+void doorbell_close(Doorbell& db) {
+    std::free(db.payload); std::free(db.flag_host);
+    db.payload = nullptr; db.flag_host = nullptr; db.d_payload = nullptr; db.flag_dev = nullptr;
+}
+// The emulated doorbell keeps the same counter discipline as the CUDA one: publish bumps a
+// counter and returns the value it produced, wait compares. There is no queue here, so the
+// value is already correct by the time the call returns.
+bool doorbell_publish(const Doorbell& db, const float* d_src, size_t n_floats) {
+    if (!db.payload || n_floats != db.n_floats) return false;
+    if (d_src != db.d_payload) std::memcpy(db.payload, d_src, n_floats * 4);
+    *db.flag_host += 1u;
+    return true;
+}
+bool doorbell_wait(const Doorbell& db, uint32_t expected) { return db.flag_host && *db.flag_host >= expected; }
+const float* doorbell_read(const Doorbell& db) { return db.payload; }
+
+// No capture here: this backend's "launches" are host loops, and capturing them would only
+// reproduce the work twice. GRAPH_NONE tells the caller to run them normally.
+int graph_open(GraphWindow&, uint64_t) { return GRAPH_NONE; }
+bool graph_close(GraphWindow&) { return true; }
+void graph_flush() {}
 
 // The emulated device decodes with src/dequant.cpp, so it can handle every type that file supports.
 bool type_supported(uint32_t type) { return g_ready && dequant_supported(type); }

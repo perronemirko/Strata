@@ -1,8 +1,13 @@
 # DSv4-Flash — the CLI to run (container)
 
-Paths are the container's (`/workspace`). The model lives on the host mount `/media/albus/windows/...`.
+Paths are the container's (`/workspace`). The model lives on the host mount `/media/albus/windows/...`
+(`dsv4_ext/DeepSeek-V4-Flash-UD-IQ1_M-00001-of-00003.gguf` auto-loads all three shards).
 The resident engine holds 20.17/23.60 GiB of VRAM (2.52 GiB free): never start a second CUDA process
 while it is up, and never kill it.
+
+**Check the GPU before choosing the binary.** `nvidia-smi -L` answering `Failed to initialize NVML`
+means this container has no card: only `dsv4_run` (CPU-emulated, `--cpu`) runs here, and `dsv4_run_cuda`
+must be started on the host. The same check decides whether `--expert-vram-pct` is worth anything.
 
 ## 1. Serve — the engine
 
@@ -54,4 +59,30 @@ Real ids already produced (chat template applied, 11 tokens):
 ```
 128803,6539,81,14,2822,370,2238,65099,33,128804,128822
 ```
+
+## 4. The expert-tier knob (new in this build)
+
+```
+--pcie-frac F   share of a layer's MISS experts sent to the device by DMA from the page-locked
+                LRU arena. -1 = auto (0.55, the native-pack value Strata uses), 0 = compute every
+                miss in place on the CPU tier with the OpenMP threads, 1 = stage every miss.
+```
+
+`0` is the CPU tier the OpenMP threads were idle for before; `1` is the old all-or-nothing staging.
+The run report now says which path was actually taken, so the effect is measured, not assumed:
+
+```
+pinned DMA: 12.345 GiB direct from the arena, 0.000 GiB still staged
+readback:   4128 doorbell, 0 synchronous DtoH | graphs: 43 captured, 1720 replays
+```
+
+Zeros in the first pair mean the LRU arena was not page-locked — the load report says why (see
+[`docs/TODO_IMPLEMENTED.md`](docs/TODO_IMPLEMENTED.md)).
+
+## 5. RAM before starting
+
+`--expert-ram all` is 74.4 GiB of private RAM on this model. With `MemAvailable` below that plus a
+big `--ram-cache-mib`, the load swaps and the engine never reports `READY` — say so with
+`--host-ram-reserve-mib`, or keep `--expert-ram profile`. The arithmetic and the fix are in
+[`AVVIO_HOST.md`](AVVIO_HOST.md).
 

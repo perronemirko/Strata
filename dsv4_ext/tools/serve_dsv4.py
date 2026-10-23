@@ -59,6 +59,8 @@ def build_engine_args(a) -> list[str]:
         args += ["--expert-ram", a.expert_ram]
     if a.ram_cache_mib is not None:
         args += ["--ram-cache-mib", str(a.ram_cache_mib)]
+    if a.pcie_frac is not None:
+        args += ["--pcie-frac", str(a.pcie_frac)]
     if a.prefill_chunk is not None:
         args += ["--prefill-chunk", str(a.prefill_chunk)]
     if a.expert_adapt_swaps:
@@ -297,6 +299,10 @@ def main() -> int:
     ap.add_argument("--expert-ram", choices=["all", "profile"], default=None)
     ap.add_argument("--ram-cache-mib", type=int, default=None,
                     help="host-RAM LRU arena for MISS experts (engine default 8192, 0 = read straight from disk)")
+    ap.add_argument("--pcie-frac", type=float, default=None,
+                    help="share of a layer's MISS experts sent to the GPU by DMA from the page-locked arena "
+                         "(engine default auto = 0.55; 0 keeps every miss on the CPU tier, which is what "
+                         "the OpenMP threads are for)")
     ap.add_argument("--prefill-chunk", type=int, default=None,
                     help="prompt tokens per batched forward (engine default 256, 0 = one token per pass)")
     ap.add_argument("--expert-adapt-swaps", type=int, default=None)

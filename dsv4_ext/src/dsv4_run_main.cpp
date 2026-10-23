@@ -66,7 +66,10 @@ static void usage() {
         "  --dump-logits F           write float32 logits of every processed token\n"
         "  --selfcheck               dequantisation statistics of real tensors, then exit if no prompt is given\n"
         "  --quiet                   no startup report on stderr (serve/server.py keeps its own log)\n"
-        "  --pcie-frac F             not implemented (must be 0)");
+        "  --pcie-frac F             share of a layer's MISS experts sent to the device by DMA from the page-locked\n"
+        "                            LRU arena (docs/TODO.md item 2). -1 = auto (0.55, Strata's native-pack default),\n"
+        "                            0 = compute every miss in place on the CPU tier with the OpenMP threads,\n"
+        "                            1 = stage every miss. The rest is the CPU tier, overlapping the GPU queue.\n");
 }
 
 static std::vector<int> split_ids(const std::string& s) {
@@ -140,7 +143,7 @@ int main(int argc, char** argv) {
         else if (a == "--dump-routing") dump_routing = next();
         else if (a == "--dump-logits") dump_logits = next();
         else if (a == "--selfcheck") selfcheck = true;
-        else if (a == "--pcie-frac") { if (std::atof(next()) != 0.0) { std::fprintf(stderr, "error: the PCIe miss path is not implemented in this build (--pcie-frac must be 0)\n"); return 2; } }
+        else if (a == "--pcie-frac") o.pcie_frac = (float) std::atof(next());
         else { usage(); return a == "--help" || a == "-h" ? 0 : 2; }
     }
     if (shards.empty()) { usage(); return 2; }
@@ -291,6 +294,16 @@ int main(int argc, char** argv) {
                  s.cache_bytes / 1073741824.0, (unsigned long long) s.cache_evictions,
                  s.h2d_bytes / 1073741824.0, s.cpu_miss_s, s.gpu_hit_s,
                  (unsigned long long) s.prefill_tokens, (unsigned long long) s.prefill_chunks, m.max_chunk());
+    // The expert path's host traffic, measured rather than assumed: how many MISS bytes started a
+    // DMA from a page-locked arena (the pinned path, docs/TODO.md item 1) versus how many still
+    // paid the staging bounce, and how many layer results were read back through the doorbell
+    // instead of a synchronous DtoH (item 3). A run that shows zeros here is not using the pinned
+    // arena, and the operator should read the load report rather than trust the flag.
+    std::fprintf(stderr, "  pinned DMA: %.3f GiB direct from the arena, %.3f GiB still staged\n"
+                         "  readback: %llu doorbell, %llu synchronous DtoH | graphs: %llu captured, %llu replays\n",
+                 s.pinned_stage_bytes / 1073741824.0, s.staged_host_bytes / 1073741824.0,
+                 (unsigned long long) s.doorbell_reads, (unsigned long long) s.d2h_syncs,
+                 (unsigned long long) s.graph_captures, (unsigned long long) s.graph_replays);
     // KV checkpoint: persist the whole conversation (prompt + generated) for the next run.
     if (!o.kv_checkpoint.empty()) {
         std::string kerr;
