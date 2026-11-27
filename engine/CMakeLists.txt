@@ -366,6 +366,11 @@ if(STRATA_BUILD_TESTS)
   add_executable(ink_chunk_test tests/core/ink_chunk_test.cpp)
   target_include_directories(ink_chunk_test PRIVATE include)
   add_test(NAME ink_chunk_test COMMAND ink_chunk_test)
+  # the auto Host KV Offload split, the grow ledger, the DSpark ctx steps and the position mapping,
+  # with the numbers measured on the RTX 4090 on 2026-11-25 (models/inkling-2-mini/serve.log) (no GPU)
+  add_executable(ink_kv_offload_test tests/core/ink_kv_offload_test.cpp)
+  target_include_directories(ink_kv_offload_test PRIVATE include)
+  add_test(NAME ink_kv_offload_test COMMAND ink_kv_offload_test)
   add_test(NAME ink_sm120a_cmake COMMAND ${CMAKE_COMMAND} -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/cmake/ink_sm120a_test.cmake)
   # the SYCL runner's memory need per slot and the most --parallel a card holds, checked before it allocates (no GPU)
   add_executable(ink_sy_fit_test tests/core/ink_sy_fit_test.cpp)
@@ -1002,6 +1007,13 @@ option(STRATA_BUILD_INKLING "Build strata-inkling: Inkling-2-Mini (.strata v1.1)
 option(STRATA_BUILD_INKLING2 "Build strata-inkling: Inkling-2-Mini (.strata v1.1) looped MoE engine + Vision + 1..64 continuous batching" ON)
 if((STRATA_BUILD_INKLING AND STRATA_BUILD_INKLING2) AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/inkling2/CMakeLists.txt")
   add_subdirectory(src/inkling2)
+endif()
+
+# ---- strata-inklin2ristrata: opt-in successor of strata-inkling (same shape engine, + --vram-pct / --no-graph controls) ----
+# Off by default: the default path stays byte-identical to the last release. Enable with -DSTRATA_BUILD_INKLIN2RISTRATA=ON.
+option(STRATA_BUILD_INKLIN2RISTRATA "Build strata-inklin2ristrata: the Inklin2RiStrata successor of strata-inkling (opt-in)" OFF)
+if(STRATA_BUILD_INKLIN2RISTRATA AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/inklin2ristrata/CMakeLists.txt")
+  add_subdirectory(src/inklin2ristrata)
 endif()
 
 # What this configure registered, so a missing capability is a stated skip (tools/check prints this line too).

@@ -1,0 +1,14 @@
+{
+ "source": "local",
+ "version": "0.1.47",
+ "archs": [
+  89
+ ],
+ "vision": "none",
+ "cuda_dirs": [
+  "/usr/local/cuda.bk/bin",
+  "/usr/local/cuda.bk/lib64"
+ ],
+ "src": "57e6e25676981a00",
+ "vision_src": null
+}
